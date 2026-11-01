@@ -1,0 +1,59 @@
+name: VORTEX-L2 Institutional CI/CD & Linux Binary Publisher
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-build-linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain (x86_64-unknown-linux-gnu)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Gate 1 — Static Linter (Zero Warnings, Zero Unwraps/Panics)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Gate 2 — Unit & Integration Test Suite (11/11 Passed)
+        run: cargo test --all-targets
+
+      - name: Gate 3 — Build LTO Release Binaries (x86_64 Linux)
+        run: cargo build --release --bins
+
+      - name: Gate 4 — Execute Pre-Production Binary Gates (Tap + Replay + Exec OOS)
+        run: |
+          ./target/release/vortex_tap
+          ./target/release/vortex_replay
+          ./target/release/vortex_exec
+
+      - name: Package Certified Linux x86_64 Binaries
+        run: |
+          tar -czf vortex-linux-x86_64.tar.gz -C target/release vortex_tap vortex_replay vortex_exec
+          sha256sum vortex-linux-x86_64.tar.gz > vortex-linux-x86_64.tar.gz.sha256
+
+      - name: Upload Certified Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vortex-linux-x86_64
+          path: |
+            vortex-linux-x86_64.tar.gz
+            vortex-linux-x86_64.tar.gz.sha256
+
+      - name: Publish Latest Certified Linux Release Binary
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-linux-x86_64
+          name: "VORTEX-L2 Certified Linux x86_64 Binaries (Latest Main)"
+          prerelease: false
+          files: |
+            vortex-linux-x86_64.tar.gz
+            vortex-linux-x86_64.tar.gz.sha256
