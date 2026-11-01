@@ -33,7 +33,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(780_091),
+        reference_mid_ticks: PriceTicks(779_301),
         realized_vol_5m: ScaledBps::from_whole_bps(58),
     },
     CandidateContract {
@@ -44,7 +44,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(226_584),
+        reference_mid_ticks: PriceTicks(226_329),
         realized_vol_5m: ScaledBps::from_whole_bps(60),
     },
     CandidateContract {
@@ -55,7 +55,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(9_462),
+        reference_mid_ticks: PriceTicks(9_456),
         realized_vol_5m: ScaledBps::from_whole_bps(62),
     },
     CandidateContract {
@@ -66,7 +66,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(8_719),
+        reference_mid_ticks: PriceTicks(8_691),
         realized_vol_5m: ScaledBps::from_whole_bps(60),
     },
     CandidateContract {
@@ -77,7 +77,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(23_453),
+        reference_mid_ticks: PriceTicks(23_419),
         realized_vol_5m: ScaledBps::from_whole_bps(68),
     },
     CandidateContract {
@@ -88,7 +88,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(8_992),
+        reference_mid_ticks: PriceTicks(8_987),
         realized_vol_5m: ScaledBps::from_whole_bps(64),
     },
     CandidateContract {
@@ -307,6 +307,16 @@ fn process_bybit_ws_frame(
                 let tfi = factor_states[slot_idx].on_public_trade(side, qty);
                 snap.last_trade_price = price;
                 snap.mark_price = price;
+                match side {
+                    Side::Bid => {
+                        snap.cum_buy_trade_lots =
+                            LotQty(snap.cum_buy_trade_lots.0.saturating_add(qty.0));
+                    }
+                    Side::Ask => {
+                        snap.cum_sell_trade_lots =
+                            LotQty(snap.cum_sell_trade_lots.0.saturating_add(qty.0));
+                    }
+                }
                 snap.factor_tfi = tfi;
                 snap.ts_exchange_ns = TimestampNs(exch_ns);
                 snap.ts_local_ns = TimestampNs(local_ns);

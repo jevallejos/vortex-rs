@@ -1,5 +1,5 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, Seqlock Hot-State Reader,
-//! Non-Volatile SHM v3 Position Rehydration, Asynchronous 1:1 Telegram Notifier,
+//! Non-Volatile SHM v4 Position Rehydration, Multi-Alias Telegram Notifier,
 //! Live HUD (`--live`), and 520-Trade OOS Verifier.
 
 use core::sync::atomic::Ordering;
@@ -65,14 +65,28 @@ fn now_epoch_ns() -> i64 {
     }
 }
 
-/// Reads `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` from `.env` or environment variables
-/// and spawns a non-blocking background worker thread so the 25.0 Hz loop experiences 0 ns I/O latency.
+/// Multi-alias `.env` parser supporting `export ` prefixes and standard Telegram variable names.
 fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
-    let mut token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
-    let mut chat_id = std::env::var("TELEGRAM_CHAT_ID").ok();
+    let mut token = std::env::var("TELEGRAM_BOT_TOKEN")
+        .or_else(|_| std::env::var("TELEGRAM_TOKEN"))
+        .or_else(|_| std::env::var("BOT_TOKEN"))
+        .or_else(|_| std::env::var("TG_BOT_TOKEN"))
+        .or_else(|_| std::env::var("TG_TOKEN"))
+        .ok();
+    let mut chat_id = std::env::var("TELEGRAM_CHAT_ID")
+        .or_else(|_| std::env::var("TELEGRAM_CHAT"))
+        .or_else(|_| std::env::var("CHAT_ID"))
+        .or_else(|_| std::env::var("TG_CHAT_ID"))
+        .ok();
 
+    let mut discovered_keys: Vec<String> = Vec::new();
     if token.is_none() || chat_id.is_none() {
-        let env_paths = [".env", "/home/ubuntu/vortex-rs/.env", "/home/ubuntu/Denk-sekka/.env"];
+        let env_paths = [
+            ".env",
+            "/home/ubuntu/vortex-rs/.env",
+            "/home/ubuntu/Denk-sekka/.env",
+            "/home/ubuntu/.env",
+        ];
         for p in env_paths {
             if let Ok(file) = File::open(p) {
                 let reader = BufReader::new(file);
@@ -81,13 +95,25 @@ fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
                     if trimmed.is_empty() || trimmed.starts_with('#') {
                         continue;
                     }
-                    if let Some((k, v)) = trimmed.split_once('=') {
+                    let clean_line = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+                    if let Some((k, v)) = clean_line.split_once('=') {
                         let key = k.trim();
                         let val = v.trim().trim_matches('"').trim_matches('\'').to_owned();
-                        if key == "TELEGRAM_BOT_TOKEN" && !val.is_empty() {
-                            token = Some(val);
-                        } else if key == "TELEGRAM_CHAT_ID" && !val.is_empty() {
-                            chat_id = Some(val);
+                        if !key.is_empty() && !discovered_keys.iter().any(|x| x == key) {
+                            discovered_keys.push(key.to_owned());
+                        }
+                        if val.is_empty() {
+                            continue;
+                        }
+                        match key {
+                            "TELEGRAM_BOT_TOKEN" | "TELEGRAM_TOKEN" | "BOT_TOKEN"
+                            | "TG_BOT_TOKEN" | "TG_TOKEN" => {
+                                token = Some(val);
+                            }
+                            "TELEGRAM_CHAT_ID" | "TELEGRAM_CHAT" | "CHAT_ID" | "TG_CHAT_ID" => {
+                                chat_id = Some(val);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -101,13 +127,21 @@ fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
     let (bot_token, target_chat) = match (token, chat_id) {
         (Some(t), Some(c)) => (t, c),
         _ => {
-            println!("[TELEGRAM] No TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID found in .env (running silent).");
+            println!(
+                "[TELEGRAM] Missing bot token or chat_id. Keys detected in .env: {:?} (running silent).",
+                discovered_keys
+            );
             return None;
         }
     };
 
     let (tx, rx) = sync_channel::<String>(64);
     println!("[TELEGRAM] Asynchronous 1:1 transactional notifier thread active.");
+
+    let _ = tx.try_send(
+        "[VORTEX-L2 ONLINE] SHM v4 Execution Engine attached in sniper-singapur (25.0 Hz)."
+            .to_owned(),
+    );
 
     thread::spawn(move || {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
@@ -387,6 +421,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
     let mut active_slot: usize = 0;
     let mut resting_queue_ahead: LotQty = LotQty(0);
     let mut prev_l1_qty: LotQty = LotQty(0);
+    let mut prev_cum_trade_lots: LotQty = LotQty(0);
 
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
     if saved_state_code == 2 || saved_state_code == 3 {
@@ -443,7 +478,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
     }
 
     println!(
-        "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with Exact L1 Queue FSM.",
+        "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with Trade-Tape + L1 Queue FSM.",
         arena.version,
         shm_path.display()
     );
@@ -474,12 +509,14 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                         ..
                                     } = fsm.state
                                     {
-                                        let init_q = match side {
-                                            Side::Bid => snap.bids[0].qty,
-                                            Side::Ask => snap.asks[0].qty,
+                                        let (init_q, init_cum_trade) = match side {
+                                            Side::Bid => (snap.bids[0].qty, snap.cum_sell_trade_lots),
+                                            Side::Ask => (snap.asks[0].qty, snap.cum_buy_trade_lots),
                                         };
                                         resting_queue_ahead = init_q;
                                         prev_l1_qty = init_q;
+                                        prev_cum_trade_lots = init_cum_trade;
+
                                         arena.exec_state_code.store(2, Ordering::Release);
                                         arena.exec_active_slot.store(s as u64, Ordering::Release);
                                         arena.exec_active_symbol.store(
@@ -530,12 +567,30 @@ fn run_shadow_execution_daemon() -> ExitCode {
             } => {
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(snap) = slot.read_snapshot(4) {
-                        // Exact physical BBO cross or full queue depletion (no lagging last_trade_price)
                         let bbo_crossed = match side {
                             Side::Bid => snap.asks[0].price.0 > 0 && snap.asks[0].price.0 <= entry_price.0,
                             Side::Ask => snap.bids[0].price.0 > 0 && snap.bids[0].price.0 >= entry_price.0,
                         };
 
+                        // 1. Drain 100% of real publicTrade volume executed against our resting side
+                        let cur_cum_trade = match side {
+                            Side::Bid => snap.cum_sell_trade_lots.0,
+                            Side::Ask => snap.cum_buy_trade_lots.0,
+                        };
+                        if cur_cum_trade > prev_cum_trade_lots.0 && prev_cum_trade_lots.0 > 0 {
+                            let traded_at_level = match side {
+                                Side::Bid => snap.last_trade_price.0 > 0 && snap.last_trade_price.0 <= entry_price.0,
+                                Side::Ask => snap.last_trade_price.0 >= entry_price.0,
+                            };
+                            if traded_at_level {
+                                let trade_drain = cur_cum_trade - prev_cum_trade_lots.0;
+                                resting_queue_ahead =
+                                    LotQty((resting_queue_ahead.0 - trade_drain).max(0));
+                            }
+                        }
+                        prev_cum_trade_lots = LotQty(cur_cum_trade);
+
+                        // 2. Drain conservative 25% of net L1 size reductions
                         let cur_l1_qty = match side {
                             Side::Bid if snap.bids[0].price.0 == entry_price.0 => snap.bids[0].qty.0,
                             Side::Ask if snap.asks[0].price.0 == entry_price.0 => snap.asks[0].qty.0,
@@ -544,13 +599,14 @@ fn run_shadow_execution_daemon() -> ExitCode {
                         if cur_l1_qty < prev_l1_qty.0 {
                             let drop = prev_l1_qty.0 - cur_l1_qty;
                             resting_queue_ahead =
-                                LotQty((resting_queue_ahead.0 - (drop / 2).max(1)).max(0));
-                            arena.exec_queue_ahead_lots.store(
-                                resting_queue_ahead.0 as u64,
-                                Ordering::Release,
-                            );
+                                LotQty((resting_queue_ahead.0 - (drop / 4).max(1)).max(0));
                         }
                         prev_l1_qty = LotQty(cur_l1_qty);
+
+                        arena.exec_queue_ahead_lots.store(
+                            resting_queue_ahead.0 as u64,
+                            Ordering::Release,
+                        );
 
                         if bbo_crossed || resting_queue_ahead.0 == 0 {
                             let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);

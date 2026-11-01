@@ -209,7 +209,6 @@ impl FifoQueueSimulator {
                         }
                     }
                     MarketEventKind::L2BookSnapshot => {
-                        // Check if L2 book stepped completely through our resting level
                         let book_traded_through = match side {
                             Side::Bid => {
                                 row.best_ask_ticks.0 > 0 && row.best_ask_ticks.0 <= limit_price.0
@@ -302,7 +301,9 @@ fn replay_captured_live_parquet_segments() {
     let mut spoof_vetoes: u64 = 0;
     let mut signals_armed: u64 = 0;
     let mut queue_aborts: u64 = 0;
+    let mut net_bps_accum: i64 = 0;
 
+    println!("--------------------------------------------------------------------------------");
     for path in &paths {
         if let Ok(batch) = ColumnarParquetBatch::read_from_file(path) {
             verified_files += 1;
@@ -371,7 +372,6 @@ fn replay_captured_live_parquet_segments() {
                             OrderLifecycleState::RestingEntryQueue { .. }
                                 if row.symbol_id == active_sym =>
                             {
-                                // Evaluate FIFO Fill FIRST before checking queue abort
                                 fifo_sim.on_market_row(&row);
                                 if matches!(
                                     fifo_sim.state,
@@ -392,7 +392,27 @@ fn replay_captured_live_parquet_segments() {
                             OrderLifecycleState::PositionOpenMakerExit { .. }
                                 if row.symbol_id == active_sym =>
                             {
-                                let _ = fsm.step_open_position(&snap, &mut ledger);
+                                if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
+                                    fifo_sim.state = SimulatedOrderState::Inactive;
+                                    net_bps_accum += summary.net_scaled_bps.raw();
+                                    let (en_w, en_f) =
+                                        spec.format_price_usdt_parts(summary.entry_price);
+                                    let (ex_w, ex_f) =
+                                        spec.format_price_usdt_parts(summary.exit_price);
+                                    println!(
+                                        "  [REAL PAR1 TRADE #{}] {:<8} {:?} {:?} | {}.{:04} -> {}.{:04} USDT | Net: {:+.2} bps (MakerExit={})",
+                                        ledger.closed_trades_count,
+                                        row.symbol_id.name(),
+                                        summary.side,
+                                        summary.kind,
+                                        en_w,
+                                        en_f,
+                                        ex_w,
+                                        ex_f,
+                                        (summary.net_scaled_bps.raw() as f64) / 100.0,
+                                        summary.is_maker_exit
+                                    );
+                                }
                             }
                             _ => {}
                         }
@@ -403,7 +423,9 @@ fn replay_captured_live_parquet_segments() {
         }
     }
 
-    println!("--------------------------------------------------------------------------------");
+    let pf_x100 = fsm.net_profit_factor_x100();
+    let maker_ratio_bps = fsm.maker_exit_ratio_bps();
+
     println!(
         "  -> Live PAR1 Archives Verified: {} files | {} total events ({} L2 / {} Trades)",
         verified_files, total_live_rows, total_l2_events, total_trade_prints
@@ -415,6 +437,15 @@ fn replay_captured_live_parquet_segments() {
         queue_aborts,
         fifo_sim.total_maker_fills,
         ledger.closed_trades_count
+    );
+    println!(
+        "  -> Live Walk-Forward PnL      : Net={:+.2} bps | MakerExit={}.{:02}% | PF={}.{:02} | FeesPaid={:.4} USDT",
+        (net_bps_accum as f64) / 100.0,
+        maker_ratio_bps / 100,
+        maker_ratio_bps % 100,
+        pf_x100 / 100,
+        pf_x100 % 100,
+        (ledger.cumulative_fees_1e8 as f64) / 100_000_000.0
     );
 }
 

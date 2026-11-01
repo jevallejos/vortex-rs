@@ -13,8 +13,8 @@ pub const LOB_DEPTH: usize = 50;
 pub const MAX_ACTIVE_PAIRS: usize = 8;
 /// Magic header identifying a valid VORTEXL2 shared memory region ("VORTEXL2" in ASCII).
 pub const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C32;
-/// Schema version of the shared memory layout (v3 persists open position TP/SL/Side across restarts).
-pub const VORTEX_SHM_VERSION: u32 = 3;
+/// Schema version of the shared memory layout (v4 adds cumulative publicTrade lot counters).
+pub const VORTEX_SHM_VERSION: u32 = 4;
 /// Canonical POSIX shared-memory path on Ubuntu Linux production nodes.
 pub const DEFAULT_LINUX_SHM_PATH: &str = "/dev/shm/vortex_lob.mmap";
 
@@ -26,7 +26,7 @@ pub struct BookLevel {
     pub qty: LotQty,
 }
 
-/// Immutable snapshot of a symbol's L2 book and pre-warmed orthogonal factors.
+/// Immutable snapshot of a symbol's L2 book, cumulative trade-tape volume, and pre-warmed orthogonal factors.
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SymbolLobSnapshot {
@@ -37,6 +37,8 @@ pub struct SymbolLobSnapshot {
     pub ts_local_ns: TimestampNs,
     pub mark_price: PriceTicks,
     pub last_trade_price: PriceTicks,
+    pub cum_buy_trade_lots: LotQty,
+    pub cum_sell_trade_lots: LotQty,
     pub realized_vol_5m: ScaledBps,
     pub factor_ofi: BoundedScore,
     pub factor_tfi: BoundedScore,
@@ -64,6 +66,8 @@ impl SymbolLobSnapshot {
             ts_local_ns: TimestampNs(0),
             mark_price: PriceTicks(0),
             last_trade_price: PriceTicks(0),
+            cum_buy_trade_lots: LotQty(0),
+            cum_sell_trade_lots: LotQty(0),
             realized_vol_5m: ScaledBps(0),
             factor_ofi: BoundedScore::ZERO,
             factor_tfi: BoundedScore::ZERO,
@@ -237,7 +241,6 @@ pub struct VortexShmArena {
     pub version: u32,
     pub active_pairs: u32,
     pub heartbeat_ns: AtomicU64,
-    /// Live Execution FSM state code (0=Idle, 1=Placing, 2=RestingQueue, 3=PositionOpen, 4=SL, 5=Halted).
     pub exec_state_code: AtomicU64,
     pub exec_active_slot: AtomicU64,
     pub exec_active_symbol: AtomicU64,
@@ -337,8 +340,6 @@ impl MappedShmRegion {
         }
     }
 
-    /// Opens or creates the shared memory region. If the region is already initialized with
-    /// `VORTEX_SHM_MAGIC` and `VORTEX_SHM_VERSION`, preserves existing atomic FSM state across restarts.
     pub fn open_or_create(path: &Path, _initialize_writer: bool) -> Result<Self, VortexError> {
         let size = core::mem::size_of::<VortexShmArena>();
         let file = OpenOptions::new()
@@ -445,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_seqlock_roundtrip_and_bbo_spread() {
-        let shm_path = std::env::temp_dir().join("vortex_test_shm_region_v3.mmap");
+        let shm_path = std::env::temp_dir().join("vortex_test_shm_region_v4.mmap");
         let region = MappedShmRegion::open_or_create(&shm_path, true);
         assert!(region.is_ok());
         if let Ok(reg) = region {
@@ -458,6 +459,8 @@ mod tests {
                 ts_local_ns: TimestampNs(1_700_000_000_005_000_000),
                 mark_price: PriceTicks(25_000),
                 last_trade_price: PriceTicks(25_001),
+                cum_buy_trade_lots: LotQty(500),
+                cum_sell_trade_lots: LotQty(300),
                 realized_vol_5m: ScaledBps::from_whole_bps(55),
                 factor_ofi: BoundedScore::new_clamped(0.68),
                 factor_tfi: BoundedScore::new_clamped(0.74),
