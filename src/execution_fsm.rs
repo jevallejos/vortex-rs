@@ -16,12 +16,10 @@ pub const MIN_QUEUE_RESIDENCE_NS: i64 = 1_500_000_000;
 pub const MAX_RESTING_QUEUE_TTL_NS: i64 = 25_000_000_000;
 /// Scale-invariant BBO runaway threshold in ScaledBps after 1.5s residence (3.50 bps = 350 units, min 3 ticks).
 pub const BBO_RUNAWAY_SCALED_BPS: i64 = 350;
-/// Structural server-side MarkPrice Stop-Loss distance (28.00 bps = 2_800 ScaledBps, min 4 ticks).
-pub const SERVER_SL_DISTANCE_SCALED_BPS: i64 = 2_800;
-/// Time horizon for harvesting positive stagnant trades >= +4.80 bps gross / +0.80 bps net (60 seconds).
-pub const EARLY_PROFIT_HARVEST_HOLD_NS: i64 = 60_000_000_000;
-/// Maximum hold time before releasing a stagnant slot via passive Maker BBO exit (240 seconds).
-pub const MAX_SLOT_STAGNATION_HOLD_NS: i64 = 240_000_000_000;
+/// Structural server-side MarkPrice Stop-Loss distance (52.00 bps = 5_200 ScaledBps, min 4 ticks).
+pub const SERVER_SL_DISTANCE_SCALED_BPS: i64 = 5_200;
+/// Maximum hold time for a stagnant net-profitable position (>= +5.00 bps gross / +1.00 bps net) before passive Maker release (180 seconds).
+pub const STAGNANT_PROFIT_HOLD_NS: i64 = 180_000_000_000;
 
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -641,13 +639,12 @@ impl ExecutionFsm {
                 && current_gross_bps.raw() >= 520
                 && current_gross_bps.raw() <= (peak_gross_bps.raw() * 70) / 100;
 
-            // Condition C: Time-decayed harvest (>= 60s at >= +4.80 bps gross, or >= 240s slot release)
+            // Condition C: Stagnant net-profitable release ONLY when gross >= +5.00 bps (+1.00 bps net after 4.00 bps Maker fees)
             let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
-            let early_profit_harvest =
-                hold_elapsed >= EARLY_PROFIT_HARVEST_HOLD_NS && current_gross_bps.raw() >= 480;
-            let max_stagnant_release = hold_elapsed >= MAX_SLOT_STAGNATION_HOLD_NS;
+            let stagnant_unwind =
+                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 500;
 
-            if flow_unwind || mfe_ratchet_unwind || early_profit_harvest || max_stagnant_release {
+            if flow_unwind || mfe_ratchet_unwind || stagnant_unwind {
                 return Some(self.finalize_close(
                     ClosedTradeKind::MakerPassiveUnwind,
                     side,

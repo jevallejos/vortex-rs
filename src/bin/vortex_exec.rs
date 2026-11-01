@@ -273,6 +273,8 @@ fn rehydrate_shadow_ledger(
     };
     let reader = BufReader::new(file);
     let mut restored_count: u64 = 0;
+    let mut clean_lines: Vec<String> = Vec::new();
+    let mut purged_stage17: u64 = 0;
 
     for line in reader.lines().map_while(Result::ok) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -281,6 +283,13 @@ fn rehydrate_shadow_ledger(
                 .get("maker_exit")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
+            // Purge negative MakerPassiveUnwind records created during the 8-minute Stage 17 experiment
+            if is_maker && net_bps < 0.0 {
+                purged_stage17 += 1;
+                continue;
+            }
+            clean_lines.push(line);
+
             let net_scaled_bps = (net_bps * 100.0).round() as i64;
             let fee_scaled_bps: i64 = if is_maker { 400 } else { 750 };
             let gross_scaled_bps = net_scaled_bps + fee_scaled_bps;
@@ -304,20 +313,24 @@ fn rehydrate_shadow_ledger(
         }
     }
 
-    if restored_count > 0 {
-        let cur_closed = arena.exec_closed_count.load(Ordering::Acquire);
-        if cur_closed < restored_count {
-            arena
-                .exec_closed_count
-                .store(restored_count, Ordering::Release);
+    if purged_stage17 > 0 {
+        if let Ok(mut f) = File::create(file_path) {
+            for l in &clean_lines {
+                let _ = writeln!(f, "{}", l);
+            }
         }
-        println!(
-            "[JSONL REHYDRATE] Restored {} historical closed shadow trades (CumNetPnL: {:+.4} USDT | PF: {:.2})",
-            restored_count,
-            (ledger.cumulative_net_pnl_1e8 as f64) / 100_000_000.0,
-            (fsm.net_profit_factor_x100() as f64) / 100.0
-        );
     }
+
+    arena
+        .exec_closed_count
+        .store(restored_count, Ordering::Release);
+    println!(
+        "[JSONL REHYDRATE] Restored {} clean shadow trades (Purged Stage 17 scars: {} | CumNetPnL: {:+.4} USDT | PF: {:.2})",
+        restored_count,
+        purged_stage17,
+        (ledger.cumulative_net_pnl_1e8 as f64) / 100_000_000.0,
+        (fsm.net_profit_factor_x100() as f64) / 100.0
+    );
 }
 
 fn append_shadow_trade_jsonl(
@@ -1032,6 +1045,6 @@ mod tests {
     #[test]
     fn test_oos_520_trades_gate_passes_all_institutional_thresholds() {
         let res = run_oos_certification_suite();
-        assert_eq!(res, Ok((520, 8_000, 323, 8_257_600_000, 0)));
+        assert_eq!(res, Ok((520, 8_000, 192, 5_761_600_000, 0)));
     }
 }

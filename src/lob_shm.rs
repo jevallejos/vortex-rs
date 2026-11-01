@@ -14,7 +14,7 @@ pub const MAX_ACTIVE_PAIRS: usize = 8;
 /// Magic header identifying a valid VORTEXL2 shared memory region ("VORTEXL2" in ASCII).
 pub const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C32;
 /// Schema version of the shared memory layout (v5 adds MFE peak price tracking).
-pub const VORTEX_SHM_VERSION: u32 = 7;
+pub const VORTEX_SHM_VERSION: u32 = 8;
 /// Canonical POSIX shared-memory path on Ubuntu Linux production nodes.
 pub const DEFAULT_LINUX_SHM_PATH: &str = "/dev/shm/vortex_lob.mmap";
 
