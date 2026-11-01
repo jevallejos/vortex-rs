@@ -447,10 +447,10 @@ impl ExecutionFsm {
         {
             let ofi = snap.factor_ofi.get();
             let tfi = snap.factor_tfi.get();
-            // Immediate protection (0 ms): if BOTH L2 OFI and Trade Tape TFI flip strongly against us, abort immediately
+            // Immediate V-Bottom protection (0 ms): if EITHER L2 OFI or Trade Tape TFI flips into opposite sign (0.37 hysteresis band), abort before sweep
             let joint_flow_reversal = match side {
-                Side::Bid => ofi <= -0.20 && tfi <= -0.25,
-                Side::Ask => ofi >= 0.20 && tfi >= 0.25,
+                Side::Bid => ofi <= -0.12 || tfi <= -0.15,
+                Side::Ask => ofi >= 0.12 || tfi >= 0.15,
             };
 
             let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
@@ -630,29 +630,29 @@ impl ExecutionFsm {
             let peak_gross_bps =
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
-            // Condition A: Flow reversal while in structural Maker profit (>= +5.20 bps gross = +1.20 bps net)
+            // Condition A: Flow reversal while in net Maker profit (>= +4.50 bps gross = +0.50 bps net WIN when OFI already reversed)
             let ofi_reversed = match side {
                 Side::Bid => snap.factor_ofi.get() < -0.05,
                 Side::Ask => snap.factor_ofi.get() > 0.05,
             };
-            let flow_unwind = current_gross_bps.raw() >= 520 && ofi_reversed;
+            let flow_unwind = current_gross_bps.raw() >= 450 && ofi_reversed;
 
-            // Condition B: MFE Zero-Loss Ratchet (reached >= +7.20 bps gross, protecting >= +4.80 bps gross = +0.80 bps net)
-            let mfe_ratchet_unwind = peak_gross_bps.raw() >= 720
-                && current_gross_bps.raw() >= 480
+            // Condition B: MFE Zero-Loss Ratchet (reached >= +6.50 bps gross, protecting >= +4.50 bps gross = +0.50 bps net WIN)
+            let mfe_ratchet_unwind = peak_gross_bps.raw() >= 650
+                && current_gross_bps.raw() >= 450
                 && current_gross_bps.raw() <= (peak_gross_bps.raw() * 72) / 100;
 
-            // Condition C: Mature profit harvest (>= 45s at >= +4.80 bps gross = +0.80 bps net) or defensive Scratch escape (>= 15s at >= +4.00 bps gross on strong joint reversal)
+            // Condition C: Mature profit harvest (>= 60s at >= +4.80 bps gross = +0.80 bps net) or defensive Scratch escape (>= 12s at >= +4.00 bps gross on channel reversal)
             let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
-            let early_harvest = hold_elapsed >= 45_000_000_000 && current_gross_bps.raw() >= 480;
-            let joint_adverse = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.20 && snap.factor_tfi.get() < -0.20,
-                Side::Ask => snap.factor_ofi.get() > 0.20 && snap.factor_tfi.get() > 0.20,
+            let early_harvest = hold_elapsed >= 60_000_000_000 && current_gross_bps.raw() >= 480;
+            let channel_adverse = match side {
+                Side::Bid => snap.factor_ofi.get() < -0.12 || snap.factor_tfi.get() < -0.15,
+                Side::Ask => snap.factor_ofi.get() > 0.12 || snap.factor_tfi.get() > 0.15,
             };
             let scratch_escape =
-                hold_elapsed >= 15_000_000_000 && current_gross_bps.raw() >= 400 && joint_adverse;
+                hold_elapsed >= 12_000_000_000 && current_gross_bps.raw() >= 400 && channel_adverse;
             let stagnant_unwind =
-                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 450;
+                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 440;
 
             if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {
                 return Some(self.finalize_close(
