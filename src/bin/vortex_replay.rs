@@ -1,5 +1,6 @@
 //! Binary 3 (`vortex_replay`): Deterministic offline L2 + publicTrade FIFO queue-priority
-//! simulator and Walk-Forward Strategy Evaluator over live `data/*.parquet` archives.
+//! simulator and Walk-Forward Strategy Evaluator over live `data/*.parquet` archives
+//! with Semantic ANSI Color/Icon Telemetry (`🟢 WIN` / `🟠 SCRATCH` / `🔴 LOSS`).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -410,7 +411,7 @@ fn replay_captured_live_parquet_segments() {
                                         ("\x1b[1;31m", "🔴", "LOSS")
                                     };
                                     println!(
-                                        "  {}{} [REAL PAR1 TRADE #{:<2} {:<7}] {:<8} {:<3} {:?} | {}.{:04} -> {}.{:04} USDT | Net: {:+.2} bps (Maker={}){}",
+                                        "  {}{} [REAL PAR1 TRADE #{:<2} {:<7}] {:<8} {:<3} {:?} | {}.{:04} -> {}.{:04} USDT | Net: {:+.2} bps (Maker={})\x1b[0m",
                                         col,
                                         icon,
                                         ledger.closed_trades_count,
@@ -423,8 +424,7 @@ fn replay_captured_live_parquet_segments() {
                                         ex_w,
                                         ex_f,
                                         net_bps,
-                                        summary.is_maker_exit,
-                                        "\x1b[0m"
+                                        summary.is_maker_exit
                                     );
                                 }
                             }
@@ -445,13 +445,14 @@ fn replay_captured_live_parquet_segments() {
         verified_files, total_live_rows, total_l2_events, total_trade_prints
     );
     println!(
-        "  -> Live Walk-Forward Replay   : SpoofVetoes={} | Armed={} | QueueAborts={} | Fills={} | Closed={}",
+        "  -> Live Walk-Forward Replay   : 🟠SpoofVetoes={} | 🟡Armed={} | 🟠QueueAborts={} | 🟡Fills={} | 🟢Closed={}",
         spoof_vetoes,
         signals_armed,
         queue_aborts,
         fifo_sim.total_maker_fills,
         ledger.closed_trades_count
     );
+
     let net_total_bps = (net_bps_accum as f64) / 100.0;
     let (sum_col, sum_icon) = if net_total_bps > 0.50 {
         ("\x1b[1;32m", "🟢")
@@ -461,7 +462,7 @@ fn replay_captured_live_parquet_segments() {
         ("\x1b[1;31m", "🔴")
     };
     println!(
-        "  {}{} -> Live Walk-Forward PnL      : Net={:+.2} bps | MakerExit={}.{:02}% | PF={}.{:02} | FeesPaid={:.4} USDT{}",
+        "  {}{} -> Live Walk-Forward PnL      : Net={:+.2} bps | MakerExit={}.{:02}% | PF={}.{:02} | FeesPaid={:.4} USDT\x1b[0m",
         sum_col,
         sum_icon,
         net_total_bps,
@@ -469,8 +470,7 @@ fn replay_captured_live_parquet_segments() {
         maker_ratio_bps % 100,
         pf_x100 / 100,
         pf_x100 % 100,
-        (ledger.cumulative_fees_1e8 as f64) / 100_000_000.0,
-        "\x1b[0m"
+        (ledger.cumulative_fees_1e8 as f64) / 100_000_000.0
     );
 }
 
@@ -537,16 +537,16 @@ fn main() -> ExitCode {
     let throughput = (total_events as f64) / secs;
 
     println!(
-        "  -> Simulated Events Processed : {} events in {:.3} ms",
+        "  \x1b[1;32m�� -> Simulated Events Processed : {} events in {:.3} ms\x1b[0m",
         total_events,
         secs * 1000.0
     );
     println!(
-        "  -> Deterministic Throughput   : {:.0} events/sec (Gate >= 100,000 ev/s)",
+        "  \x1b[1;32m🟢 -> Deterministic Throughput   : {:.0} events/sec (Gate >= 100,000 ev/s)\x1b[0m",
         throughput
     );
     println!(
-        "  -> Verified FIFO Maker Fills  : {} | PostOnly Rejects: {}",
+        "  \x1b[1;32m🟢 -> Verified FIFO Maker Fills  : {} | PostOnly Rejects: {}\x1b[0m",
         sim.total_maker_fills, sim.total_post_only_rejects
     );
 
