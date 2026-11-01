@@ -341,12 +341,15 @@ mod tests {
         state.on_l2_snapshot(&mut snap);
 
         for _ in 0..6 {
-            let _ = state.on_public_trade(Side::Bid, LotQty(5));
-            snap.bids[0].qty.0 += 2;
+            let _ = state.on_public_trade(Side::Bid, LotQty(50));
+            for i in 0..5 {
+                snap.bids[i].qty.0 += 50;
+            }
             state.on_l2_snapshot(&mut snap);
         }
 
         assert!(snap.factor_ofi.get() > 0.80);
+        assert!(snap.factor_geom.get() > 0.10);
         let verdict = state.evaluate_entry_signal(&spec, &snap);
         assert!(matches!(
             verdict,

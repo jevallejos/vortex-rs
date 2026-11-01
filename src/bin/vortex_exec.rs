@@ -1,13 +1,17 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, Seqlock Hot-State Reader,
-//! Live Shared-Memory Telemetry HUD (`--live`), and 520-Trade OOS Gate Verifier.
+//! Live Shared-Memory Telemetry HUD (`--live`), Persistent Shadow Trade Ledger (`data/vortex_shadow_trades.jsonl`),
+//! and 520-Trade OOS Gate Verifier.
 
 use core::sync::atomic::Ordering;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
-use vortex_rs::execution_fsm::ExecutionFsm;
+use vortex_rs::execution_fsm::{ClosedTradeSummary, ExecutionFsm};
 use vortex_rs::forensic_parquet::ParitySyncLedger;
 use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena};
 use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
@@ -57,6 +61,34 @@ fn now_epoch_ns() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_nanos() as i64,
         Err(_) => 1_762_012_800_000_000_000,
+    }
+}
+
+fn append_shadow_trade_jsonl(
+    symbol: &str,
+    summary: &ClosedTradeSummary,
+    ledger: &ParitySyncLedger,
+    fsm: &ExecutionFsm,
+) {
+    let data_dir = Path::new("data");
+    let _ = std::fs::create_dir_all(data_dir);
+    let file_path = data_dir.join("vortex_shadow_trades.jsonl");
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(file_path) {
+        let line = format!(
+            "{{\"ts_ns\":{},\"symbol\":\"{}\",\"kind\":\"{:?}\",\"side\":\"{:?}\",\"entry_ticks\":{},\"exit_ticks\":{},\"net_bps\":{:.2},\"maker_exit\":{},\"total_trades\":{},\"pf_x100\":{},\"cum_net_pnl_1e8\":{}}}\n",
+            now_epoch_ns(),
+            symbol,
+            summary.kind,
+            summary.side,
+            summary.entry_price.0,
+            summary.exit_price.0,
+            (summary.net_scaled_bps.raw() as f64) / 100.0,
+            summary.is_maker_exit,
+            ledger.closed_trades_count,
+            fsm.net_profit_factor_x100(),
+            ledger.cumulative_net_pnl_1e8
+        );
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -319,6 +351,12 @@ fn main() -> ExitCode {
                         }
                         if s == active_slot {
                             if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
+                                append_shadow_trade_jsonl(
+                                    snap.symbol_id.name(),
+                                    &summary,
+                                    &ledger,
+                                    &fsm,
+                                );
                                 println!(
                                     "[SHADOW CLOSE] {} {:?} | Net: {:+.2} bps | Total Trades: {}",
                                     snap.symbol_id.name(),
