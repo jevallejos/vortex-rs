@@ -312,7 +312,9 @@ fn rehydrate_shadow_ledger(
                 .get("maker_exit")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
-            if is_maker && net_bps < 0.0 {
+            let en_ticks = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            // Purge negative MakerPassiveUnwind from Stage 17 and the pre-Stage-23 0ms PostOnly-cross false fill (8888t)
+            if (is_maker && net_bps < 0.0) || (!is_maker && en_ticks == 8888) {
                 purged_stage17 += 1;
                 continue;
             }
@@ -796,84 +798,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
                                 {
                                     active_slot = s;
-                                    let _ = fsm.on_entry_order_resting(snap.ts_local_ns);
-                                    if let OrderLifecycleState::RestingEntryQueue {
-                                        side,
-                                        entry_price,
-                                        sl_trigger_price,
-                                        resting_since_ts,
-                                        ..
-                                    } = fsm.state
-                                    {
-                                        let (init_q, init_cum_trade) = match side {
-                                            Side::Bid => (snap.bids[0].qty, snap.cum_sell_trade_lots),
-                                            Side::Ask => (snap.asks[0].qty, snap.cum_buy_trade_lots),
-                                        };
-                                        resting_queue_ahead = init_q;
-                                        prev_l1_qty = init_q;
-                                        prev_cum_trade_lots = init_cum_trade;
-
-                                        arena.exec_state_code.store(2, Ordering::Release);
-                                        arena.exec_active_slot.store(s as u64, Ordering::Release);
-                                        arena.exec_active_symbol.store(
-                                            u64::from(snap.symbol_id.0),
-                                            Ordering::Release,
-                                        );
-                                        arena.exec_side.store(side as u64, Ordering::Release);
-                                        arena.exec_entry_ticks.store(
-                                            entry_price.0 as u64,
-                                            Ordering::Release,
-                                        );
-                                        arena.exec_peak_ticks.store(
-                                            entry_price.0 as u64,
-                                            Ordering::Release,
-                                        );
-                                        arena.exec_tp_ticks.store(0, Ordering::Release);
-                                        arena.exec_sl_ticks.store(
-                                            sl_trigger_price.0 as u64,
-                                            Ordering::Release,
-                                        );
-                                        arena.exec_resting_since_ns.store(
-                                            resting_since_ts.0 as u64,
-                                            Ordering::Release,
-                                        );
-                                        arena.exec_queue_ahead_lots.store(
-                                            resting_queue_ahead.0 as u64,
-                                            Ordering::Release,
-                                        );
-                                        arena.exec_armed_count.fetch_add(1, Ordering::Release);
-
-                                        if let Some(ref b_tx) = bybit_tx {
-                                            let (ew, ef) = spec.format_price_usdt_parts(entry_price);
-                                            let (sw, sf) = spec.format_price_usdt_parts(sl_trigger_price);
-                                            let bybit_side = match side {
-                                                Side::Bid => "Buy",
-                                                Side::Ask => "Sell",
-                                            };
-                                            let order_json = format!(
-                                                "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"1\",\"price\":\"{}.{:04}\",\"stopLoss\":\"{}.{:04}\",\"slTriggerBy\":\"MarkPrice\"}}",
-                                                snap.symbol_id.name(),
-                                                bybit_side,
-                                                ew,
-                                                ef,
-                                                sw,
-                                                sf
-                                            );
-                                            let _ = b_tx.try_send(order_json);
-                                        }
-
-                                        println!(
-                                            "{}🟡 [SHADOW QUEUE ARMED] {} {:?} resting at L1 (Queue ahead: {} lots | Seq: {} | OFI: {:+.2} | TFI: {:+.2}){}",
-                                            ANSI_YELLOW,
-                                            snap.symbol_id.name(),
-                                            side,
-                                            resting_queue_ahead.0,
-                                            snap.sequence_id,
-                                            snap.factor_ofi.get(),
-                                            snap.factor_tfi.get(),
-                                            ANSI_RESET
-                                        );
-                                    }
+                                    arena.exec_state_code.store(1, Ordering::Release);
+                                    arena.exec_active_slot.store(s as u64, Ordering::Release);
+                                    arena.exec_active_symbol.store(
+                                        u64::from(snap.symbol_id.0),
+                                        Ordering::Release,
+                                    );
                                     break;
                                 }
                             }
@@ -920,15 +850,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             continue;
                         }
 
+                        // Strict trade-through: opposite side must step strictly past our resting price
                         let level_swept = match side {
-                            Side::Bid => {
-                                (snap.bids[0].price.0 > 0 && snap.bids[0].price.0 < entry_price.0)
-                                    || (snap.asks[0].price.0 > 0 && snap.asks[0].price.0 <= entry_price.0)
-                            }
-                            Side::Ask => {
-                                (snap.asks[0].price.0 > 0 && snap.asks[0].price.0 > entry_price.0)
-                                    || (snap.bids[0].price.0 > 0 && snap.bids[0].price.0 >= entry_price.0)
-                            }
+                            Side::Bid => snap.asks[0].price.0 > 0 && snap.asks[0].price.0 < entry_price.0,
+                            Side::Ask => snap.bids[0].price.0 > 0 && snap.bids[0].price.0 > entry_price.0,
                         };
 
                         let cur_cum_trade = match side {
@@ -1128,8 +1053,86 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 }
             }
 
-            OrderLifecycleState::PlacingEntryMaker { .. } => {
-                let _ = fsm.on_entry_order_resting(TimestampNs(now_epoch_ns()));
+            OrderLifecycleState::PlacingEntryMaker {
+                side,
+                entry_price,
+                sl_trigger_price,
+                submitted_ts,
+                ..
+            } => {
+                if let Ok(slot) = arena.slot(active_slot) {
+                    if let Ok(snap) = slot.read_snapshot(4) {
+                        // Enforce 25ms one-way flight latency (matching vortex_replay SIMULATED_ONE_WAY_LATENCY_NS)
+                        if snap.ts_local_ns.0.saturating_sub(submitted_ts.0) < 25_000_000 {
+                            continue;
+                        }
+                        let post_only_crossed = match side {
+                            Side::Bid => snap.asks[0].price.0 > 0 && entry_price.0 >= snap.asks[0].price.0,
+                            Side::Ask => snap.bids[0].price.0 > 0 && entry_price.0 <= snap.bids[0].price.0,
+                        };
+                        let flow_died_in_flight = match side {
+                            Side::Bid => snap.factor_ofi.get() <= 0.0 || snap.factor_tfi.get() <= 0.0,
+                            Side::Ask => snap.factor_ofi.get() >= 0.0 || snap.factor_tfi.get() >= 0.0,
+                        };
+                        if post_only_crossed || flow_died_in_flight {
+                            fsm.state = OrderLifecycleState::Idle;
+                            arena.exec_state_code.store(0, Ordering::Release);
+                            continue;
+                        }
+
+                        let _ = fsm.on_entry_order_resting(snap.ts_local_ns);
+                        let (init_q, init_cum_trade) = match side {
+                            Side::Bid => (snap.bids[0].qty, snap.cum_sell_trade_lots),
+                            Side::Ask => (snap.asks[0].qty, snap.cum_buy_trade_lots),
+                        };
+                        resting_queue_ahead = init_q;
+                        prev_l1_qty = init_q;
+                        prev_cum_trade_lots = init_cum_trade;
+                        last_seen_seq[active_slot] = snap.sequence_id;
+
+                        arena.exec_state_code.store(2, Ordering::Release);
+                        arena.exec_side.store(side as u64, Ordering::Release);
+                        arena.exec_entry_ticks.store(entry_price.0 as u64, Ordering::Release);
+                        arena.exec_peak_ticks.store(entry_price.0 as u64, Ordering::Release);
+                        arena.exec_tp_ticks.store(0, Ordering::Release);
+                        arena.exec_sl_ticks.store(sl_trigger_price.0 as u64, Ordering::Release);
+                        arena.exec_resting_since_ns.store(snap.ts_local_ns.0 as u64, Ordering::Release);
+                        arena.exec_queue_ahead_lots.store(resting_queue_ahead.0 as u64, Ordering::Release);
+                        arena.exec_armed_count.fetch_add(1, Ordering::Release);
+
+                        let spec = APPROVED_SPECS[active_slot];
+                        if let Some(ref b_tx) = bybit_tx {
+                            let (ew, ef) = spec.format_price_usdt_parts(entry_price);
+                            let (sw, sf) = spec.format_price_usdt_parts(sl_trigger_price);
+                            let bybit_side = match side {
+                                Side::Bid => "Buy",
+                                Side::Ask => "Sell",
+                            };
+                            let order_json = format!(
+                                "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"1\",\"price\":\"{}.{:04}\",\"stopLoss\":\"{}.{:04}\",\"slTriggerBy\":\"MarkPrice\"}}",
+                                snap.symbol_id.name(),
+                                bybit_side,
+                                ew,
+                                ef,
+                                sw,
+                                sf
+                            );
+                            let _ = b_tx.try_send(order_json);
+                        }
+
+                        println!(
+                            "{}🟡 [SHADOW QUEUE ARMED] {} {:?} resting at L1 after 25ms PostOnly check (Queue ahead: {} lots | Seq: {} | OFI: {:+.2} | TFI: {:+.2}){}",
+                            ANSI_YELLOW,
+                            snap.symbol_id.name(),
+                            side,
+                            resting_queue_ahead.0,
+                            snap.sequence_id,
+                            snap.factor_ofi.get(),
+                            snap.factor_tfi.get(),
+                            ANSI_RESET
+                        );
+                    }
+                }
             }
 
             OrderLifecycleState::EmergencyStopTriggered { .. }
