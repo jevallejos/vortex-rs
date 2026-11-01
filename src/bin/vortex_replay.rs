@@ -372,21 +372,23 @@ fn replay_captured_live_parquet_segments() {
                             OrderLifecycleState::RestingEntryQueue { .. }
                                 if row.symbol_id == active_sym =>
                             {
-                                fifo_sim.on_market_row(&row);
-                                if matches!(
-                                    fifo_sim.state,
-                                    SimulatedOrderState::FilledMaker { .. }
-                                ) {
-                                    let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
-                                } else if matches!(
-                                    fifo_sim.state,
-                                    SimulatedOrderState::RejectedPostOnlyCross
-                                ) {
-                                    fsm.state = OrderLifecycleState::Idle;
-                                    fifo_sim.state = SimulatedOrderState::Inactive;
-                                } else if fsm.check_resting_queue_abort(&snap) {
+                                if fsm.check_resting_queue_abort(&snap) {
                                     queue_aborts += 1;
                                     fifo_sim.state = SimulatedOrderState::Inactive;
+                                } else {
+                                    fifo_sim.on_market_row(&row);
+                                    if matches!(
+                                        fifo_sim.state,
+                                        SimulatedOrderState::FilledMaker { .. }
+                                    ) {
+                                        let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
+                                    } else if matches!(
+                                        fifo_sim.state,
+                                        SimulatedOrderState::RejectedPostOnlyCross
+                                    ) {
+                                        fsm.state = OrderLifecycleState::Idle;
+                                        fifo_sim.state = SimulatedOrderState::Inactive;
+                                    }
                                 }
                             }
                             OrderLifecycleState::PositionOpenMakerExit { .. }
@@ -399,18 +401,30 @@ fn replay_captured_live_parquet_segments() {
                                         spec.format_price_usdt_parts(summary.entry_price);
                                     let (ex_w, ex_f) =
                                         spec.format_price_usdt_parts(summary.exit_price);
+                                    let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
+                                    let (col, icon, badge) = if net_bps > 0.50 {
+                                        ("\x1b[1;32m", "🟢", "WIN")
+                                    } else if net_bps >= -0.50 {
+                                        ("\x1b[38;5;208m", "🟠", "SCRATCH")
+                                    } else {
+                                        ("\x1b[1;31m", "🔴", "LOSS")
+                                    };
                                     println!(
-                                        "  [REAL PAR1 TRADE #{}] {:<8} {:?} {:?} | {}.{:04} -> {}.{:04} USDT | Net: {:+.2} bps (MakerExit={})",
+                                        "  {}{} [REAL PAR1 TRADE #{:<2} {:<7}] {:<8} {:<3} {:?} | {}.{:04} -> {}.{:04} USDT | Net: {:+.2} bps (Maker={}){}",
+                                        col,
+                                        icon,
                                         ledger.closed_trades_count,
+                                        badge,
                                         row.symbol_id.name(),
-                                        summary.side,
+                                        format!("{:?}", summary.side),
                                         summary.kind,
                                         en_w,
                                         en_f,
                                         ex_w,
                                         ex_f,
-                                        (summary.net_scaled_bps.raw() as f64) / 100.0,
-                                        summary.is_maker_exit
+                                        net_bps,
+                                        summary.is_maker_exit,
+                                        "\x1b[0m"
                                     );
                                 }
                             }
@@ -438,14 +452,25 @@ fn replay_captured_live_parquet_segments() {
         fifo_sim.total_maker_fills,
         ledger.closed_trades_count
     );
+    let net_total_bps = (net_bps_accum as f64) / 100.0;
+    let (sum_col, sum_icon) = if net_total_bps > 0.50 {
+        ("\x1b[1;32m", "🟢")
+    } else if net_total_bps >= -0.50 {
+        ("\x1b[38;5;208m", "🟠")
+    } else {
+        ("\x1b[1;31m", "🔴")
+    };
     println!(
-        "  -> Live Walk-Forward PnL      : Net={:+.2} bps | MakerExit={}.{:02}% | PF={}.{:02} | FeesPaid={:.4} USDT",
-        (net_bps_accum as f64) / 100.0,
+        "  {}{} -> Live Walk-Forward PnL      : Net={:+.2} bps | MakerExit={}.{:02}% | PF={}.{:02} | FeesPaid={:.4} USDT{}",
+        sum_col,
+        sum_icon,
+        net_total_bps,
         maker_ratio_bps / 100,
         maker_ratio_bps % 100,
         pf_x100 / 100,
         pf_x100 % 100,
-        (ledger.cumulative_fees_1e8 as f64) / 100_000_000.0
+        (ledger.cumulative_fees_1e8 as f64) / 100_000_000.0,
+        "\x1b[0m"
     );
 }
 

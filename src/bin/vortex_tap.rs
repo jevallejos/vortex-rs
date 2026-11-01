@@ -535,7 +535,7 @@ fn main() -> ExitCode {
                 }
 
                 println!(
-                    "  [APPROVED -> SLOT {}] {:<12} | Tick_bps: {:>4}.{:02} bps (<= 1.50) | Vol5m: {:>2} bps",
+                    "  \x1b[1;32m🟢 [APPROVED -> SLOT {}]\x1b[0m {:<12} | Tick_bps: {:>4}.{:02} bps (<= 1.50) | Vol5m: {:>2} bps",
                     slot_idx,
                     candidate.name,
                     tick_scaled_bps.raw() / 100,
@@ -545,7 +545,7 @@ fn main() -> ExitCode {
             }
             Err(reason) => {
                 println!(
-                    "  [VETOED BY GUARD   ] {:<12} | Reason: {}",
+                    "  \x1b[1;31m🔴 [VETOED BY GUARD   ]\x1b[0m {:<12} | Reason: {}",
                     candidate.name, reason
                 );
             }

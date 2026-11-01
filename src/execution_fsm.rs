@@ -445,29 +445,32 @@ impl ExecutionFsm {
             ..
         } = self.state
         {
-            let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
-            if elapsed_ns < MIN_QUEUE_RESIDENCE_NS {
-                return false;
-            }
-
-            let ttl_expired = elapsed_ns >= MAX_RESTING_QUEUE_TTL_NS;
-
             let ofi = snap.factor_ofi.get();
             let tfi = snap.factor_tfi.get();
+            // Immediate protection (0 ms): if BOTH L2 OFI and Trade Tape TFI flip strongly against us, abort immediately
             let joint_flow_reversal = match side {
                 Side::Bid => ofi <= -0.20 && tfi <= -0.25,
                 Side::Ask => ofi >= 0.20 && tfi >= 0.25,
             };
 
+            let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
+            let ttl_expired = elapsed_ns >= MAX_RESTING_QUEUE_TTL_NS;
+
+            // Anti-burst residence floor (1.50s) applies strictly to BBO runaway re-pegs
+            let residence_satisfied = elapsed_ns >= MIN_QUEUE_RESIDENCE_NS;
             let runaway_allowance_ticks =
                 ((entry_price.0 * BBO_RUNAWAY_SCALED_BPS) / 1_000_000).max(3);
 
-            let bbo_runaway = match snap.bbo_and_spread_ticks() {
-                Some((best_bid, best_ask, _)) => match side {
-                    Side::Bid => best_bid.price.0 - entry_price.0 >= runaway_allowance_ticks,
-                    Side::Ask => entry_price.0 - best_ask.price.0 >= runaway_allowance_ticks,
-                },
-                None => false,
+            let bbo_runaway = if residence_satisfied {
+                match snap.bbo_and_spread_ticks() {
+                    Some((best_bid, best_ask, _)) => match side {
+                        Side::Bid => best_bid.price.0 - entry_price.0 >= runaway_allowance_ticks,
+                        Side::Ask => entry_price.0 - best_ask.price.0 >= runaway_allowance_ticks,
+                    },
+                    None => false,
+                }
+            } else {
+                false
             };
 
             if joint_flow_reversal || ttl_expired || bbo_runaway {
@@ -627,24 +630,31 @@ impl ExecutionFsm {
             let peak_gross_bps =
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
-            // Condition A: Flow reversal while in net Maker profit (>= +6.00 bps gross = +2.00 bps net)
+            // Condition A: Flow reversal while in net Maker profit (>= +4.40 bps gross = +0.40 bps net, unlocking 4..5 tick SUI/SOL moves)
             let ofi_reversed = match side {
                 Side::Bid => snap.factor_ofi.get() < -0.05,
                 Side::Ask => snap.factor_ofi.get() > 0.05,
             };
-            let flow_unwind = current_gross_bps.raw() >= 600 && ofi_reversed;
+            let flow_unwind = current_gross_bps.raw() >= 440 && ofi_reversed;
 
-            // Condition B: MFE Zero-Loss Ratchet (reached >= +8.50 bps gross, protecting >= +5.20 bps gross)
-            let mfe_ratchet_unwind = peak_gross_bps.raw() >= 850
-                && current_gross_bps.raw() >= 520
-                && current_gross_bps.raw() <= (peak_gross_bps.raw() * 70) / 100;
+            // Condition B: MFE Zero-Loss Ratchet (reached >= +5.50 bps gross, protecting >= +4.20 bps gross = +0.20 bps net)
+            let mfe_ratchet_unwind = peak_gross_bps.raw() >= 550
+                && current_gross_bps.raw() >= 420
+                && current_gross_bps.raw() <= (peak_gross_bps.raw() * 75) / 100;
 
-            // Condition C: Stagnant net-profitable release ONLY when gross >= +5.00 bps (+1.00 bps net after 4.00 bps Maker fees)
+            // Condition C: Early profit harvest (>= 20s at >= +4.20 bps gross) or Scratch escape (>= 15s at >= +4.00 bps gross = 0.00 bps net on joint reversal)
             let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
+            let early_harvest = hold_elapsed >= 20_000_000_000 && current_gross_bps.raw() >= 420;
+            let joint_adverse = match side {
+                Side::Bid => snap.factor_ofi.get() < -0.15 && snap.factor_tfi.get() < -0.15,
+                Side::Ask => snap.factor_ofi.get() > 0.15 && snap.factor_tfi.get() > 0.15,
+            };
+            let scratch_escape =
+                hold_elapsed >= 15_000_000_000 && current_gross_bps.raw() >= 400 && joint_adverse;
             let stagnant_unwind =
-                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 500;
+                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 400;
 
-            if flow_unwind || mfe_ratchet_unwind || stagnant_unwind {
+            if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {
                 return Some(self.finalize_close(
                     ClosedTradeKind::MakerPassiveUnwind,
                     side,

@@ -124,13 +124,9 @@ case "\${1:-live}" in
         ;;
     trades|-t)
         echo "=== [SHADOW QUEUE & EXECUTION EVENTS IN JOURNALCTL] ==="
-        journalctl -u vortex-exec.service -n 30 --no-pager | grep -E "SHADOW|SHM|DAEMON|TELEGRAM" || true
-        echo "=== [CLOSED SHADOW TRADES LEDGER (vortex_shadow_trades.jsonl)] ==="
-        if [ -f "${DATA_DIR}/vortex_shadow_trades.jsonl" ]; then
-            tail -n 20 "${DATA_DIR}/vortex_shadow_trades.jsonl"
-        else
-            echo "(No closed shadow trades yet — waiting for structural 35..80 bps target or SL)"
-        fi
+        journalctl -u vortex-exec.service -n 25 --no-pager | grep -E "SHADOW|SHM|DAEMON|TELEGRAM|JSONL" || true
+        echo "=== [COLORIZED CLOSED SHADOW TRADES LEDGER (vortex_shadow_trades.jsonl)] ==="
+        cd "${VORTEX_DIR}" && ${BIN_DIR}/vortex_exec --trades
         ;;
     status|-s)
         systemctl status vortex-tap.service vortex-exec.service --no-pager

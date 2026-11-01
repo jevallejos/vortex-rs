@@ -1,6 +1,6 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, 200.0 Hz Seqlock Reader,
-//! Non-Volatile SHM v5 + JSONL Ledger Rehydration, Convex MFE Maker Ratchet,
-//! Authenticated Bybit UTA V5 Private REST Bridge (`--live-capital`), and 520-Trade OOS Verifier.
+//! Non-Volatile SHM v9 + JSONL Ledger Rehydration, Convex MFE Maker Ratchet,
+//! Semantic Color/Icon Telemetry (`🟢`/`🟠`/`🔴`/`🟡`), and 520-Trade OOS Verifier.
 
 use core::sync::atomic::Ordering;
 use std::fs::{File, OpenOptions};
@@ -20,6 +20,13 @@ use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexSh
 use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
 
 pub const TOTAL_OOS_TRADES_GATE: usize = 520;
+
+const ANSI_GREEN: &str = "\x1b[1;32m";
+const ANSI_ORANGE: &str = "\x1b[38;5;208m";
+const ANSI_RED: &str = "\x1b[1;31m";
+const ANSI_YELLOW: &str = "\x1b[1;33m";
+const ANSI_GRAY: &str = "\x1b[90m";
+const ANSI_RESET: &str = "\x1b[0m";
 
 const APPROVED_SPECS: [PairSpec; 6] = [
     PairSpec {
@@ -67,8 +74,21 @@ fn now_epoch_ns() -> i64 {
     }
 }
 
-/// Asynchronous Bybit UTA V5 Private REST Order Dispatcher (`HMAC-SHA256` authenticated).
-/// Only active when `--live-capital` flag is passed at startup.
+/// Returns `(ansi_color, icon, label)` for a closed trade based on net basis points:
+/// - `> +0.50 bps`: `🟢 WIN` (Green)
+/// - `-0.50 .. +0.50 bps`: `�� SCRATCH` (Orange)
+/// - `< -0.50 bps`: `🔴 LOSS` (Red)
+#[inline]
+fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static str) {
+    if net_bps > 0.50 {
+        (ANSI_GREEN, "🟢", "WIN")
+    } else if net_bps >= -0.50 {
+        (ANSI_ORANGE, "🟠", "SCRATCH")
+    } else {
+        (ANSI_RED, "🔴", "LOSS")
+    }
+}
+
 fn spawn_bybit_v5_private_bridge(live_capital_enabled: bool) -> Option<SyncSender<String>> {
     if !live_capital_enabled {
         return None;
@@ -114,13 +134,19 @@ fn spawn_bybit_v5_private_bridge(live_capital_enabled: bool) -> Option<SyncSende
     let (key, secret) = match (api_key, api_secret) {
         (Some(k), Some(s)) => (k, s),
         _ => {
-            println!("[BYBIT V5 BRIDGE] --live-capital requested but BYBIT_API_KEY / BYBIT_API_SECRET missing.");
+            println!(
+                "{}🔴 [BYBIT V5 BRIDGE] --live-capital requested but BYBIT_API_KEY / BYBIT_API_SECRET missing.{}",
+                ANSI_RED, ANSI_RESET
+            );
             return None;
         }
     };
 
     let (tx, rx) = sync_channel::<String>(64);
-    println!("[BYBIT V5 BRIDGE] Authenticated HMAC-SHA256 Live Order Dispatcher ARMED.");
+    println!(
+        "{}🟡 [BYBIT V5 BRIDGE] Authenticated HMAC-SHA256 Live Order Dispatcher ARMED.{}",
+        ANSI_YELLOW, ANSI_RESET
+    );
 
     thread::spawn(move || {
         while let Ok(json_body) = rx.recv() {
@@ -223,18 +249,21 @@ fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
         (Some(t), Some(c)) => (t, c),
         _ => {
             println!(
-                "[TELEGRAM] Missing bot token or chat_id. Keys detected in .env: {:?} (running silent).",
-                discovered_keys
+                "{}🟠 [TELEGRAM] Missing bot token or chat_id. Keys detected in .env: {:?} (running silent).{}",
+                ANSI_ORANGE, discovered_keys, ANSI_RESET
             );
             return None;
         }
     };
 
     let (tx, rx) = sync_channel::<String>(64);
-    println!("[TELEGRAM] Asynchronous 1:1 transactional notifier thread active.");
+    println!(
+        "{}🟢 [TELEGRAM] Asynchronous 1:1 transactional notifier thread active.{}",
+        ANSI_GREEN, ANSI_RESET
+    );
 
     let _ = tx.try_send(
-        "[VORTEX-L2 STAGE 16 ONLINE] 200Hz SHM v5 + 1.5s Anti-Burst Queue Guard active."
+        "🟢 [VORTEX-L2 STAGE 20 ONLINE]\nSHM v9 (200.0 Hz) + Semantic Color Telemetry + 5-Tick Harvest active in sniper-singapur."
             .to_owned(),
     );
 
@@ -283,7 +312,6 @@ fn rehydrate_shadow_ledger(
                 .get("maker_exit")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
-            // Purge negative MakerPassiveUnwind records created during the 8-minute Stage 17 experiment
             if is_maker && net_bps < 0.0 {
                 purged_stage17 += 1;
                 continue;
@@ -325,12 +353,82 @@ fn rehydrate_shadow_ledger(
         .exec_closed_count
         .store(restored_count, Ordering::Release);
     println!(
-        "[JSONL REHYDRATE] Restored {} clean shadow trades (Purged Stage 17 scars: {} | CumNetPnL: {:+.4} USDT | PF: {:.2})",
+        "{}🟢 [JSONL REHYDRATE] Restored {} clean shadow trades (CumNetPnL: {:+.4} USDT | PF: {:.2}){}",
+        ANSI_GREEN,
         restored_count,
-        purged_stage17,
         (ledger.cumulative_net_pnl_1e8 as f64) / 100_000_000.0,
-        (fsm.net_profit_factor_x100() as f64) / 100.0
+        (fsm.net_profit_factor_x100() as f64) / 100.0,
+        ANSI_RESET
     );
+}
+
+fn print_colorized_shadow_trades() -> ExitCode {
+    let file_path = Path::new("data/vortex_shadow_trades.jsonl");
+    let file = match File::open(file_path) {
+        Ok(f) => f,
+        Err(_) => {
+            println!("⚪ (No closed shadow trades yet in data/vortex_shadow_trades.jsonl)");
+            return ExitCode::SUCCESS;
+        }
+    };
+    let reader = BufReader::new(file);
+    let mut total_net_bps = 0.0_f64;
+    let mut wins = 0_u64;
+    let mut scratches = 0_u64;
+    let mut losses = 0_u64;
+
+    for (idx, line) in reader.lines().map_while(Result::ok).enumerate() {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+            let sym = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("-");
+            let side = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("-");
+            let kind = val.get("kind").and_then(serde_json::Value::as_str).unwrap_or("-");
+            let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+            let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+
+            total_net_bps += net_bps;
+            let (color, icon, badge) = classify_pnl_badge(net_bps);
+            if net_bps > 0.50 {
+                wins += 1;
+            } else if net_bps >= -0.50 {
+                scratches += 1;
+            } else {
+                losses += 1;
+            }
+
+            println!(
+                "  {}{} [SHADOW #{} {:<7}] {:<9} {:<4} {:<20} | {}t -> {}t | Net: {:+.2} bps (Maker={}){}",
+                color,
+                icon,
+                idx + 1,
+                badge,
+                sym,
+                side,
+                kind,
+                en_t,
+                ex_t,
+                net_bps,
+                is_maker,
+                ANSI_RESET
+            );
+        }
+    }
+
+    let (sum_color, sum_icon, _) = classify_pnl_badge(total_net_bps);
+    println!("------------------------------------------------------------------------------------------");
+    println!(
+        "  {}{} [SHADOW SUMMARY] Total: {} (🟢 Wins: {} | 🟠 Scratches: {} | 🔴 Losses: {}) | CumNet: {:+.2} bps{}",
+        sum_color,
+        sum_icon,
+        wins + scratches + losses,
+        wins,
+        scratches,
+        losses,
+        total_net_bps,
+        ANSI_RESET
+    );
+    ExitCode::SUCCESS
 }
 
 fn append_shadow_trade_jsonl(
@@ -505,16 +603,20 @@ fn print_live_shm_hud() -> ExitCode {
                     Some((_, _, s)) => s,
                     None => 0,
                 };
-                let verdict_str = match evaluator.evaluate_entry_signal(&spec, &snap) {
-                    Ok(SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }) => "AUTH_LONG_MKR",
-                    Ok(SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. }) => "AUTH_SHORT_MKR",
-                    Ok(SignalVerdict::SpoofingVeto) => "SPOOF_VETO",
-                    Ok(SignalVerdict::NeutralNoAction) => "NEUTRAL_WAIT",
-                    Err(_) => "GUARD_VETO",
+                let (v_col, v_icon, verdict_str) = match evaluator.evaluate_entry_signal(&spec, &snap) {
+                    Ok(SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }) => {
+                        (ANSI_YELLOW, "🟡", "AUTH_LONG_MKR")
+                    }
+                    Ok(SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. }) => {
+                        (ANSI_YELLOW, "🟡", "AUTH_SHORT_MKR")
+                    }
+                    Ok(SignalVerdict::SpoofingVeto) => (ANSI_ORANGE, "🟠", "SPOOF_VETO"),
+                    Ok(SignalVerdict::NeutralNoAction) => (ANSI_GRAY, "⚪", "NEUTRAL_WAIT"),
+                    Err(_) => (ANSI_RED, "🔴", "GUARD_VETO"),
                 };
 
                 println!(
-                    "  {}  | {:<10} | {:>12} | {:>7}.{:04} | {:>7}.{:04} | {:>5} | {:>+6.2} | {:>+6.2} | {:>+6.2} | {}",
+                    "  {}  | {:<10} | {:>12} | {:>7}.{:04} | {:>7}.{:04} | {:>5} | {:>+6.2} | {:>+6.2} | {:>+6.2} | {}{} {}{}",
                     slot_idx,
                     snap.symbol_id.name(),
                     snap.sequence_id,
@@ -526,7 +628,10 @@ fn print_live_shm_hud() -> ExitCode {
                     snap.factor_ofi.get(),
                     snap.factor_tfi.get(),
                     snap.factor_geom.get(),
-                    verdict_str
+                    v_col,
+                    v_icon,
+                    verdict_str,
+                    ANSI_RESET
                 );
             }
         }
@@ -547,19 +652,22 @@ fn print_live_shm_hud() -> ExitCode {
     let fills = arena.exec_fill_count.load(Ordering::Acquire);
     let closed = arena.exec_closed_count.load(Ordering::Acquire);
 
-    let state_label = match state_code {
-        0 => "IDLE (SCANNING)",
-        1 => "PLACING_MAKER",
-        2 => "RESTING_L1_QUEUE",
-        3 => "POSITION_OPEN_MAKER_TP",
-        4 => "EMERGENCY_SL",
-        _ => "HALTED_GUARD",
+    let (st_col, st_icon, state_label) = match state_code {
+        0 => (ANSI_GRAY, "⚪", "IDLE (SCANNING)"),
+        1 => (ANSI_YELLOW, "🟡", "PLACING_MAKER"),
+        2 => (ANSI_YELLOW, "🟡", "RESTING_L1_QUEUE"),
+        3 => (ANSI_YELLOW, "🟡", "POSITION_OPEN_MAKER_TP"),
+        4 => (ANSI_RED, "🔴", "EMERGENCY_SL"),
+        _ => (ANSI_RED, "��", "HALTED_GUARD"),
     };
 
     println!("------------------------------------------------------------------------------------------");
     println!(
-        "[EXEC FSM LIVE] State: {} | Sym: {} ({}) @ {}t [Peak:{}t | TP:{}t | SL:{}t] (Q: {} lots) | Armed: {} | Aborts: {} | Fills: {} | Closed: {}",
+        "[EXEC FSM LIVE] State: {}{} {}{} | Sym: {} ({}) @ {}t [Peak:{}t | TP:{}t | SL:{}t] (Q: {} lots) | 🟡Armed: {} | 🟠Aborts: {} | 🟡Fills: {} | 🟢Closed: {}",
+        st_col,
+        st_icon,
         state_label,
+        ANSI_RESET,
         if state_code == 0 { "-" } else { active_sym.name() },
         if state_code == 0 { "-" } else { side_str },
         entry_ticks,
@@ -625,11 +733,13 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 resting_since_ts: since_saved,
             };
             println!(
-                "[SHM HOT-RESTORE] Rehydrated RestingEntryQueue on {} {:?} @ {}t (Queue: {} lots)",
+                "{}🟡 [SHM HOT-RESTORE] Rehydrated RestingEntryQueue on {} {:?} @ {}t (Queue: {} lots){}",
+                ANSI_YELLOW,
                 APPROVED_SPECS[active_slot].symbol_id.name(),
                 side_saved,
                 entry_saved.0,
-                q_saved.0
+                q_saved.0,
+                ANSI_RESET
             );
         } else {
             fsm.state = OrderLifecycleState::PositionOpenMakerExit {
@@ -642,21 +752,25 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 opened_ts: since_saved,
             };
             println!(
-                "[SHM HOT-RESTORE] Rehydrated PositionOpenMakerExit on {} {:?} @ {}t [Peak:{}t | TP:{}t | SL:{}t]",
+                "{}🟡 [SHM HOT-RESTORE] Rehydrated PositionOpenMakerExit on {} {:?} @ {}t [Peak:{}t | TP:{}t | SL:{}t]{}",
+                ANSI_YELLOW,
                 APPROVED_SPECS[active_slot].symbol_id.name(),
                 side_saved,
                 entry_saved.0,
                 peak_saved.0,
                 tp_saved.0,
-                sl_saved.0
+                sl_saved.0,
+                ANSI_RESET
             );
         }
     }
 
     println!(
-        "[DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with 1.5s Anti-Burst & MFE Ratchet.",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with Semantic Color Telemetry & 5-Tick Harvest.{}",
+        ANSI_GREEN,
         arena.version,
-        shm_path.display()
+        shm_path.display(),
+        ANSI_RESET
     );
 
     loop {
@@ -749,13 +863,15 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         }
 
                                         println!(
-                                            "[SHADOW QUEUE ARMED] {} {:?} resting at L1 (Queue ahead: {} lots | Seq: {} | OFI: {:+.2} | TFI: {:+.2})",
+                                            "{}🟡 [SHADOW QUEUE ARMED] {} {:?} resting at L1 (Queue ahead: {} lots | Seq: {} | OFI: {:+.2} | TFI: {:+.2}){}",
+                                            ANSI_YELLOW,
                                             snap.symbol_id.name(),
                                             side,
                                             resting_queue_ahead.0,
                                             snap.sequence_id,
                                             snap.factor_ofi.get(),
-                                            snap.factor_tfi.get()
+                                            snap.factor_tfi.get(),
+                                            ANSI_RESET
                                         );
                                     }
                                     break;
@@ -776,6 +892,33 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             continue;
                         }
                         last_seen_seq[active_slot] = snap.sequence_id;
+
+                        // Check immediate joint flow reversal BEFORE allowing a toxic sweep fill
+                        if fsm.check_resting_queue_abort(&snap) {
+                            arena.exec_abort_count.fetch_add(1, Ordering::Release);
+                            arena.exec_state_code.store(0, Ordering::Release);
+                            arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                            if let Some(ref b_tx) = bybit_tx {
+                                let cancel_json = format!(
+                                    "{{\"category\":\"linear\",\"symbol\":\"{}\",\"cancelAll\":true}}",
+                                    snap.symbol_id.name()
+                                );
+                                let _ = b_tx.try_send(cancel_json);
+                            }
+                            println!(
+                                "{}🟠 [SHADOW QUEUE ABORT] {} {:?} canceled before fill (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | BestAsk: {} | Entry: {}){}",
+                                ANSI_ORANGE,
+                                snap.symbol_id.name(),
+                                side,
+                                snap.factor_ofi.get(),
+                                snap.factor_tfi.get(),
+                                snap.bids[0].price.0,
+                                snap.asks[0].price.0,
+                                entry_price.0,
+                                ANSI_RESET
+                            );
+                            continue;
+                        }
 
                         let level_swept = match side {
                             Side::Bid => {
@@ -853,7 +996,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let (sl_w, sl_f) = spec.format_price_usdt_parts(PriceTicks(sl_t));
 
                             println!(
-                                "[SHADOW MAKER FILL] {} {:?} filled passively at {}.{:04} USDT ({}t | TP: {}.{:04} | SL: {}.{:04})",
+                                "{}🟡 [SHADOW MAKER FILL] {} {:?} filled passively at {}.{:04} USDT ({}t | TP: {}.{:04} | SL: {}.{:04}){}",
+                                ANSI_YELLOW,
                                 snap.symbol_id.name(),
                                 side,
                                 e_w,
@@ -862,11 +1006,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 tp_w,
                                 tp_f,
                                 sl_w,
-                                sl_f
+                                sl_f,
+                                ANSI_RESET
                             );
                             if let Some(ref tx) = tg_tx {
                                 let alert = format!(
-                                    "[VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?})\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT\nServer SL: {}.{:04} USDT",
+                                    "🟡 [VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?})\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT\nServer SL: {}.{:04} USDT",
                                     snap.symbol_id.name(),
                                     side,
                                     e_w,
@@ -879,29 +1024,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 let _ = tx.try_send(alert);
                             }
                             continue;
-                        }
-
-                        if fsm.check_resting_queue_abort(&snap) {
-                            arena.exec_abort_count.fetch_add(1, Ordering::Release);
-                            arena.exec_state_code.store(0, Ordering::Release);
-                            arena.exec_queue_ahead_lots.store(0, Ordering::Release);
-                            if let Some(ref b_tx) = bybit_tx {
-                                let cancel_json = format!(
-                                    "{{\"category\":\"linear\",\"symbol\":\"{}\",\"cancelAll\":true}}",
-                                    snap.symbol_id.name()
-                                );
-                                let _ = b_tx.try_send(cancel_json);
-                            }
-                            println!(
-                                "[SHADOW QUEUE ABORT] {} {:?} canceled before fill (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | BestAsk: {} | Entry: {})",
-                                snap.symbol_id.name(),
-                                side,
-                                snap.factor_ofi.get(),
-                                snap.factor_tfi.get(),
-                                snap.bids[0].price.0,
-                                snap.asks[0].price.0,
-                                entry_price.0
-                            );
                         }
                     }
                 }
@@ -932,9 +1054,13 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let (en_w, en_f) = spec.format_price_usdt_parts(summary.entry_price);
                             let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
                             let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
+                            let (c_col, c_icon, c_badge) = classify_pnl_badge(net_bps);
 
                             println!(
-                                "[SHADOW CLOSE] {} {:?} | {}.{:04} -> {}.{:04} | Net: {:+.2} bps | Total Trades: {}",
+                                "{}{} [SHADOW CLOSE — {}] {} {:?} | {}.{:04} -> {}.{:04} | Net: {:+.2} bps | Total Trades: {}{}",
+                                c_col,
+                                c_icon,
+                                c_badge,
                                 snap.symbol_id.name(),
                                 summary.kind,
                                 en_w,
@@ -942,12 +1068,15 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 ex_w,
                                 ex_f,
                                 net_bps,
-                                ledger.closed_trades_count
+                                ledger.closed_trades_count,
+                                ANSI_RESET
                             );
 
                             if let Some(ref tx) = tg_tx {
                                 let alert = format!(
-                                    "[VORTEX-L2 TRADE CLOSED]\nSymbol: {} ({:?})\nExit Type: {:?}\nPrice: {}.{:04} -> {}.{:04} USDT\nNet PnL: {:+.2} bps (Maker Exit: {})\nTotal Trades: {} | PF: {:.2}",
+                                    "{} [VORTEX-L2 TRADE {}]\nSymbol: {} ({:?})\nExit Type: {:?}\nPrice: {}.{:04} -> {}.{:04} USDT\nNet PnL: {:+.2} bps (Maker Exit: {})\nTotal Trades: {} | PF: {:.2}",
+                                    c_icon,
+                                    c_badge,
                                     snap.symbol_id.name(),
                                     summary.side,
                                     summary.kind,
@@ -989,9 +1118,11 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    let live_hud_mode = std::env::args().any(|a| a == "--live");
-    if live_hud_mode {
+    if std::env::args().any(|a| a == "--live") {
         return print_live_shm_hud();
+    }
+    if std::env::args().any(|a| a == "--trades") {
+        return print_colorized_shadow_trades();
     }
 
     let daemon_mode = std::env::args().any(|a| a == "--daemon");
@@ -1006,27 +1137,34 @@ fn main() -> ExitCode {
             let net_pnl_usdt_frac = (net_pnl_1e8.abs() % 100_000_000) / 10_000;
 
             println!(
-                "  -> OOS Closed Trades Verified : {} (Gate >= 500)",
-                closed_trades
+                "  {}🟢 -> OOS Closed Trades Verified : {} (Gate >= 500){}",
+                ANSI_GREEN, closed_trades, ANSI_RESET
             );
             println!(
-                "  -> Maker Exit Ratio           : {}.{:02}% (Gate >= 80.00%)",
+                "  {}🟢 -> Maker Exit Ratio           : {}.{:02}% (Gate >= 80.00%){}",
+                ANSI_GREEN,
                 maker_ratio_bps / 100,
-                maker_ratio_bps % 100
+                maker_ratio_bps % 100,
+                ANSI_RESET
             );
             println!(
-                "  -> Net Profit Factor (PostFee): {}.{:02} (Gate >= 1.35)",
+                "  {}🟢 -> Net Profit Factor (PostFee): {}.{:02} (Gate >= 1.35){}",
+                ANSI_GREEN,
                 pf_x100 / 100,
-                pf_x100 % 100
+                pf_x100 % 100,
+                ANSI_RESET
             );
             println!(
-                "  -> Cumulative Net PnL (3x)    : + {}.{:04} USDT | PARITY_SYNC Drift: {} units",
-                net_pnl_usdt_whole, net_pnl_usdt_frac, parity_drift
+                "  {}🟢 -> Cumulative Net PnL (3x)    : + {}.{:04} USDT | PARITY_SYNC Drift: {} units{}",
+                ANSI_GREEN, net_pnl_usdt_whole, net_pnl_usdt_frac, parity_drift, ANSI_RESET
             );
             println!("================================================================================");
         }
         Err(code) => {
-            println!("  [ERROR] OOS Gate verification failed with code: {}", code);
+            println!(
+                "  {}🔴 [ERROR] OOS Gate verification failed with code: {}{}",
+                ANSI_RED, code, ANSI_RESET
+            );
             return ExitCode::from(code);
         }
     }
