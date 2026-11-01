@@ -1,6 +1,6 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, 200.0 Hz Seqlock Reader,
 //! Non-Volatile SHM v5 + JSONL Ledger Rehydration, Convex MFE Maker Ratchet,
-//! Multi-Alias Telegram Notifier, Live HUD (`--live`), and 520-Trade OOS Verifier.
+//! Authenticated Bybit UTA V5 Private REST Bridge (`--live-capital`), and 520-Trade OOS Verifier.
 
 use core::sync::atomic::Ordering;
 use std::fs::{File, OpenOptions};
@@ -12,7 +12,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
-use vortex_rs::execution_fsm::{ClosedTradeSummary, ExecutionFsm, OrderLifecycleState};
+use vortex_rs::execution_fsm::{
+    sign_bybit_v5_hmac_sha256, ClosedTradeSummary, ExecutionFsm, OrderLifecycleState,
+};
 use vortex_rs::forensic_parquet::ParitySyncLedger;
 use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena};
 use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
@@ -63,6 +65,100 @@ fn now_epoch_ns() -> i64 {
         Ok(d) => d.as_nanos() as i64,
         Err(_) => 1_762_012_800_000_000_000,
     }
+}
+
+/// Asynchronous Bybit UTA V5 Private REST Order Dispatcher (`HMAC-SHA256` authenticated).
+/// Only active when `--live-capital` flag is passed at startup.
+fn spawn_bybit_v5_private_bridge(live_capital_enabled: bool) -> Option<SyncSender<String>> {
+    if !live_capital_enabled {
+        return None;
+    }
+
+    let mut api_key = std::env::var("BYBIT_API_KEY").ok();
+    let mut api_secret = std::env::var("BYBIT_API_SECRET").ok();
+
+    if api_key.is_none() || api_secret.is_none() {
+        let env_paths = [
+            ".env",
+            "/home/ubuntu/vortex-rs/.env",
+            "/home/ubuntu/Denk-sekka/.env",
+        ];
+        for p in env_paths {
+            if let Ok(file) = File::open(p) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().map_while(Result::ok) {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    let clean = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+                    if let Some((k, v)) = clean.split_once('=') {
+                        let key = k.trim();
+                        let val = v.trim().trim_matches('"').trim_matches('\'').to_owned();
+                        if !val.is_empty() {
+                            match key {
+                                "BYBIT_API_KEY" | "API_KEY" => api_key = Some(val),
+                                "BYBIT_API_SECRET" | "API_SECRET" => api_secret = Some(val),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            if api_key.is_some() && api_secret.is_some() {
+                break;
+            }
+        }
+    }
+
+    let (key, secret) = match (api_key, api_secret) {
+        (Some(k), Some(s)) => (k, s),
+        _ => {
+            println!("[BYBIT V5 BRIDGE] --live-capital requested but BYBIT_API_KEY / BYBIT_API_SECRET missing.");
+            return None;
+        }
+    };
+
+    let (tx, rx) = sync_channel::<String>(64);
+    println!("[BYBIT V5 BRIDGE] Authenticated HMAC-SHA256 Live Order Dispatcher ARMED.");
+
+    thread::spawn(move || {
+        while let Ok(json_body) = rx.recv() {
+            let ts_ms = (now_epoch_ns() / 1_000_000).to_string();
+            let recv_win = "5000";
+            let sig_bytes = sign_bybit_v5_hmac_sha256(&ts_ms, &key, recv_win, &json_body, &secret);
+            let sig_str = core::str::from_utf8(&sig_bytes).unwrap_or("");
+
+            let endpoint = if json_body.contains("\"cancelAll\"") {
+                "https://api.bybit.com/v5/order/cancel-all"
+            } else {
+                "https://api.bybit.com/v5/order/create"
+            };
+
+            let _ = Command::new("curl")
+                .args([
+                    "-sS",
+                    "-X",
+                    "POST",
+                    endpoint,
+                    "-H",
+                    "Content-Type: application/json",
+                    "-H",
+                    &format!("X-BAPI-API-KEY: {}", key),
+                    "-H",
+                    &format!("X-BAPI-TIMESTAMP: {}", ts_ms),
+                    "-H",
+                    &format!("X-BAPI-RECV-WINDOW: {}", recv_win),
+                    "-H",
+                    &format!("X-BAPI-SIGN: {}", sig_str),
+                    "-d",
+                    &json_body,
+                ])
+                .output();
+        }
+    });
+
+    Some(tx)
 }
 
 fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
@@ -138,7 +234,7 @@ fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
     println!("[TELEGRAM] Asynchronous 1:1 transactional notifier thread active.");
 
     let _ = tx.try_send(
-        "[VORTEX-L2 STAGE 15 ONLINE] 200Hz SHM v5 Execution Engine + MFE Zero-Loss Ratchet active."
+        "[VORTEX-L2 STAGE 16 ONLINE] 200Hz SHM v5 + 1.5s Anti-Burst Queue Guard active."
             .to_owned(),
     );
 
@@ -467,7 +563,7 @@ fn print_live_shm_hud() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_shadow_execution_daemon() -> ExitCode {
+fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let shm_path = MappedShmRegion::default_shm_path();
     let region = match MappedShmRegion::open_or_create(&shm_path, false) {
         Ok(r) => r,
@@ -475,6 +571,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
     };
     let arena = region.arena();
     let tg_tx = spawn_async_telegram_notifier();
+    let bybit_tx = spawn_bybit_v5_private_bridge(live_capital_enabled);
     let evaluator = OrthogonalFactorState::new();
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
     let mut ledger = ParitySyncLedger::new(10_000_000_000);
@@ -544,7 +641,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
     }
 
     println!(
-        "[DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with MFE Ratchet & 5ms FSM.",
+        "[DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with 1.5s Anti-Burst & MFE Ratchet.",
         arena.version,
         shm_path.display()
     );
@@ -618,6 +715,25 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                             Ordering::Release,
                                         );
                                         arena.exec_armed_count.fetch_add(1, Ordering::Release);
+
+                                        if let Some(ref b_tx) = bybit_tx {
+                                            let (ew, ef) = spec.format_price_usdt_parts(entry_price);
+                                            let (sw, sf) = spec.format_price_usdt_parts(sl_trigger_price);
+                                            let bybit_side = match side {
+                                                Side::Bid => "Buy",
+                                                Side::Ask => "Sell",
+                                            };
+                                            let order_json = format!(
+                                                "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"1\",\"price\":\"{}.{:04}\",\"stopLoss\":\"{}.{:04}\",\"slTriggerBy\":\"MarkPrice\"}}",
+                                                snap.symbol_id.name(),
+                                                bybit_side,
+                                                ew,
+                                                ef,
+                                                sw,
+                                                sf
+                                            );
+                                            let _ = b_tx.try_send(order_json);
+                                        }
 
                                         println!(
                                             "[SHADOW QUEUE ARMED] {} {:?} resting at L1 (Queue ahead: {} lots | Seq: {} | OFI: {:+.2} | TFI: {:+.2})",
@@ -756,6 +872,13 @@ fn run_shadow_execution_daemon() -> ExitCode {
                             arena.exec_abort_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(0, Ordering::Release);
                             arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                            if let Some(ref b_tx) = bybit_tx {
+                                let cancel_json = format!(
+                                    "{{\"category\":\"linear\",\"symbol\":\"{}\",\"cancelAll\":true}}",
+                                    snap.symbol_id.name()
+                                );
+                                let _ = b_tx.try_send(cancel_json);
+                            }
                             println!(
                                 "[SHADOW QUEUE ABORT] {} {:?} canceled before fill (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | BestAsk: {} | Entry: {})",
                                 snap.symbol_id.name(),
@@ -859,6 +982,7 @@ fn main() -> ExitCode {
     }
 
     let daemon_mode = std::env::args().any(|a| a == "--daemon");
+    let live_capital_mode = std::env::args().any(|a| a == "--live-capital");
     println!("================================================================================");
     println!("[VORTEX-EXEC V1.0] EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER (STAGE 5)");
     println!("================================================================================");
@@ -895,7 +1019,7 @@ fn main() -> ExitCode {
     }
 
     if daemon_mode {
-        return run_shadow_execution_daemon();
+        return run_shadow_execution_daemon(live_capital_mode);
     }
 
     ExitCode::SUCCESS
