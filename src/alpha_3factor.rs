@@ -30,6 +30,7 @@ pub struct OrthogonalFactorState {
     initialized: bool,
     prev_bids: [BookLevel; OFI_DEPTH],
     prev_asks: [BookLevel; OFI_DEPTH],
+    ema_reference_depth: f64,
     ofi_fast_500ms: f64,
     ofi_med_3s: f64,
     ofi_slow_15s: f64,
@@ -62,6 +63,7 @@ impl OrthogonalFactorState {
                 price: PriceTicks(0),
                 qty: LotQty(0),
             }; OFI_DEPTH],
+            ema_reference_depth: 1.0,
             ofi_fast_500ms: 0.0,
             ofi_med_3s: 0.0,
             ofi_slow_15s: 0.0,
@@ -77,7 +79,6 @@ impl OrthogonalFactorState {
     #[inline]
     pub fn on_public_trade(&mut self, aggressor_side: Side, qty: LotQty) -> BoundedScore {
         let q = (qty.0.max(0)) as f64;
-        // Exponential decay factor (~3s horizon at typical trade arrival rate)
         self.tfi_buy_accum *= 0.92;
         self.tfi_sell_accum *= 0.92;
         match aggressor_side {
@@ -94,24 +95,27 @@ impl OrthogonalFactorState {
     /// and writes the 3 pre-warmed orthogonal factors into `snap`.
     #[inline]
     pub fn on_l2_snapshot(&mut self, snap: &mut SymbolLobSnapshot) {
+        let level_weights: [f64; OFI_DEPTH] = [1.0, 0.70, 0.45, 0.25, 0.12];
         let mut cur_bids = [BookLevel::default(); OFI_DEPTH];
         let mut cur_asks = [BookLevel::default(); OFI_DEPTH];
+        let mut cur_weighted_depth = 0.0;
+
         let mut i = 0;
         while i < OFI_DEPTH {
             cur_bids[i] = snap.bids[i];
             cur_asks[i] = snap.asks[i];
+            cur_weighted_depth +=
+                level_weights[i] * ((cur_bids[i].qty.0.max(1) + cur_asks[i].qty.0.max(1)) as f64);
             i += 1;
         }
 
         if !self.initialized {
             self.prev_bids = cur_bids;
             self.prev_asks = cur_asks;
+            self.ema_reference_depth = cur_weighted_depth.max(1.0);
             self.initialized = true;
         } else {
-            let level_weights: [f64; OFI_DEPTH] = [1.0, 0.70, 0.45, 0.25, 0.12];
             let mut net_flow = 0.0;
-            let mut norm_depth = 1.0;
-
             let mut lvl = 0;
             while lvl < OFI_DEPTH {
                 let w = level_weights[lvl];
@@ -137,12 +141,14 @@ impl OrthogonalFactorState {
                 };
 
                 net_flow += w * (bid_delta - ask_delta);
-                norm_depth += w * ((b_cur.qty.0.max(1) + a_cur.qty.0.max(1)) as f64);
                 lvl += 1;
             }
 
-            let step_ofi = (net_flow / norm_depth).clamp(-1.0, 1.0);
-            // Multi-scale exponential update: 500ms (alpha=0.35), 3s (alpha=0.10), 15s (alpha=0.025)
+            // Normalize against pre-impact smoothed reference depth to prevent self-dilution
+            let step_ofi = (net_flow / self.ema_reference_depth.max(1.0)).clamp(-1.0, 1.0);
+            self.ema_reference_depth =
+                0.95 * self.ema_reference_depth + 0.05 * cur_weighted_depth.max(1.0);
+
             self.ofi_fast_500ms = 0.65 * self.ofi_fast_500ms + 0.35 * step_ofi;
             self.ofi_med_3s = 0.90 * self.ofi_med_3s + 0.10 * step_ofi;
             self.ofi_slow_15s = 0.975 * self.ofi_slow_15s + 0.025 * step_ofi;
@@ -191,39 +197,33 @@ impl OrthogonalFactorState {
         };
         let mid_ticks = PriceTicks((best_bid.price.0 + best_ask.price.0) / 2);
 
-        // Step 1: Verify pair microeconomic eligibility (Tick_bps <= 1.50 bps & Vol_5m >= 35.00 bps)
         let _tick_bps = spec.validate_eligibility(mid_ticks, snap.realized_vol_5m)?;
 
         let x_ofi = snap.factor_ofi.get();
         let x_tfi = snap.factor_tfi.get();
         let x_geom = snap.factor_geom.get();
 
-        // Step 2: Anti-Spoofing Gate (if strong L2 book OFI is contradicted by real trade tape)
         if (x_ofi >= 0.35 && x_tfi <= -0.05) || (x_ofi <= -0.35 && x_tfi >= 0.05) {
             return Ok(SignalVerdict::SpoofingVeto);
         }
 
-        // Step 3: Orthogonal Composite Conviction Score in [-1.0, +1.0]
         let composite = 0.45 * x_ofi + 0.35 * x_tfi + 0.20 * x_geom;
         let abs_comp = composite.abs();
         if abs_comp < 0.42 {
             return Ok(SignalVerdict::NeutralNoAction);
         }
 
-        //Require all 3 factors to agree in sign before committing capital
         let long_aligned = x_ofi > 0.25 && x_tfi > 0.20 && x_geom > 0.10;
         let short_aligned = x_ofi < -0.25 && x_tfi < -0.20 && x_geom < -0.10;
         if !long_aligned && !short_aligned {
             return Ok(SignalVerdict::NeutralNoAction);
         }
 
-        // Step 4: Conditional Excursion Prediction scaled by 5-minute realized volatility
         let vol_bps = snap.realized_vol_5m.raw() as f64;
         let predicted_scaled = ((vol_bps * abs_comp * 1.15) as i64)
             .clamp(0, ScaledBps::MAX_STRUCTURAL_EXCURSION_BPS.raw());
         let expected_excursion = ScaledBps(predicted_scaled);
 
-        // Step 5: Enforce 3x Round-Trip Friction Barrier (>= 3 * Cost_RT and >= 35.00 bps)
         let cost_rt = spec.passes_3x_friction_barrier(mid_ticks, expected_excursion)?;
 
         let side = if long_aligned { Side::Bid } else { Side::Ask };
@@ -308,7 +308,6 @@ mod tests {
         }
         state.on_l2_snapshot(&mut snap);
 
-        // Simulate aggressive buying on publicTrade and strong Bid L2 additions
         for _ in 0..6 {
             let _ = state.on_public_trade(Side::Bid, LotQty(450));
             for i in 0..5 {
