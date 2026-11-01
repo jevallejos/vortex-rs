@@ -28,6 +28,8 @@ impl ScaledBps {
     pub const MAX_ALLOWED_TICK_BPS: Self = Self(150);
     /// Minimum structural excursion target: 35.00 bps (0.35%).
     pub const MIN_STRUCTURAL_EXCURSION_BPS: Self = Self(3_500);
+    /// Maximum structural excursion cap: 80.00 bps (0.80%).
+    pub const MAX_STRUCTURAL_EXCURSION_BPS: Self = Self(8_000);
     /// Bybit UTA V5 VIP-0 Maker fee: 2.00 bps (0.020%).
     pub const BYBIT_VIP0_MAKER_FEE_BPS: Self = Self(200);
     /// Bybit UTA V5 VIP-0 Taker fee: 5.50 bps (0.055%).
@@ -78,6 +80,13 @@ impl BoundedScore {
     pub const fn get(self) -> f64 {
         self.0
     }
+
+    /// Converts score in [-1.0, +1.0] to integer basis points [-10_000, +10_000] for binary storage.
+    #[inline]
+    #[must_use]
+    pub fn to_bps_i32(self) -> i32 {
+        (self.0 * 10_000.0) as i32
+    }
 }
 
 /// Compact static identifier for a trading pair in the shared-memory ring.
@@ -116,6 +125,14 @@ pub enum VortexError {
     },
     SharedMemorySeqConflict,
     InvalidSymbolSlot,
+    BatchCapacityExceeded,
+    ColumnarIoFailure,
+    ColumnarFormatCorrupted,
+    AccountingParityDrift {
+        internal_balance_1e8: i64,
+        exchange_balance_1e8: i64,
+        drift_1e8: i64,
+    },
 }
 
 impl fmt::Display for VortexError {

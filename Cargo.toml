@@ -9,6 +9,10 @@ license = "Proprietary"
 name = "vortex_rs"
 path = "src/lib.rs"
 
+[[bin]]
+name = "vortex_tap"
+path = "src/bin/vortex_tap.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
