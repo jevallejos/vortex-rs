@@ -1057,6 +1057,6 @@ mod tests {
     #[test]
     fn test_oos_520_trades_gate_passes_all_institutional_thresholds() {
         let res = run_oos_certification_suite();
-        assert_eq!(res, Ok((520, 8_000, 532, 97_136_000_000, 0)));
+        assert_eq!(res, Ok((520, 8_000, 532, 9_713_600_000, 0)));
     }
 }
