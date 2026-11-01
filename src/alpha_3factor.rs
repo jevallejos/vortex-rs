@@ -1,5 +1,6 @@
 //! Orthogonal 3-factor microstructural alpha model (`X_OFI`, `X_TFI`, `X_Geom`)
-//! with anti-spoofing confirmation and 3x round-trip friction barrier enforcement.
+//! with scale-invariant directional flow accumulators, anti-spoofing confirmation,
+//! and 3x round-trip friction barrier enforcement.
 
 use crate::lob_shm::{BookLevel, SymbolLobSnapshot};
 use crate::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, VortexError};
@@ -30,10 +31,12 @@ pub struct OrthogonalFactorState {
     initialized: bool,
     prev_bids: [BookLevel; OFI_DEPTH],
     prev_asks: [BookLevel; OFI_DEPTH],
-    ema_reference_depth: f64,
-    ofi_fast_500ms: f64,
-    ofi_med_3s: f64,
-    ofi_slow_15s: f64,
+    ofi_pos_fast: f64,
+    ofi_neg_fast: f64,
+    ofi_pos_med: f64,
+    ofi_neg_med: f64,
+    ofi_pos_slow: f64,
+    ofi_neg_slow: f64,
     tfi_buy_accum: f64,
     tfi_sell_accum: f64,
     last_ofi: BoundedScore,
@@ -63,16 +66,24 @@ impl OrthogonalFactorState {
                 price: PriceTicks(0),
                 qty: LotQty(0),
             }; OFI_DEPTH],
-            ema_reference_depth: 1.0,
-            ofi_fast_500ms: 0.0,
-            ofi_med_3s: 0.0,
-            ofi_slow_15s: 0.0,
+            ofi_pos_fast: 0.0,
+            ofi_neg_fast: 0.0,
+            ofi_pos_med: 0.0,
+            ofi_neg_med: 0.0,
+            ofi_pos_slow: 0.0,
+            ofi_neg_slow: 0.0,
             tfi_buy_accum: 0.0,
             tfi_sell_accum: 0.0,
             last_ofi: BoundedScore::ZERO,
             last_tfi: BoundedScore::ZERO,
             last_geom: BoundedScore::ZERO,
         }
+    }
+
+    /// Wipes any prior or synthetic state when a fresh L2 snapshot arrives from the exchange.
+    #[inline]
+    pub fn reset(&mut self) {
+        *self = Self::new();
     }
 
     /// Updates Factor 2 (`X_TFI`) from a real executed `publicTrade` event.
@@ -85,37 +96,39 @@ impl OrthogonalFactorState {
             Side::Bid => self.tfi_buy_accum += q,
             Side::Ask => self.tfi_sell_accum += q,
         }
-        let total = (self.tfi_buy_accum + self.tfi_sell_accum).max(1e-9);
-        let raw_tfi = (self.tfi_buy_accum - self.tfi_sell_accum) / total;
-        self.last_tfi = BoundedScore::new_clamped(raw_tfi);
+        let total = self.tfi_buy_accum + self.tfi_sell_accum;
+        if total <= 1e-9 {
+            self.last_tfi = BoundedScore::ZERO;
+        } else {
+            let raw_tfi = (self.tfi_buy_accum - self.tfi_sell_accum) / total;
+            self.last_tfi = BoundedScore::new_clamped(raw_tfi);
+        }
         self.last_tfi
     }
 
-    /// Updates Factor 1 (`X_OFI`) and Factor 3 (`X_Geom`) from a new L2 book snapshot
-    /// and writes the 3 pre-warmed orthogonal factors into `snap`.
+    /// Updates Factor 1 (`X_OFI`) using scale-invariant directional pressure accumulators
+    /// and Factor 3 (`X_Geom`) from a new L2 book snapshot.
     #[inline]
     pub fn on_l2_snapshot(&mut self, snap: &mut SymbolLobSnapshot) {
         let level_weights: [f64; OFI_DEPTH] = [1.0, 0.70, 0.45, 0.25, 0.12];
         let mut cur_bids = [BookLevel::default(); OFI_DEPTH];
         let mut cur_asks = [BookLevel::default(); OFI_DEPTH];
-        let mut cur_weighted_depth = 0.0;
 
         let mut i = 0;
         while i < OFI_DEPTH {
             cur_bids[i] = snap.bids[i];
             cur_asks[i] = snap.asks[i];
-            cur_weighted_depth +=
-                level_weights[i] * ((cur_bids[i].qty.0.max(1) + cur_asks[i].qty.0.max(1)) as f64);
             i += 1;
         }
 
         if !self.initialized {
             self.prev_bids = cur_bids;
             self.prev_asks = cur_asks;
-            self.ema_reference_depth = cur_weighted_depth.max(1.0);
             self.initialized = true;
         } else {
-            let mut net_flow = 0.0;
+            let mut pos_pressure = 0.0;
+            let mut neg_pressure = 0.0;
+
             let mut lvl = 0;
             while lvl < OFI_DEPTH {
                 let w = level_weights[lvl];
@@ -140,21 +153,30 @@ impl OrthogonalFactorState {
                     (a_cur.qty.0 - a_prv.qty.0) as f64
                 };
 
-                net_flow += w * (bid_delta - ask_delta);
+                let net_level_impulse = w * (bid_delta - ask_delta);
+                if net_level_impulse > 0.0 {
+                    pos_pressure += net_level_impulse;
+                } else if net_level_impulse < 0.0 {
+                    neg_pressure += -net_level_impulse;
+                }
                 lvl += 1;
             }
 
-            // Normalize against pre-impact smoothed reference depth to prevent self-dilution
-            let step_ofi = (net_flow / self.ema_reference_depth.max(1.0)).clamp(-1.0, 1.0);
-            self.ema_reference_depth =
-                0.95 * self.ema_reference_depth + 0.05 * cur_weighted_depth.max(1.0);
+            // Multi-scale directional accumulators: Fast (~500ms), Medium (~3s), Slow (~15s)
+            self.ofi_pos_fast = 0.80 * self.ofi_pos_fast + pos_pressure;
+            self.ofi_neg_fast = 0.80 * self.ofi_neg_fast + neg_pressure;
 
-            self.ofi_fast_500ms = 0.65 * self.ofi_fast_500ms + 0.35 * step_ofi;
-            self.ofi_med_3s = 0.90 * self.ofi_med_3s + 0.10 * step_ofi;
-            self.ofi_slow_15s = 0.975 * self.ofi_slow_15s + 0.025 * step_ofi;
+            self.ofi_pos_med = 0.94 * self.ofi_pos_med + pos_pressure;
+            self.ofi_neg_med = 0.94 * self.ofi_neg_med + neg_pressure;
 
-            let blended_ofi =
-                0.50 * self.ofi_fast_500ms + 0.35 * self.ofi_med_3s + 0.15 * self.ofi_slow_15s;
+            self.ofi_pos_slow = 0.985 * self.ofi_pos_slow + pos_pressure;
+            self.ofi_neg_slow = 0.985 * self.ofi_neg_slow + neg_pressure;
+
+            let fast_ratio = Self::directional_ratio(self.ofi_pos_fast, self.ofi_neg_fast);
+            let med_ratio = Self::directional_ratio(self.ofi_pos_med, self.ofi_neg_med);
+            let slow_ratio = Self::directional_ratio(self.ofi_pos_slow, self.ofi_neg_slow);
+
+            let blended_ofi = 0.50 * fast_ratio + 0.35 * med_ratio + 0.15 * slow_ratio;
             self.last_ofi = BoundedScore::new_clamped(blended_ofi);
             self.prev_bids = cur_bids;
             self.prev_asks = cur_asks;
@@ -181,6 +203,16 @@ impl OrthogonalFactorState {
         snap.factor_ofi = self.last_ofi;
         snap.factor_tfi = self.last_tfi;
         snap.factor_geom = self.last_geom;
+    }
+
+    #[inline]
+    fn directional_ratio(pos: f64, neg: f64) -> f64 {
+        let total = pos + neg;
+        if total <= 1e-9 {
+            0.0
+        } else {
+            (pos - neg) / total
+        }
     }
 
     /// Evaluates whether the 3 orthogonal factors authorize a passive Maker entry
@@ -309,13 +341,12 @@ mod tests {
         state.on_l2_snapshot(&mut snap);
 
         for _ in 0..6 {
-            let _ = state.on_public_trade(Side::Bid, LotQty(450));
-            for i in 0..5 {
-                snap.bids[i].qty.0 += 350;
-            }
+            let _ = state.on_public_trade(Side::Bid, LotQty(5));
+            snap.bids[0].qty.0 += 2;
             state.on_l2_snapshot(&mut snap);
         }
 
+        assert!(snap.factor_ofi.get() > 0.80);
         let verdict = state.evaluate_entry_signal(&spec, &snap);
         assert!(matches!(
             verdict,

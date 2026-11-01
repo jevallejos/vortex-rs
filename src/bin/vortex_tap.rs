@@ -33,7 +33,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(776_700),
+        reference_mid_ticks: PriceTicks(780_997),
         realized_vol_5m: ScaledBps::from_whole_bps(42),
     },
     CandidateContract {
@@ -44,7 +44,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(265_000),
+        reference_mid_ticks: PriceTicks(226_776),
         realized_vol_5m: ScaledBps::from_whole_bps(46),
     },
     CandidateContract {
@@ -55,7 +55,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(17_500),
+        reference_mid_ticks: PriceTicks(9_474),
         realized_vol_5m: ScaledBps::from_whole_bps(58),
     },
     CandidateContract {
@@ -66,7 +66,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(26_000),
+        reference_mid_ticks: PriceTicks(8_749),
         realized_vol_5m: ScaledBps::from_whole_bps(54),
     },
     CandidateContract {
@@ -77,7 +77,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(48_000),
+        reference_mid_ticks: PriceTicks(23_524),
         realized_vol_5m: ScaledBps::from_whole_bps(68),
     },
     CandidateContract {
@@ -88,7 +88,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(21_000),
+        reference_mid_ticks: PriceTicks(9_012),
         realized_vol_5m: ScaledBps::from_whole_bps(62),
     },
     CandidateContract {
@@ -188,6 +188,7 @@ fn process_bybit_ws_frame(
         let snap = &mut active_snaps[slot_idx];
         if msg_type == "snapshot" {
             snap.clear_book();
+            factor_states[slot_idx].reset();
         }
 
         if let Some(bids) = data.get("b").and_then(serde_json::Value::as_array) {
@@ -346,6 +347,17 @@ fn run_live_bybit_ws_loop(
     active_snaps: &mut [SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
     batch: &mut ColumnarParquetBatch,
 ) -> ! {
+    // Wipe any synthetic audit accumulators before connecting to live exchange stream
+    let mut s = 0;
+    while s < approved_slots {
+        factor_states[s].reset();
+        active_snaps[s].clear_book();
+        active_snaps[s].factor_ofi = vortex_rs::types::BoundedScore::ZERO;
+        active_snaps[s].factor_tfi = vortex_rs::types::BoundedScore::ZERO;
+        active_snaps[s].factor_geom = vortex_rs::types::BoundedScore::ZERO;
+        s += 1;
+    }
+
     let subscribe_payload = r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","publicTrade.BTCUSDT","orderbook.50.ETHUSDT","publicTrade.ETHUSDT","orderbook.50.SOLUSDT","publicTrade.SOLUSDT","orderbook.50.AVAXUSDT","publicTrade.AVAXUSDT","orderbook.50.TAOUSDT","publicTrade.TAOUSDT","orderbook.50.SUIUSDT","publicTrade.SUIUSDT"]}"#;
     let mut parquet_seq: u64 = 0;
 
@@ -446,8 +458,6 @@ fn main() -> ExitCode {
                 let slot_idx = approved_slots;
                 approved_slots += 1;
 
-                let _ = factor_states[slot_idx].on_public_trade(Side::Bid, LotQty(500));
-
                 let mut snap = SymbolLobSnapshot {
                     symbol_id: candidate.spec.symbol_id,
                     is_eligible: true,
@@ -469,7 +479,6 @@ fn main() -> ExitCode {
                         qty: LotQty(200),
                     };
                 }
-                factor_states[slot_idx].on_l2_snapshot(&mut snap);
                 active_snaps[slot_idx] = snap;
 
                 if let Ok(slot) = arena.slot(slot_idx) {

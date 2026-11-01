@@ -1,16 +1,15 @@
 //! Binary 3 (`vortex_replay`): Deterministic offline L2 + publicTrade FIFO queue-priority
-//! simulator with 25ms network RTT latency and conservative 25% cancellation credit.
+//! simulator and live `data/*.parquet` archive auditor.
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use vortex_rs::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind};
 use vortex_rs::types::{LotQty, PriceTicks, Side, SymbolId, TimestampNs};
 
-/// Simulated one-way network latency from `sniper-singapur` to Bybit matching engine (25 ms).
 pub const SIMULATED_ONE_WAY_LATENCY_NS: i64 = 25_000_000;
 
-/// Lifecycle state of a simulated `Limit PostOnly` order inside `vortex_replay`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SimulatedOrderState {
     Inactive,
@@ -36,7 +35,6 @@ pub enum SimulatedOrderState {
     RejectedPostOnlyCross,
 }
 
-/// Deterministic L1 FIFO queue simulator for a single passive `Limit PostOnly` order.
 #[derive(Copy, Clone, Debug)]
 pub struct FifoQueueSimulator {
     pub state: SimulatedOrderState,
@@ -62,7 +60,6 @@ impl FifoQueueSimulator {
         }
     }
 
-    /// Submits a new passive `Limit PostOnly` order at `emit_ts_ns`.
     #[inline]
     pub fn submit_post_only(
         &mut self,
@@ -79,7 +76,6 @@ impl FifoQueueSimulator {
         };
     }
 
-    /// Advances the FIFO state machine using a single `ColumnarMarketRow`.
     #[inline]
     pub fn on_market_row(&mut self, row: &ColumnarMarketRow) {
         match self.state {
@@ -96,7 +92,6 @@ impl FifoQueueSimulator {
                 if row.ts_local_ns.0 < arrival_ts_ns.0 {
                     return;
                 }
-                // Check PostOnly crossing rule upon arrival at matching engine
                 match side {
                     Side::Bid => {
                         if limit_price.0 >= row.best_ask_ticks.0 {
@@ -148,7 +143,6 @@ impl FifoQueueSimulator {
             } => {
                 match row.event_kind {
                     MarketEventKind::PublicTradePrint => {
-                        // Aggressive trade hitting our resting limit price drains 100% from queue_ahead_qty
                         let hits_our_level = match side {
                             Side::Bid => row.side == Side::Ask && row.price_ticks.0 <= limit_price.0,
                             Side::Ask => row.side == Side::Bid && row.price_ticks.0 >= limit_price.0,
@@ -169,7 +163,6 @@ impl FifoQueueSimulator {
                         }
                     }
                     MarketEventKind::L2BookSnapshot => {
-                        // Conservative 25% queue reduction credit on L2 size drops at our level
                         let current_l1_qty = match side {
                             Side::Bid if row.best_bid_ticks.0 == limit_price.0 => row.best_bid_qty.0,
                             Side::Ask if row.best_ask_ticks.0 == limit_price.0 => row.best_ask_qty.0,
@@ -177,7 +170,7 @@ impl FifoQueueSimulator {
                         };
                         if current_l1_qty < last_observed_l1_qty.0 {
                             let drop = last_observed_l1_qty.0 - current_l1_qty;
-                            let conservative_credit = drop / 4; // 25% credit
+                            let conservative_credit = drop / 4;
                             queue_ahead_qty = LotQty((queue_ahead_qty.0 - conservative_credit).max(0));
                         }
                         last_observed_l1_qty = LotQty(current_l1_qty);
@@ -196,12 +189,55 @@ impl FifoQueueSimulator {
     }
 }
 
+fn audit_captured_live_parquet_segments() {
+    let data_dir = Path::new("data");
+    if !data_dir.exists() {
+        return;
+    }
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut verified_files: u64 = 0;
+    let mut total_live_rows: usize = 0;
+    let mut total_l2_events: u64 = 0;
+    let mut total_trade_prints: u64 = 0;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("parquet") {
+            if let Ok(batch) = ColumnarParquetBatch::read_from_file(&path) {
+                verified_files += 1;
+                total_live_rows += batch.len();
+                let mut idx = 0;
+                while idx < batch.len() {
+                    if let Some(row) = batch.row_at(idx) {
+                        match row.event_kind {
+                            MarketEventKind::L2BookSnapshot => total_l2_events += 1,
+                            MarketEventKind::PublicTradePrint => total_trade_prints += 1,
+                        }
+                    }
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    if verified_files > 0 {
+        println!("--------------------------------------------------------------------------------");
+        println!(
+            "  -> Live PAR1 Archives Verified: {} files | {} total events ({} L2 / {} Trades)",
+            verified_files, total_live_rows, total_l2_events, total_trade_prints
+        );
+    }
+}
+
 fn main() -> ExitCode {
     println!("================================================================================");
     println!("[VORTEX-REPLAY V1.0] DETERMINISTIC L1 FIFO QUEUE & LATENCY SIMULATOR (STAGE 4)");
     println!("================================================================================");
 
-    // Construct a deterministic columnar batch representing L2 updates + aggressive trade prints
     let mut batch = ColumnarParquetBatch::new();
     let base_ts = 1_762_015_000_000_000_000_i64;
 
@@ -234,7 +270,6 @@ fn main() -> ExitCode {
         }
     }
 
-    // Run 1,000 batch replays (200,000 events) to certify vectorized single-thread throughput
     let mut sim = FifoQueueSimulator::new();
     let total_batches: usize = 1_000;
     let total_events = total_batches * batch.len();
@@ -273,6 +308,8 @@ fn main() -> ExitCode {
         "  -> Verified FIFO Maker Fills  : {} | PostOnly Rejects: {}",
         sim.total_maker_fills, sim.total_post_only_rejects
     );
+
+    audit_captured_live_parquet_segments();
     println!("================================================================================");
 
     if throughput < 100_000.0 || sim.total_maker_fills != (total_batches as u64) {
