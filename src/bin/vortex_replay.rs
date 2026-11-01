@@ -1,14 +1,56 @@
 //! Binary 3 (`vortex_replay`): Deterministic offline L2 + publicTrade FIFO queue-priority
-//! simulator and live `data/*.parquet` archive auditor.
+//! simulator and Walk-Forward Strategy Evaluator over live `data/*.parquet` archives.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use vortex_rs::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind};
-use vortex_rs::types::{LotQty, PriceTicks, Side, SymbolId, TimestampNs};
+use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
+use vortex_rs::execution_fsm::{ExecutionFsm, OrderLifecycleState};
+use vortex_rs::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind, ParitySyncLedger};
+use vortex_rs::lob_shm::{BookLevel, SymbolLobSnapshot};
+use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
 
 pub const SIMULATED_ONE_WAY_LATENCY_NS: i64 = 25_000_000;
+
+const APPROVED_SPECS: [PairSpec; 6] = [
+    PairSpec {
+        symbol_id: SymbolId(1),
+        tick_size_1e8: 10_000_000,
+        lot_step_1e8: 100_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(2),
+        tick_size_1e8: 1_000_000,
+        lot_step_1e8: 1_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(3),
+        tick_size_1e8: 1_000_000,
+        lot_step_1e8: 10_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(4),
+        tick_size_1e8: 100_000,
+        lot_step_1e8: 10_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(5),
+        tick_size_1e8: 1_000_000,
+        lot_step_1e8: 1_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(6),
+        tick_size_1e8: 10_000,
+        lot_step_1e8: 100_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+];
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SimulatedOrderState {
@@ -189,7 +231,18 @@ impl FifoQueueSimulator {
     }
 }
 
-fn audit_captured_live_parquet_segments() {
+fn spec_for_symbol(sym: SymbolId) -> Option<(usize, PairSpec)> {
+    let mut i = 0;
+    while i < APPROVED_SPECS.len() {
+        if APPROVED_SPECS[i].symbol_id == sym {
+            return Some((i, APPROVED_SPECS[i]));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn replay_captured_live_parquet_segments() {
     let data_dir = Path::new("data");
     if !data_dir.exists() {
         return;
@@ -199,38 +252,146 @@ fn audit_captured_live_parquet_segments() {
         Err(_) => return,
     };
 
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("parquet") {
+            paths.push(p);
+        }
+    }
+    paths.sort();
+
+    if paths.is_empty() {
+        return;
+    }
+
+    let evaluator = OrthogonalFactorState::new();
+    let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
+    let mut ledger = ParitySyncLedger::new(10_000_000_000);
+    let mut fifo_sim = FifoQueueSimulator::new();
+    let mut active_sym = SymbolId(0);
+
     let mut verified_files: u64 = 0;
     let mut total_live_rows: usize = 0;
     let mut total_l2_events: u64 = 0;
     let mut total_trade_prints: u64 = 0;
+    let mut spoof_vetoes: u64 = 0;
+    let mut signals_armed: u64 = 0;
+    let mut queue_aborts: u64 = 0;
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("parquet") {
-            if let Ok(batch) = ColumnarParquetBatch::read_from_file(&path) {
-                verified_files += 1;
-                total_live_rows += batch.len();
-                let mut idx = 0;
-                while idx < batch.len() {
-                    if let Some(row) = batch.row_at(idx) {
-                        match row.event_kind {
-                            MarketEventKind::L2BookSnapshot => total_l2_events += 1,
-                            MarketEventKind::PublicTradePrint => total_trade_prints += 1,
+    for path in &paths {
+        if let Ok(batch) = ColumnarParquetBatch::read_from_file(path) {
+            verified_files += 1;
+            total_live_rows += batch.len();
+
+            let mut idx = 0;
+            while idx < batch.len() {
+                if let Some(row) = batch.row_at(idx) {
+                    match row.event_kind {
+                        MarketEventKind::L2BookSnapshot => total_l2_events += 1,
+                        MarketEventKind::PublicTradePrint => total_trade_prints += 1,
+                    }
+
+                    if let Some((_, spec)) = spec_for_symbol(row.symbol_id) {
+                        let mut snap = SymbolLobSnapshot {
+                            symbol_id: row.symbol_id,
+                            is_eligible: true,
+                            sequence_id: row.sequence_id,
+                            ts_exchange_ns: row.ts_exchange_ns,
+                            ts_local_ns: row.ts_local_ns,
+                            mark_price: row.mark_price_ticks,
+                            last_trade_price: row.price_ticks,
+                            realized_vol_5m: ScaledBps::from_whole_bps(58),
+                            factor_ofi: BoundedScore::new_clamped(f64::from(row.ofi_bps) / 10_000.0),
+                            factor_tfi: BoundedScore::new_clamped(f64::from(row.tfi_bps) / 10_000.0),
+                            factor_geom: BoundedScore::new_clamped(f64::from(row.geom_bps) / 10_000.0),
+                            ..SymbolLobSnapshot::default()
+                        };
+                        snap.bids[0] = BookLevel {
+                            price: row.best_bid_ticks,
+                            qty: row.best_bid_qty,
+                        };
+                        snap.asks[0] = BookLevel {
+                            price: row.best_ask_ticks,
+                            qty: row.best_ask_qty,
+                        };
+
+                        match fsm.state {
+                            OrderLifecycleState::Idle => {
+                                if let Ok(verdict) = evaluator.evaluate_entry_signal(&spec, &snap) {
+                                    if matches!(verdict, SignalVerdict::SpoofingVeto) {
+                                        spoof_vetoes += 1;
+                                    } else if let Ok(true) =
+                                        fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
+                                    {
+                                        if let OrderLifecycleState::PlacingEntryMaker {
+                                            side,
+                                            entry_price,
+                                            qty,
+                                            ..
+                                        } = fsm.state
+                                        {
+                                            active_sym = row.symbol_id;
+                                            signals_armed += 1;
+                                            fifo_sim.submit_post_only(
+                                                side,
+                                                entry_price,
+                                                qty,
+                                                row.ts_local_ns,
+                                            );
+                                            let _ = fsm.on_entry_order_resting(row.ts_local_ns);
+                                        }
+                                    }
+                                }
+                            }
+                            OrderLifecycleState::RestingEntryQueue { .. }
+                                if row.symbol_id == active_sym =>
+                            {
+                                if fsm.check_resting_queue_abort(&snap) {
+                                    queue_aborts += 1;
+                                    fifo_sim.state = SimulatedOrderState::Inactive;
+                                } else {
+                                    fifo_sim.on_market_row(&row);
+                                    if matches!(
+                                        fifo_sim.state,
+                                        SimulatedOrderState::FilledMaker { .. }
+                                    ) {
+                                        let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
+                                    } else if matches!(
+                                        fifo_sim.state,
+                                        SimulatedOrderState::RejectedPostOnlyCross
+                                    ) {
+                                        fsm.state = OrderLifecycleState::Idle;
+                                    }
+                                }
+                            }
+                            OrderLifecycleState::PositionOpenMakerExit { .. }
+                                if row.symbol_id == active_sym =>
+                            {
+                                let _ = fsm.step_open_position(&snap, &mut ledger);
+                            }
+                            _ => {}
                         }
                     }
-                    idx += 1;
                 }
+                idx += 1;
             }
         }
     }
 
-    if verified_files > 0 {
-        println!("--------------------------------------------------------------------------------");
-        println!(
-            "  -> Live PAR1 Archives Verified: {} files | {} total events ({} L2 / {} Trades)",
-            verified_files, total_live_rows, total_l2_events, total_trade_prints
-        );
-    }
+    println!("--------------------------------------------------------------------------------");
+    println!(
+        "  -> Live PAR1 Archives Verified: {} files | {} total events ({} L2 / {} Trades)",
+        verified_files, total_live_rows, total_l2_events, total_trade_prints
+    );
+    println!(
+        "  -> Live Walk-Forward Replay   : SpoofVetoes={} | Armed={} | QueueAborts={} | Fills={} | Closed={}",
+        spoof_vetoes,
+        signals_armed,
+        queue_aborts,
+        fifo_sim.total_maker_fills,
+        ledger.closed_trades_count
+    );
 }
 
 fn main() -> ExitCode {
@@ -309,7 +470,7 @@ fn main() -> ExitCode {
         sim.total_maker_fills, sim.total_post_only_rejects
     );
 
-    audit_captured_live_parquet_segments();
+    replay_captured_live_parquet_segments();
     println!("================================================================================");
 
     if throughput < 100_000.0 || sim.total_maker_fills != (total_batches as u64) {

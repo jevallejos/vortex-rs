@@ -1,6 +1,6 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, Seqlock Hot-State Reader,
-//! Live Shared-Memory Telemetry HUD (`--live`), Persistent Shadow Trade Ledger (`data/vortex_shadow_trades.jsonl`),
-//! and 520-Trade OOS Gate Verifier.
+//! Live Shared-Memory Telemetry HUD (`--live`), Realistic L1 Queue Shadow Executor (`--daemon`),
+//! Persistent Shadow Trade Ledger (`data/vortex_shadow_trades.jsonl`), and 520-Trade OOS Gate Verifier.
 
 use core::sync::atomic::Ordering;
 use std::fs::OpenOptions;
@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
-use vortex_rs::execution_fsm::{ClosedTradeSummary, ExecutionFsm};
+use vortex_rs::execution_fsm::{ClosedTradeSummary, ExecutionFsm, OrderLifecycleState};
 use vortex_rs::forensic_parquet::ParitySyncLedger;
 use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena};
 use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
@@ -267,6 +267,155 @@ fn print_live_shm_hud() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_shadow_execution_daemon() -> ExitCode {
+    let shm_path = MappedShmRegion::default_shm_path();
+    let region = match MappedShmRegion::open_or_create(&shm_path, false) {
+        Ok(r) => r,
+        Err(_) => return ExitCode::from(9),
+    };
+    let arena = region.arena();
+    let evaluator = OrthogonalFactorState::new();
+    let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
+    let mut ledger = ParitySyncLedger::new(10_000_000_000);
+    let mut active_slot: usize = 0;
+    let mut resting_queue_ahead: LotQty = LotQty(0);
+    let mut prev_l1_qty: LotQty = LotQty(0);
+
+    println!(
+        "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena ({}) with Realistic L1 Queue Shadow FSM.",
+        shm_path.display()
+    );
+
+    loop {
+        thread::sleep(Duration::from_millis(40));
+
+        match fsm.state {
+            OrderLifecycleState::Idle => {
+                let mut s = 0;
+                while s < APPROVED_SPECS.len() {
+                    let spec = APPROVED_SPECS[s];
+                    if let Ok(slot) = arena.slot(s) {
+                        if let Ok(snap) = slot.read_snapshot(4) {
+                            if let Ok(verdict) = evaluator.evaluate_entry_signal(&spec, &snap) {
+                                if let Ok(true) =
+                                    fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
+                                {
+                                    active_slot = s;
+                                    let _ = fsm.on_entry_order_resting(snap.ts_local_ns);
+                                    if let OrderLifecycleState::RestingEntryQueue { side, .. } =
+                                        fsm.state
+                                    {
+                                        let init_q = match side {
+                                            Side::Bid => snap.bids[0].qty,
+                                            Side::Ask => snap.asks[0].qty,
+                                        };
+                                        resting_queue_ahead = init_q;
+                                        prev_l1_qty = init_q;
+                                        println!(
+                                            "[SHADOW QUEUE ARMED] {} {:?} resting at L1 (Queue ahead: {} lots | Seq: {} | OFI: {:+.2} | TFI: {:+.2})",
+                                            snap.symbol_id.name(),
+                                            side,
+                                            resting_queue_ahead.0,
+                                            snap.sequence_id,
+                                            snap.factor_ofi.get(),
+                                            snap.factor_tfi.get()
+                                        );
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    s += 1;
+                }
+            }
+
+            OrderLifecycleState::RestingEntryQueue {
+                side, entry_price, ..
+            } => {
+                if let Ok(slot) = arena.slot(active_slot) {
+                    if let Ok(snap) = slot.read_snapshot(4) {
+                        // 1. Check if trade flow flipped against our resting order before fill
+                        if fsm.check_resting_queue_abort(&snap) {
+                            println!(
+                                "[SHADOW QUEUE ABORT] {} {:?} canceled before fill due to adverse TFI flip ({:+.2})",
+                                snap.symbol_id.name(),
+                                side,
+                                snap.factor_tfi.get()
+                            );
+                            continue;
+                        }
+
+                        // 2. Update FIFO queue ahead via trade-through or conservative 25% L1 depletion
+                        let traded_through = match side {
+                            Side::Bid => {
+                                snap.asks[0].price.0 <= entry_price.0
+                                    || snap.last_trade_price.0 < entry_price.0
+                            }
+                            Side::Ask => {
+                                snap.bids[0].price.0 >= entry_price.0
+                                    || snap.last_trade_price.0 > entry_price.0
+                            }
+                        };
+
+                        let cur_l1_qty = match side {
+                            Side::Bid if snap.bids[0].price.0 == entry_price.0 => snap.bids[0].qty.0,
+                            Side::Ask if snap.asks[0].price.0 == entry_price.0 => snap.asks[0].qty.0,
+                            _ => prev_l1_qty.0,
+                        };
+                        if cur_l1_qty < prev_l1_qty.0 {
+                            let drop = prev_l1_qty.0 - cur_l1_qty;
+                            resting_queue_ahead =
+                                LotQty((resting_queue_ahead.0 - (drop / 4).max(1)).max(0));
+                        }
+                        prev_l1_qty = LotQty(cur_l1_qty);
+
+                        if traded_through || resting_queue_ahead.0 == 0 {
+                            let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
+                            println!(
+                                "[SHADOW MAKER FILL] {} {:?} filled passively at {} ticks (Seq: {})",
+                                snap.symbol_id.name(),
+                                side,
+                                entry_price.0,
+                                snap.sequence_id
+                            );
+                        }
+                    }
+                }
+            }
+
+            OrderLifecycleState::PositionOpenMakerExit { .. } => {
+                if let Ok(slot) = arena.slot(active_slot) {
+                    if let Ok(snap) = slot.read_snapshot(4) {
+                        if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
+                            append_shadow_trade_jsonl(
+                                snap.symbol_id.name(),
+                                &summary,
+                                &ledger,
+                                &fsm,
+                            );
+                            println!(
+                                "[SHADOW CLOSE] {} {:?} | Net: {:+.2} bps | Total Trades: {}",
+                                snap.symbol_id.name(),
+                                summary.kind,
+                                (summary.net_scaled_bps.raw() as f64) / 100.0,
+                                ledger.closed_trades_count
+                            );
+                        }
+                    }
+                }
+            }
+
+            OrderLifecycleState::PlacingEntryMaker { .. } => {
+                let _ = fsm.on_entry_order_resting(TimestampNs(now_epoch_ns()));
+            }
+
+            OrderLifecycleState::EmergencyStopTriggered { .. }
+            | OrderLifecycleState::HaltedByRiskGuard { .. } => {}
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let live_hud_mode = std::env::args().any(|a| a == "--live");
     if live_hud_mode {
@@ -310,67 +459,7 @@ fn main() -> ExitCode {
     }
 
     if daemon_mode {
-        let shm_path = MappedShmRegion::default_shm_path();
-        let region = match MappedShmRegion::open_or_create(&shm_path, false) {
-            Ok(r) => r,
-            Err(_) => return ExitCode::from(9),
-        };
-        let arena = region.arena();
-        let evaluator = OrthogonalFactorState::new();
-        let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
-        let mut ledger = ParitySyncLedger::new(10_000_000_000);
-        let mut active_slot: usize = 0;
-
-        println!(
-            "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena ({}) in Shadow Execution Mode.",
-            shm_path.display()
-        );
-
-        loop {
-            thread::sleep(Duration::from_millis(40));
-            let mut s = 0;
-            while s < APPROVED_SPECS.len() {
-                let spec = APPROVED_SPECS[s];
-                if let Ok(slot) = arena.slot(s) {
-                    if let Ok(snap) = slot.read_snapshot(4) {
-                        if let Ok(verdict) = evaluator.evaluate_entry_signal(&spec, &snap) {
-                            if let Ok(true) =
-                                fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
-                            {
-                                active_slot = s;
-                                let _ = fsm.on_entry_order_resting(snap.ts_local_ns);
-                                let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
-                                println!(
-                                    "[SHADOW ENTRY] Armed & filled Maker entry on {} (Seq: {}, OFI: {:+.2}, TFI: {:+.2})",
-                                    snap.symbol_id.name(),
-                                    snap.sequence_id,
-                                    snap.factor_ofi.get(),
-                                    snap.factor_tfi.get()
-                                );
-                            }
-                        }
-                        if s == active_slot {
-                            if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
-                                append_shadow_trade_jsonl(
-                                    snap.symbol_id.name(),
-                                    &summary,
-                                    &ledger,
-                                    &fsm,
-                                );
-                                println!(
-                                    "[SHADOW CLOSE] {} {:?} | Net: {:+.2} bps | Total Trades: {}",
-                                    snap.symbol_id.name(),
-                                    summary.kind,
-                                    (summary.net_scaled_bps.raw() as f64) / 100.0,
-                                    ledger.closed_trades_count
-                                );
-                            }
-                        }
-                    }
-                }
-                s += 1;
-            }
-        }
+        return run_shadow_execution_daemon();
     }
 
     ExitCode::SUCCESS

@@ -95,6 +95,16 @@ case "\${1:-live}" in
     live|-l)
         ${BIN_DIR}/vortex_exec --live
         ;;
+    trades|-t)
+        echo "=== [SHADOW QUEUE & EXECUTION EVENTS IN JOURNALCTL] ==="
+        journalctl -u vortex-exec.service -n 30 --no-pager | grep -E "SHADOW|DAEMON" || true
+        echo "=== [CLOSED SHADOW TRADES LEDGER (vortex_shadow_trades.jsonl)] ==="
+        if [ -f "${DATA_DIR}/vortex_shadow_trades.jsonl" ]; then
+            tail -n 20 "${DATA_DIR}/vortex_shadow_trades.jsonl"
+        else
+            echo "(No closed shadow trades yet — waiting for structural 35..80 bps target or SL)"
+        fi
+        ;;
     status|-s)
         systemctl status vortex-tap.service vortex-exec.service --no-pager
         ls -lh /dev/shm/vortex_lob.mmap
@@ -107,18 +117,18 @@ case "\${1:-live}" in
         ${BIN_DIR}/vortex_tap
         ;;
     replay|-r)
-        ${BIN_DIR}/vortex_replay
+        cd "${VORTEX_DIR}" && ${BIN_DIR}/vortex_replay
         ;;
     oos|-o)
         ${BIN_DIR}/vortex_exec
         ;;
     all)
         ${BIN_DIR}/vortex_tap
-        ${BIN_DIR}/vortex_replay
+        cd "${VORTEX_DIR}" && ${BIN_DIR}/vortex_replay
         ${BIN_DIR}/vortex_exec
         ;;
     *)
-        echo "Usage: vortex {live|status|logs|audit|replay|oos|all}"
+        echo "Usage: vortex {live|trades|status|logs|audit|replay|oos|all}"
         exit 1
         ;;
 esac
@@ -130,5 +140,5 @@ sudo systemctl enable vortex-tap.service vortex-exec.service
 sudo systemctl restart vortex-tap.service vortex-exec.service
 sleep 3
 
-echo "[OK] VORTEX-L2 Live Bybit V5 WebSocket Daemons active."
+echo "[OK] VORTEX-L2 Stage 9 Daemons active."
 vortex live
