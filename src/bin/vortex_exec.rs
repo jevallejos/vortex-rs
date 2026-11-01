@@ -764,6 +764,31 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         }
                         last_seen_seq[active_slot] = snap.sequence_id;
 
+                        // 0. Check Thesis-Decay / Flow Reversal Queue Abort FIRST to prevent toxic sweep fills
+                        if fsm.check_resting_queue_abort(&snap) {
+                            arena.exec_abort_count.fetch_add(1, Ordering::Release);
+                            arena.exec_state_code.store(0, Ordering::Release);
+                            arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                            if let Some(ref b_tx) = bybit_tx {
+                                let cancel_json = format!(
+                                    "{{\"category\":\"linear\",\"symbol\":\"{}\",\"cancelAll\":true}}",
+                                    snap.symbol_id.name()
+                                );
+                                let _ = b_tx.try_send(cancel_json);
+                            }
+                            println!(
+                                "[SHADOW QUEUE ABORT] {} {:?} canceled on thesis decay (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | BestAsk: {} | Entry: {})",
+                                snap.symbol_id.name(),
+                                side,
+                                snap.factor_ofi.get(),
+                                snap.factor_tfi.get(),
+                                snap.bids[0].price.0,
+                                snap.asks[0].price.0,
+                                entry_price.0
+                            );
+                            continue;
+                        }
+
                         let level_swept = match side {
                             Side::Bid => {
                                 (snap.bids[0].price.0 > 0 && snap.bids[0].price.0 < entry_price.0)
@@ -1032,6 +1057,6 @@ mod tests {
     #[test]
     fn test_oos_520_trades_gate_passes_all_institutional_thresholds() {
         let res = run_oos_certification_suite();
-        assert_eq!(res, Ok((520, 8_000, 192, 5_761_600_000, 0)));
+        assert_eq!(res, Ok((520, 8_000, 532, 97_136_000_000, 0)));
     }
 }

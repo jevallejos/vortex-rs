@@ -372,21 +372,23 @@ fn replay_captured_live_parquet_segments() {
                             OrderLifecycleState::RestingEntryQueue { .. }
                                 if row.symbol_id == active_sym =>
                             {
-                                fifo_sim.on_market_row(&row);
-                                if matches!(
-                                    fifo_sim.state,
-                                    SimulatedOrderState::FilledMaker { .. }
-                                ) {
-                                    let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
-                                } else if matches!(
-                                    fifo_sim.state,
-                                    SimulatedOrderState::RejectedPostOnlyCross
-                                ) {
-                                    fsm.state = OrderLifecycleState::Idle;
-                                    fifo_sim.state = SimulatedOrderState::Inactive;
-                                } else if fsm.check_resting_queue_abort(&snap) {
+                                if fsm.check_resting_queue_abort(&snap) {
                                     queue_aborts += 1;
                                     fifo_sim.state = SimulatedOrderState::Inactive;
+                                } else {
+                                    fifo_sim.on_market_row(&row);
+                                    if matches!(
+                                        fifo_sim.state,
+                                        SimulatedOrderState::FilledMaker { .. }
+                                    ) {
+                                        let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
+                                    } else if matches!(
+                                        fifo_sim.state,
+                                        SimulatedOrderState::RejectedPostOnlyCross
+                                    ) {
+                                        fsm.state = OrderLifecycleState::Idle;
+                                        fifo_sim.state = SimulatedOrderState::Inactive;
+                                    }
                                 }
                             }
                             OrderLifecycleState::PositionOpenMakerExit { .. }
