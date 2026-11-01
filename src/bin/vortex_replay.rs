@@ -403,9 +403,9 @@ fn replay_captured_live_parquet_segments() {
                                     let (ex_w, ex_f) =
                                         spec.format_price_usdt_parts(summary.exit_price);
                                     let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
-                                    let (col, icon, badge) = if net_bps > 0.50 {
+                                    let (col, icon, badge) = if net_bps >= 0.20 {
                                         ("\x1b[1;32m", "🟢", "WIN")
-                                    } else if net_bps >= -0.50 {
+                                    } else if net_bps > -0.20 {
                                         ("\x1b[38;5;208m", "🟠", "SCRATCH")
                                     } else {
                                         ("\x1b[1;31m", "🔴", "LOSS")
@@ -454,7 +454,7 @@ fn replay_captured_live_parquet_segments() {
     );
 
     let net_total_bps = (net_bps_accum as f64) / 100.0;
-    let (sum_col, sum_icon) = if net_total_bps > 0.50 {
+    let (sum_col, sum_icon) = if net_total_bps >= 0.20 {
         ("\x1b[1;32m", "🟢")
     } else if net_total_bps >= -0.50 {
         ("\x1b[38;5;208m", "🟠")

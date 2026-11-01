@@ -80,9 +80,9 @@ fn now_epoch_ns() -> i64 {
 /// - `< -0.50 bps`: `🔴 LOSS` (Red)
 #[inline]
 fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static str) {
-    if net_bps > 0.50 {
+    if net_bps >= 0.20 {
         (ANSI_GREEN, "🟢", "WIN")
-    } else if net_bps >= -0.50 {
+    } else if net_bps > -0.20 {
         (ANSI_ORANGE, "🟠", "SCRATCH")
     } else {
         (ANSI_RED, "🔴", "LOSS")
@@ -389,9 +389,9 @@ fn print_colorized_shadow_trades() -> ExitCode {
 
             total_net_bps += net_bps;
             let (color, icon, badge) = classify_pnl_badge(net_bps);
-            if net_bps > 0.50 {
+            if net_bps >= 0.20 {
                 wins += 1;
-            } else if net_bps >= -0.50 {
+            } else if net_bps > -0.20 {
                 scratches += 1;
             } else {
                 losses += 1;
@@ -964,6 +964,29 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             resting_queue_ahead.0 as u64,
                             Ordering::Release,
                         );
+
+                        let toxic_sweep = level_swept
+                            && resting_queue_ahead.0 > 0
+                            && match side {
+                                Side::Bid => snap.factor_ofi.get() <= -0.10,
+                                Side::Ask => snap.factor_ofi.get() >= 0.10,
+                            };
+                        if toxic_sweep {
+                            fsm.state = OrderLifecycleState::Idle;
+                            arena.exec_abort_count.fetch_add(1, Ordering::Release);
+                            arena.exec_state_code.store(0, Ordering::Release);
+                            arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                            println!(
+                                "{}🟠 [TOXIC SWEEP VETO] {} {:?} aborted on adverse L1 sweep (OFI: {:+.2} | Queue left: {} lots){}",
+                                ANSI_ORANGE,
+                                snap.symbol_id.name(),
+                                side,
+                                snap.factor_ofi.get(),
+                                resting_queue_ahead.0,
+                                ANSI_RESET
+                            );
+                            continue;
+                        }
 
                         if level_swept || resting_queue_ahead.0 == 0 {
                             let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
