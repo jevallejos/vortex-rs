@@ -1,6 +1,6 @@
 //! Binary 1 (`vortex_tap`): Immortal L2 + publicTrade ingestion daemon,
 //! Bybit UTA V5 Live WebSocket client (`wss://stream.bybit.com/v5/public/linear`),
-//! Microeconomic Pair Eligibility Auditor, and Append-Only Seqlock/PAR1 writer.
+//! Microeconomic Pair Eligibility Auditor, and Append-Only Seqlock/PAR1 writer with 4096-file Ring Retention.
 
 use core::sync::atomic::Ordering;
 use std::path::Path;
@@ -15,6 +15,8 @@ use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexSh
 use vortex_rs::types::{LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
 
 const BYBIT_PUBLIC_LINEAR_WS: &str = "wss://stream.bybit.com/v5/public/linear";
+/// Rolling retention cap (~1,048,576 events) to prevent disk exhaustion on sniper-singapur.
+const MAX_PARQUET_RING_FILES: u64 = 4_096;
 
 #[derive(Copy, Clone, Debug)]
 struct CandidateContract {
@@ -33,7 +35,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(779_301),
+        reference_mid_ticks: PriceTicks(779_116),
         realized_vol_5m: ScaledBps::from_whole_bps(58),
     },
     CandidateContract {
@@ -44,7 +46,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(226_329),
+        reference_mid_ticks: PriceTicks(226_333),
         realized_vol_5m: ScaledBps::from_whole_bps(60),
     },
     CandidateContract {
@@ -55,7 +57,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(9_456),
+        reference_mid_ticks: PriceTicks(9_446),
         realized_vol_5m: ScaledBps::from_whole_bps(62),
     },
     CandidateContract {
@@ -66,7 +68,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(8_691),
+        reference_mid_ticks: PriceTicks(8_676),
         realized_vol_5m: ScaledBps::from_whole_bps(60),
     },
     CandidateContract {
@@ -77,7 +79,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(23_419),
+        reference_mid_ticks: PriceTicks(23_346),
         realized_vol_5m: ScaledBps::from_whole_bps(68),
     },
     CandidateContract {
@@ -88,7 +90,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(8_987),
+        reference_mid_ticks: PriceTicks(8_971),
         realized_vol_5m: ScaledBps::from_whole_bps(64),
     },
     CandidateContract {
@@ -368,6 +370,11 @@ fn flush_parquet_batch(batch: &mut ColumnarParquetBatch, parquet_seq: &mut u64) 
             checksum
         );
     }
+    if *parquet_seq > MAX_PARQUET_RING_FILES {
+        let expired_seq = *parquet_seq - MAX_PARQUET_RING_FILES;
+        let expired_path = data_dir.join(format!("vortex_l2_segment_{:06}.parquet", expired_seq));
+        let _ = std::fs::remove_file(expired_path);
+    }
     batch.clear();
 }
 
@@ -391,8 +398,9 @@ fn run_live_bybit_ws_loop(
     let subscribe_payload = r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","publicTrade.BTCUSDT","orderbook.50.ETHUSDT","publicTrade.ETHUSDT","orderbook.50.SOLUSDT","publicTrade.SOLUSDT","orderbook.50.AVAXUSDT","publicTrade.AVAXUSDT","orderbook.50.TAOUSDT","publicTrade.TAOUSDT","orderbook.50.SUIUSDT","publicTrade.SUIUSDT"]}"#;
     let mut parquet_seq: u64 = discover_max_parquet_seq();
     println!(
-        "[PAR1 APPEND-ONLY] Resuming columnar segment sequence from #{:06}",
-        parquet_seq + 1
+        "[PAR1 APPEND-ONLY] Resuming columnar segment sequence from #{:06} (Ring Cap: {})",
+        parquet_seq + 1,
+        MAX_PARQUET_RING_FILES
     );
 
     loop {

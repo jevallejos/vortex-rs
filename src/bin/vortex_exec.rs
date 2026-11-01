@@ -1,6 +1,6 @@
-//! Binary 2 (`vortex_exec`): Institutional Execution Engine, Seqlock Hot-State Reader,
-//! Non-Volatile SHM v4 Position Rehydration, Multi-Alias Telegram Notifier,
-//! Live HUD (`--live`), and 520-Trade OOS Verifier.
+//! Binary 2 (`vortex_exec`): Institutional Execution Engine, 200.0 Hz Seqlock Reader,
+//! Non-Volatile SHM v4 + JSONL Ledger Rehydration, Level-Wiped Fill Detection,
+//! Multi-Alias Telegram Notifier, Live HUD (`--live`), and 520-Trade OOS Verifier.
 
 use core::sync::atomic::Ordering;
 use std::fs::{File, OpenOptions};
@@ -65,7 +65,6 @@ fn now_epoch_ns() -> i64 {
     }
 }
 
-/// Multi-alias `.env` parser supporting `export ` prefixes and standard Telegram variable names.
 fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
     let mut token = std::env::var("TELEGRAM_BOT_TOKEN")
         .or_else(|_| std::env::var("TELEGRAM_TOKEN"))
@@ -139,7 +138,7 @@ fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
     println!("[TELEGRAM] Asynchronous 1:1 transactional notifier thread active.");
 
     let _ = tx.try_send(
-        "[VORTEX-L2 ONLINE] SHM v4 Execution Engine attached in sniper-singapur (25.0 Hz)."
+        "[VORTEX-L2 STAGE 14 ONLINE] 200Hz SHM v4 Execution Engine active in sniper-singapur."
             .to_owned(),
     );
 
@@ -164,6 +163,65 @@ fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
     });
 
     Some(tx)
+}
+
+fn rehydrate_shadow_ledger(
+    ledger: &mut ParitySyncLedger,
+    fsm: &mut ExecutionFsm,
+    arena: &VortexShmArena,
+) {
+    let file_path = Path::new("data/vortex_shadow_trades.jsonl");
+    let file = match File::open(file_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let reader = BufReader::new(file);
+    let mut restored_count: u64 = 0;
+
+    for line in reader.lines().map_while(Result::ok) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+            let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+            let is_maker = val
+                .get("maker_exit")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let net_scaled_bps = (net_bps * 100.0).round() as i64;
+            let fee_scaled_bps: i64 = if is_maker { 400 } else { 750 };
+            let gross_scaled_bps = net_scaled_bps + fee_scaled_bps;
+
+            let gross_1e8 = (fsm.notional_per_trade_1e8 * gross_scaled_bps) / 1_000_000;
+            let fee_1e8 = (fsm.notional_per_trade_1e8 * fee_scaled_bps) / 1_000_000;
+            let net_1e8 = gross_1e8 - fee_1e8;
+
+            ledger.record_closed_trade(gross_1e8, fee_1e8);
+            if is_maker {
+                fsm.maker_exits_count += 1;
+            } else {
+                fsm.taker_sl_exits_count += 1;
+            }
+            if net_1e8 >= 0 {
+                fsm.gross_profit_accum_1e8 += net_1e8;
+            } else {
+                fsm.gross_loss_accum_1e8 += -net_1e8;
+            }
+            restored_count += 1;
+        }
+    }
+
+    if restored_count > 0 {
+        let cur_closed = arena.exec_closed_count.load(Ordering::Acquire);
+        if cur_closed < restored_count {
+            arena
+                .exec_closed_count
+                .store(restored_count, Ordering::Release);
+        }
+        println!(
+            "[JSONL REHYDRATE] Restored {} historical closed shadow trades (CumNetPnL: {:+.4} USDT | PF: {:.2})",
+            restored_count,
+            (ledger.cumulative_net_pnl_1e8 as f64) / 100_000_000.0,
+            (fsm.net_profit_factor_x100() as f64) / 100.0
+        );
+    }
 }
 
 fn append_shadow_trade_jsonl(
@@ -422,6 +480,9 @@ fn run_shadow_execution_daemon() -> ExitCode {
     let mut resting_queue_ahead: LotQty = LotQty(0);
     let mut prev_l1_qty: LotQty = LotQty(0);
     let mut prev_cum_trade_lots: LotQty = LotQty(0);
+    let mut last_seen_seq = [0_u64; 6];
+
+    rehydrate_shadow_ledger(&mut ledger, &mut fsm, arena);
 
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
     if saved_state_code == 2 || saved_state_code == 3 {
@@ -478,13 +539,13 @@ fn run_shadow_execution_daemon() -> ExitCode {
     }
 
     println!(
-        "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with Trade-Tape + L1 Queue FSM.",
+        "[DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with 5ms Event-Driven Queue FSM.",
         arena.version,
         shm_path.display()
     );
 
     loop {
-        thread::sleep(Duration::from_millis(40));
+        thread::sleep(Duration::from_millis(5));
 
         match fsm.state {
             OrderLifecycleState::Idle => {
@@ -495,6 +556,12 @@ fn run_shadow_execution_daemon() -> ExitCode {
                     let spec = APPROVED_SPECS[s];
                     if let Ok(slot) = arena.slot(s) {
                         if let Ok(snap) = slot.read_snapshot(4) {
+                            if snap.sequence_id == last_seen_seq[s] {
+                                s += 1;
+                                continue;
+                            }
+                            last_seen_seq[s] = snap.sequence_id;
+
                             if let Ok(verdict) = evaluator.evaluate_entry_signal(&spec, &snap) {
                                 if let Ok(true) =
                                     fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
@@ -567,9 +634,23 @@ fn run_shadow_execution_daemon() -> ExitCode {
             } => {
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(snap) = slot.read_snapshot(4) {
-                        let bbo_crossed = match side {
-                            Side::Bid => snap.asks[0].price.0 > 0 && snap.asks[0].price.0 <= entry_price.0,
-                            Side::Ask => snap.bids[0].price.0 > 0 && snap.bids[0].price.0 >= entry_price.0,
+                        if snap.sequence_id == last_seen_seq[active_slot] {
+                            continue;
+                        }
+                        last_seen_seq[active_slot] = snap.sequence_id;
+
+                        // Physical LOB Law:
+                        // - For Bid at entry_price: if BestBid < entry_price OR BestAsk <= entry_price, the entire entry_price Bid level was swept.
+                        // - For Ask at entry_price: if BestAsk > entry_price OR BestBid >= entry_price, the entire entry_price Ask level was swept.
+                        let level_swept = match side {
+                            Side::Bid => {
+                                (snap.bids[0].price.0 > 0 && snap.bids[0].price.0 < entry_price.0)
+                                    || (snap.asks[0].price.0 > 0 && snap.asks[0].price.0 <= entry_price.0)
+                            }
+                            Side::Ask => {
+                                (snap.asks[0].price.0 > 0 && snap.asks[0].price.0 > entry_price.0)
+                                    || (snap.bids[0].price.0 > 0 && snap.bids[0].price.0 >= entry_price.0)
+                            }
                         };
 
                         // 1. Drain 100% of real publicTrade volume executed against our resting side
@@ -608,7 +689,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
                             Ordering::Release,
                         );
 
-                        if bbo_crossed || resting_queue_ahead.0 == 0 {
+                        if level_swept || resting_queue_ahead.0 == 0 {
                             let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
                             let mut tp_t: i64 = 0;
                             let mut sl_t: i64 = 0;
@@ -671,12 +752,13 @@ fn run_shadow_execution_daemon() -> ExitCode {
                             arena.exec_state_code.store(0, Ordering::Release);
                             arena.exec_queue_ahead_lots.store(0, Ordering::Release);
                             println!(
-                                "[SHADOW QUEUE ABORT] {} {:?} canceled before fill (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | Entry: {})",
+                                "[SHADOW QUEUE ABORT] {} {:?} canceled before fill (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | BestAsk: {} | Entry: {})",
                                 snap.symbol_id.name(),
                                 side,
                                 snap.factor_ofi.get(),
                                 snap.factor_tfi.get(),
                                 snap.bids[0].price.0,
+                                snap.asks[0].price.0,
                                 entry_price.0
                             );
                         }
@@ -687,6 +769,11 @@ fn run_shadow_execution_daemon() -> ExitCode {
             OrderLifecycleState::PositionOpenMakerExit { .. } => {
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(snap) = slot.read_snapshot(4) {
+                        if snap.sequence_id == last_seen_seq[active_slot] {
+                            continue;
+                        }
+                        last_seen_seq[active_slot] = snap.sequence_id;
+
                         if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
                             arena.exec_closed_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(0, Ordering::Release);
