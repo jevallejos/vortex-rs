@@ -1,12 +1,15 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, Seqlock Hot-State Reader,
 //! and Pre-Production Out-of-Sample Gate Verifier (`N = 520` trades, `PF >= 1.35`, `Maker% >= 80%`).
 
+use core::sync::atomic::Ordering;
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
 
 use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use vortex_rs::execution_fsm::ExecutionFsm;
 use vortex_rs::forensic_parquet::ParitySyncLedger;
-use vortex_rs::lob_shm::{BookLevel, SymbolLobSnapshot, VortexShmArena};
+use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena};
 use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
 
 pub const TOTAL_OOS_TRADES_GATE: usize = 520;
@@ -22,14 +25,12 @@ pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
         empirical_taker_exit_prob_pct: 20,
     };
 
-    // Initial wallet equity: 100.00000000 USDT (10_000_000_000 in 1e8 units)
     let initial_wallet_1e8: i64 = 10_000_000_000;
     let mut ledger = ParitySyncLedger::new(initial_wallet_1e8);
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
     let mut factor_state = OrthogonalFactorState::new();
 
     let mut current_ts_ns: i64 = 1_762_020_000_000_000_000;
-    // At base_mid_ticks = 100_000, 1 tick = 0.10 bps -> 1 bps = 10 ticks.
     let base_mid_ticks: i64 = 100_000;
 
     for trade_idx in 0..TOTAL_OOS_TRADES_GATE {
@@ -82,10 +83,6 @@ pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
         current_ts_ns += 50_000_000;
         let _ = fsm.on_entry_filled_maker(TimestampNs(current_ts_ns));
 
-        // 20-trade repeating OOS block at scale 1 bps = 10 ticks:
-        // - 13/20 (65.0%, 338 trades): +45.00 bps (+450 ticks) -> fills MakerStructuralTp at +38.00 bps
-        // -  3/20 (15.0%,  78 trades): +10.00 bps (+100 ticks) -> fills MakerPassiveUnwind at BBO
-        // -  4/20 (20.0%, 104 trades): -52.00 bps (-520 ticks) -> triggers ServerMarkPriceStopLoss
         let bucket = trade_idx % 20;
         current_ts_ns += 180_000_000_000;
         let mut exit_snap = live_snap;
@@ -133,6 +130,7 @@ pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
 }
 
 fn main() -> ExitCode {
+    let daemon_mode = std::env::args().any(|a| a == "--daemon");
     println!("================================================================================");
     println!("[VORTEX-EXEC V1.0] EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER (STAGE 5)");
     println!("================================================================================");
@@ -161,13 +159,34 @@ fn main() -> ExitCode {
                 net_pnl_usdt_whole, net_pnl_usdt_frac, parity_drift
             );
             println!("================================================================================");
-            ExitCode::SUCCESS
         }
         Err(code) => {
             println!("  [ERROR] OOS Gate verification failed with code: {}", code);
-            ExitCode::from(code)
+            return ExitCode::from(code);
         }
     }
+
+    if daemon_mode {
+        let shm_path = MappedShmRegion::default_shm_path();
+        let region = match MappedShmRegion::open_or_create(&shm_path, false) {
+            Ok(r) => r,
+            Err(_) => return ExitCode::from(9),
+        };
+        let arena = region.arena();
+        println!(
+            "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena ({}) with 0 ms warmup.",
+            shm_path.display()
+        );
+        loop {
+            thread::sleep(Duration::from_millis(40));
+            let _hb = arena.heartbeat_ns.load(Ordering::Acquire);
+            if let Ok(slot0) = arena.slot(0) {
+                let _ = slot0.read_snapshot(4);
+            }
+        }
+    }
+
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

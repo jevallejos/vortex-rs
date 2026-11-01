@@ -8,12 +8,10 @@ echo "==========================================================================
 VORTEX_DIR="${HOME}/vortex-rs"
 BIN_DIR="${VORTEX_DIR}/bin"
 DATA_DIR="${VORTEX_DIR}/data"
-SHM_PATH="/dev/shm/vortex_lob.mmap"
 RELEASE_URL="https://github.com/jevallejos/vortex-rs/releases/download/latest-linux-x86_64/vortex-linux-x86_64.tar.gz"
 
 mkdir -p "${BIN_DIR}" "${DATA_DIR}"
 
-# 1. Detener y deshabilitar demonios antiguos en Python para evitar colisión de órdenes en Bybit
 for legacy_svc in bot-sniper.service doctor-blythe.service; do
     if systemctl list-unit-files | grep -q "^${legacy_svc}"; then
         echo "[CLEANUP] Stopping and disabling legacy Python service: ${legacy_svc}"
@@ -22,14 +20,13 @@ for legacy_svc in bot-sniper.service doctor-blythe.service; do
     fi
 done
 
-# 2. Descargar binarios Linux x86_64 pre-compilados desde GitHub Release (o compilar con nice -n 19 si aún no termina Actions)
 echo "[BINARY FETCH] Attempting zero-jitter download of pre-built Linux x86_64 binaries..."
 if curl -fsSL "${RELEASE_URL}" -o "/tmp/vortex-linux-x86_64.tar.gz"; then
     tar -xzf "/tmp/vortex-linux-x86_64.tar.gz" -C "${BIN_DIR}"
     rm -f "/tmp/vortex-linux-x86_64.tar.gz"
     echo "[OK] Pre-built LTO binaries installed into ${BIN_DIR} (0% compilation CPU jitter)."
 else
-    echo "[FALLBACK] Release artifact still building in GitHub Actions. Building once under idle CPU priority..."
+    echo "[FALLBACK] Building once under idle CPU priority..."
     if ! command -v cargo >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
         export PATH="${HOME}/.cargo/bin:${PATH}"
@@ -42,7 +39,6 @@ fi
 
 chmod +x "${BIN_DIR}/vortex_tap" "${BIN_DIR}/vortex_replay" "${BIN_DIR}/vortex_exec"
 
-# 3. Configurar unidades systemd de bajo jitter (vortex-tap.service y vortex-exec.service)
 sudo tee /etc/systemd/system/vortex-tap.service >/dev/null <<EOF
 [Unit]
 Description=VORTEX-L2 Immortal L2 + PublicTrade Ingestion & Pair Eligibility Daemon
@@ -50,11 +46,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 User=${USER}
 WorkingDirectory=${VORTEX_DIR}
-ExecStart=${BIN_DIR}/vortex_tap
+ExecStart=${BIN_DIR}/vortex_tap --daemon
+Restart=always
+RestartSec=1
 Nice=-10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=0
@@ -72,11 +69,12 @@ After=vortex-tap.service
 Requires=vortex-tap.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=simple
 User=${USER}
 WorkingDirectory=${VORTEX_DIR}
-ExecStart=${BIN_DIR}/vortex_exec
+ExecStart=${BIN_DIR}/vortex_exec --daemon
+Restart=always
+RestartSec=1
 Nice=-10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=0
@@ -87,13 +85,13 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 EOF
 
-# 4. Instalar CLI global `/usr/local/bin/vortex`
 sudo tee /usr/local/bin/vortex >/dev/null <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 case "\${1:-status}" in
     status|-s)
         systemctl status vortex-tap.service vortex-exec.service --no-pager
+        ls -lh /dev/shm/vortex_lob.mmap
         ;;
     audit|-a)
         ${BIN_DIR}/vortex_tap
@@ -120,6 +118,7 @@ sudo chmod +x /usr/local/bin/vortex
 sudo systemctl daemon-reload
 sudo systemctl enable vortex-tap.service vortex-exec.service
 sudo systemctl restart vortex-tap.service vortex-exec.service
+sleep 1
 
-echo "[OK] VORTEX-L2 systemd services enabled and active."
+echo "[OK] VORTEX-L2 systemd services enabled and running perpetually (Type=simple)."
 vortex all

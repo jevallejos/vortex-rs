@@ -1,6 +1,10 @@
-//! Zero-allocation L2 Order Book and Hot-State ring over lock-free Seqlock memory.
+//! Zero-allocation L2 Order Book and Hot-State ring over lock-free Seqlock memory,
+//! backed by POSIX `/dev/shm/vortex_lob.mmap` (`MAP_SHARED`) on Linux.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
+
 use crate::types::{BoundedScore, LotQty, PriceTicks, ScaledBps, SymbolId, TimestampNs, VortexError};
 
 /// Canonical depth of Bybit `orderbook.50` stream.
@@ -11,6 +15,8 @@ pub const MAX_ACTIVE_PAIRS: usize = 8;
 pub const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C32;
 /// Schema version of the shared memory layout.
 pub const VORTEX_SHM_VERSION: u32 = 1;
+/// Canonical POSIX shared-memory path on Ubuntu Linux production nodes.
+pub const DEFAULT_LINUX_SHM_PATH: &str = "/dev/shm/vortex_lob.mmap";
 
 /// Single price-quantity level in the L2 order book (16 bytes).
 #[repr(C)]
@@ -82,7 +88,11 @@ impl SymbolLobSnapshot {
     pub const fn bbo_and_spread_ticks(&self) -> Option<(BookLevel, BookLevel, i64)> {
         let best_bid = self.bids[0];
         let best_ask = self.asks[0];
-        if best_bid.price.0 <= 0 || best_ask.price.0 <= best_bid.price.0 || best_bid.qty.0 <= 0 || best_ask.qty.0 <= 0 {
+        if best_bid.price.0 <= 0
+            || best_ask.price.0 <= best_bid.price.0
+            || best_bid.qty.0 <= 0
+            || best_ask.qty.0 <= 0
+        {
             return None;
         }
         let spread = best_ask.price.0 - best_bid.price.0;
@@ -118,8 +128,7 @@ impl SeqlockSymbolSlot {
         }
     }
 
-    /// Single-writer lock-free update (`vortex-tap`). Increments `seq` to odd before writing,
-    /// and to even on completion with Release ordering.
+    /// Single-writer lock-free update (`vortex-tap`).
     #[inline]
     pub fn write_snapshot(&self, snap: &SymbolLobSnapshot) {
         let s0 = self.seq.load(Ordering::Relaxed);
@@ -133,7 +142,7 @@ impl SeqlockSymbolSlot {
         self.seq.store(s_odd.wrapping_add(1), Ordering::Release);
     }
 
-    /// Lock-free optimistic read (`vortex-exec`). Retries up to `max_retries` if a write is in progress.
+    /// Lock-free optimistic read (`vortex-exec`).
     #[inline]
     pub fn read_snapshot(&self, max_retries: usize) -> Result<SymbolLobSnapshot, VortexError> {
         for _ in 0..max_retries {
@@ -201,48 +210,177 @@ impl VortexShmArena {
     }
 }
 
+#[cfg(unix)]
+extern "C" {
+    fn mmap(
+        addr: *mut core::ffi::c_void,
+        length: usize,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: i64,
+    ) -> *mut core::ffi::c_void;
+    fn munmap(addr: *mut core::ffi::c_void, length: usize) -> i32;
+}
+
+/// Cross-process memory-mapped wrapper for `VortexShmArena`.
+/// Uses POSIX `mmap(MAP_SHARED)` on `/dev/shm/vortex_lob.mmap` on Linux and heap-backed fallback on Windows.
+#[derive(Debug)]
+pub struct MappedShmRegion {
+    #[cfg(unix)]
+    ptr: *mut VortexShmArena,
+    #[cfg(unix)]
+    len: usize,
+    #[cfg(not(unix))]
+    arena: Box<VortexShmArena>,
+}
+
+impl MappedShmRegion {
+    /// Returns the default OS path (`/dev/shm/vortex_lob.mmap` on Linux, temp dir on Windows).
+    #[must_use]
+    pub fn default_shm_path() -> PathBuf {
+        let dev_shm = Path::new("/dev/shm");
+        if dev_shm.exists() {
+            dev_shm.join("vortex_lob.mmap")
+        } else {
+            std::env::temp_dir().join("vortex_lob.mmap")
+        }
+    }
+
+    /// Opens or creates the shared memory region at `path`.
+    pub fn open_or_create(path: &Path, initialize_writer: bool) -> Result<Self, VortexError> {
+        let size = core::mem::size_of::<VortexShmArena>();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|_| VortexError::ColumnarIoFailure)?;
+
+        file.set_len(size as u64)
+            .map_err(|_| VortexError::ColumnarIoFailure)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            const PROT_READ: i32 = 0x1;
+            const PROT_WRITE: i32 = 0x2;
+            const MAP_SHARED: i32 = 0x01;
+
+            // SAFETY: File descriptor is valid and sized to `size_of::<VortexShmArena>()`.
+            let raw_ptr = unsafe {
+                mmap(
+                    core::ptr::null_mut(),
+                    size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if raw_ptr.is_null() || (raw_ptr as usize) == usize::MAX {
+                return Err(VortexError::ColumnarIoFailure);
+            }
+            let arena_ptr = raw_ptr.cast::<VortexShmArena>();
+            // SAFETY: `arena_ptr` points to a valid page-aligned `MAP_SHARED` region of `size` bytes.
+            unsafe {
+                let current_magic = core::ptr::read_volatile(&(*arena_ptr).magic);
+                if initialize_writer || current_magic != VORTEX_SHM_MAGIC {
+                    core::ptr::write(arena_ptr, VortexShmArena::new());
+                }
+            }
+            Ok(Self {
+                ptr: arena_ptr,
+                len: size,
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = initialize_writer;
+            Ok(Self {
+                arena: Box::new(VortexShmArena::new()),
+            })
+        }
+    }
+
+    /// Returns a shared reference to the underlying `VortexShmArena`.
+    #[inline]
+    #[must_use]
+    pub fn arena(&self) -> &VortexShmArena {
+        #[cfg(unix)]
+        {
+            // SAFETY: `self.ptr` remains valid for the lifetime of `MappedShmRegion`.
+            unsafe { &*self.ptr }
+        }
+        #[cfg(not(unix))]
+        {
+            &self.arena
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MappedShmRegion {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            // SAFETY: Unmaps the region previously mapped in `open_or_create`.
+            unsafe {
+                let _ = munmap(self.ptr.cast::<core::ffi::c_void>(), self.len);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_seqlock_roundtrip_and_bbo_spread() {
-        let arena = VortexShmArena::new();
-        let mut snap = SymbolLobSnapshot {
-            symbol_id: SymbolId(1),
-            is_eligible: true,
-            sequence_id: 42,
-            ts_exchange_ns: TimestampNs(1_700_000_000_000_000_000),
-            ts_local_ns: TimestampNs(1_700_000_000_005_000_000),
-            mark_price: PriceTicks(25_000),
-            last_trade_price: PriceTicks(25_001),
-            realized_vol_5m: ScaledBps::from_whole_bps(55),
-            factor_ofi: BoundedScore::new_clamped(0.68),
-            factor_tfi: BoundedScore::new_clamped(0.74),
-            factor_geom: BoundedScore::new_clamped(0.52),
-            ..SymbolLobSnapshot::default()
-        };
-        snap.bids[0] = BookLevel {
-            price: PriceTicks(25_000),
-            qty: LotQty(150),
-        };
-        snap.asks[0] = BookLevel {
-            price: PriceTicks(25_001),
-            qty: LotQty(120),
-        };
+        let shm_path = std::env::temp_dir().join("vortex_test_shm_region.mmap");
+        let region = MappedShmRegion::open_or_create(&shm_path, true);
+        assert!(region.is_ok());
+        if let Ok(reg) = region {
+            let arena = reg.arena();
+            let mut snap = SymbolLobSnapshot {
+                symbol_id: SymbolId(1),
+                is_eligible: true,
+                sequence_id: 42,
+                ts_exchange_ns: TimestampNs(1_700_000_000_000_000_000),
+                ts_local_ns: TimestampNs(1_700_000_000_005_000_000),
+                mark_price: PriceTicks(25_000),
+                last_trade_price: PriceTicks(25_001),
+                realized_vol_5m: ScaledBps::from_whole_bps(55),
+                factor_ofi: BoundedScore::new_clamped(0.68),
+                factor_tfi: BoundedScore::new_clamped(0.74),
+                factor_geom: BoundedScore::new_clamped(0.52),
+                ..SymbolLobSnapshot::default()
+            };
+            snap.bids[0] = BookLevel {
+                price: PriceTicks(25_000),
+                qty: LotQty(150),
+            };
+            snap.asks[0] = BookLevel {
+                price: PriceTicks(25_001),
+                qty: LotQty(120),
+            };
 
-        let slot = arena.slot(0);
-        assert!(slot.is_ok());
-        if let Ok(s) = slot {
-            s.write_snapshot(&snap);
-            let read_back = s.read_snapshot(8);
-            assert_eq!(read_back, Ok(snap));
-            if let Ok(rb) = read_back {
-                assert_eq!(
-                    rb.bbo_and_spread_ticks(),
-                    Some((snap.bids[0], snap.asks[0], 1))
-                );
+            let slot = arena.slot(0);
+            assert!(slot.is_ok());
+            if let Ok(s) = slot {
+                s.write_snapshot(&snap);
+                let read_back = s.read_snapshot(8);
+                assert_eq!(read_back, Ok(snap));
+                if let Ok(rb) = read_back {
+                    assert_eq!(
+                        rb.bbo_and_spread_ticks(),
+                        Some((snap.bids[0], snap.asks[0], 1))
+                    );
+                }
             }
         }
+        let _ = std::fs::remove_file(&shm_path);
     }
 }

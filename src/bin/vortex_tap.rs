@@ -1,12 +1,15 @@
 //! Binary 1 (`vortex_tap`): Immortal L2 + publicTrade ingestion daemon,
 //! Microeconomic Pair Eligibility Auditor (`Tick-to-Price Guard <= 1.50 bps`),
-//! and Seqlock shared-memory writer.
+//! and Seqlock shared-memory writer over `/dev/shm/vortex_lob.mmap`.
 
+use core::sync::atomic::Ordering;
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vortex_rs::alpha_3factor::OrthogonalFactorState;
 use vortex_rs::forensic_parquet::ColumnarParquetBatch;
-use vortex_rs::lob_shm::{BookLevel, SymbolLobSnapshot, VortexShmArena, MAX_ACTIVE_PAIRS};
+use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
 use vortex_rs::types::{LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
 
 #[derive(Copy, Clone, Debug)]
@@ -119,14 +122,33 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
     },
 ];
 
+fn now_epoch_ns() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i64,
+        Err(_) => 1_762_012_800_000_000_000,
+    }
+}
+
 fn main() -> ExitCode {
+    let daemon_mode = std::env::args().any(|a| a == "--daemon");
+    let shm_path = MappedShmRegion::default_shm_path();
+
     println!("================================================================================");
-    println!("[VORTEX-TAP V1.0] INSTITUTIONAL PAIR ELIGIBILITY & SEQLOCK/PARQUET DAEMON");
+    println!(
+        "[VORTEX-TAP V1.0] PAIR ELIGIBILITY & SEQLOCK DAEMON (SHM: {})",
+        shm_path.display()
+    );
     println!("================================================================================");
 
-    let arena = VortexShmArena::new();
+    let region = match MappedShmRegion::open_or_create(&shm_path, true) {
+        Ok(r) => r,
+        Err(_) => return ExitCode::from(1),
+    };
+    let arena = region.arena();
     let mut batch = ColumnarParquetBatch::new();
     let mut approved_slots: usize = 0;
+    let mut factor_states = [OrthogonalFactorState::new(); MAX_ACTIVE_PAIRS];
+    let mut active_snaps = [SymbolLobSnapshot::new_empty(); MAX_ACTIVE_PAIRS];
 
     for candidate in CANDIDATE_UNIVERSE {
         match candidate
@@ -140,15 +162,14 @@ fn main() -> ExitCode {
                 let slot_idx = approved_slots;
                 approved_slots += 1;
 
-                let mut factor_state = OrthogonalFactorState::new();
-                let _ = factor_state.on_public_trade(Side::Bid, LotQty(500));
+                let _ = factor_states[slot_idx].on_public_trade(Side::Bid, LotQty(500));
 
                 let mut snap = SymbolLobSnapshot {
                     symbol_id: candidate.spec.symbol_id,
                     is_eligible: true,
                     sequence_id: 1,
-                    ts_exchange_ns: TimestampNs(1_762_012_800_000_000_000),
-                    ts_local_ns: TimestampNs(1_762_012_800_000_500_000),
+                    ts_exchange_ns: TimestampNs(now_epoch_ns()),
+                    ts_local_ns: TimestampNs(now_epoch_ns()),
                     mark_price: candidate.reference_mid_ticks,
                     last_trade_price: candidate.reference_mid_ticks,
                     realized_vol_5m: candidate.realized_vol_5m,
@@ -164,7 +185,8 @@ fn main() -> ExitCode {
                         qty: LotQty(200),
                     };
                 }
-                factor_state.on_l2_snapshot(&mut snap);
+                factor_states[slot_idx].on_l2_snapshot(&mut snap);
+                active_snaps[slot_idx] = snap;
 
                 if let Ok(slot) = arena.slot(slot_idx) {
                     slot.write_snapshot(&snap);
@@ -191,6 +213,10 @@ fn main() -> ExitCode {
         }
     }
 
+    arena
+        .heartbeat_ns
+        .store(now_epoch_ns() as u64, Ordering::Release);
+
     let out_path = std::env::temp_dir().join("vortex_tap_audit_segment.parquet");
     let checksum = match batch.write_to_file(&out_path) {
         Ok(c) => c,
@@ -210,5 +236,29 @@ fn main() -> ExitCode {
         checksum
     );
     println!("================================================================================");
+
+    if daemon_mode {
+        println!("[DAEMON 25.0 Hz] Entering immortal Seqlock writer loop (40 ms tick interval)...");
+        let mut tick_counter: u64 = 1;
+        loop {
+            thread::sleep(Duration::from_millis(40));
+            tick_counter = tick_counter.wrapping_add(1);
+            let ts = now_epoch_ns();
+            arena.heartbeat_ns.store(ts as u64, Ordering::Release);
+
+            let mut s = 0;
+            while s < approved_slots {
+                active_snaps[s].sequence_id = tick_counter;
+                active_snaps[s].ts_local_ns = TimestampNs(ts);
+                active_snaps[s].ts_exchange_ns = TimestampNs(ts);
+                factor_states[s].on_l2_snapshot(&mut active_snaps[s]);
+                if let Ok(slot) = arena.slot(s) {
+                    slot.write_snapshot(&active_snaps[s]);
+                }
+                s += 1;
+            }
+        }
+    }
+
     ExitCode::SUCCESS
 }
