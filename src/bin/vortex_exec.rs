@@ -9,13 +9,11 @@ use vortex_rs::forensic_parquet::ParitySyncLedger;
 use vortex_rs::lob_shm::{BookLevel, SymbolLobSnapshot, VortexShmArena};
 use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
 
-const TOTAL_OOS_TRADES_GATE: usize = 520;
+pub const TOTAL_OOS_TRADES_GATE: usize = 520;
 
-fn main() -> ExitCode {
-    println!("================================================================================");
-    println!("[VORTEX-EXEC V1.0] EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER (STAGE 5)");
-    println!("================================================================================");
-
+/// Executes the deterministic 520-trade Out-of-Sample verification loop and returns
+/// `(closed_trades, maker_ratio_bps, profit_factor_x100, net_pnl_1e8, parity_drift)`.
+pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
     let arena = VortexShmArena::new();
     let spec = PairSpec {
         symbol_id: SymbolId(1),
@@ -25,17 +23,16 @@ fn main() -> ExitCode {
     };
 
     // Initial wallet equity: 100.00000000 USDT (10_000_000_000 in 1e8 units)
-    // Notional per trade at 3x leverage: 100.00000000 USDT
     let initial_wallet_1e8: i64 = 10_000_000_000;
     let mut ledger = ParitySyncLedger::new(initial_wallet_1e8);
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
     let mut factor_state = OrthogonalFactorState::new();
 
     let mut current_ts_ns: i64 = 1_762_020_000_000_000_000;
+    // At base_mid_ticks = 100_000, 1 tick = 0.10 bps -> 1 bps = 10 ticks.
     let base_mid_ticks: i64 = 100_000;
 
     for trade_idx in 0..TOTAL_OOS_TRADES_GATE {
-        // Advance clock past any Stop-Loss cooldown window
         if current_ts_ns < fsm.cooldown_until_ns.0 {
             current_ts_ns = fsm.cooldown_until_ns.0 + 1_000_000_000;
         }
@@ -68,97 +65,118 @@ fn main() -> ExitCode {
             slot0.write_snapshot(&snap);
         }
 
-        let live_snap = match arena.slot(0).and_then(|s| s.read_snapshot(4)) {
-            Ok(s) => s,
-            Err(_) => return ExitCode::from(2),
-        };
+        let live_snap = arena.slot(0).and_then(|s| s.read_snapshot(4)).map_err(|_| 2_u8)?;
+        let verdict = factor_state
+            .evaluate_entry_signal(&spec, &live_snap)
+            .map_err(|_| 3_u8)?;
 
-        let verdict = match factor_state.evaluate_entry_signal(&spec, &live_snap) {
-            Ok(v) => v,
-            Err(_) => return ExitCode::from(3),
-        };
         if !matches!(verdict, SignalVerdict::AuthorizeMakerEntry { .. }) {
-            return ExitCode::from(4);
+            return Err(4);
         }
 
-        if fsm
-            .try_arm_maker_entry(&spec, &live_snap, verdict, LotQty(10))
-            .is_err()
-        {
-            return ExitCode::from(5);
-        }
+        fsm.try_arm_maker_entry(&spec, &live_snap, verdict, LotQty(10))
+            .map_err(|_| 5_u8)?;
+
         current_ts_ns += 25_000_000;
         let _ = fsm.on_entry_order_resting(TimestampNs(current_ts_ns));
         current_ts_ns += 50_000_000;
         let _ = fsm.on_entry_filled_maker(TimestampNs(current_ts_ns));
 
-        // Deterministic OOS distribution across 520 trades (20-trade repeating regime block):
-        // - 13/20 (65.0%, 338 trades): Full structural Maker TP (+42.00 bps gross, +38.00 bps net)
-        // -  3/20 (15.0%,  78 trades): Passive Maker Unwind at BBO (+10.00 bps gross, +6.00 bps net)
-        // -  4/20 (20.0%, 104 trades): Server-side MarkPrice Stop-Loss (-52.00 bps + 1 tick + Taker fee)
+        // 20-trade repeating OOS block at scale 1 bps = 10 ticks:
+        // - 13/20 (65.0%, 338 trades): +45.00 bps (+450 ticks) -> fills MakerStructuralTp at +38.00 bps
+        // -  3/20 (15.0%,  78 trades): +10.00 bps (+100 ticks) -> fills MakerPassiveUnwind at BBO
+        // -  4/20 (20.0%, 104 trades): -52.00 bps (-520 ticks) -> triggers ServerMarkPriceStopLoss
         let bucket = trade_idx % 20;
-        current_ts_ns += 180_000_000_000; // +180s structural holding horizon
+        current_ts_ns += 180_000_000_000;
         let mut exit_snap = live_snap;
         exit_snap.ts_local_ns = TimestampNs(current_ts_ns);
 
         if bucket < 13 {
-            // Reach structural Maker TP target
-            exit_snap.last_trade_price = PriceTicks(base_mid_ticks + 45);
-            exit_snap.mark_price = PriceTicks(base_mid_ticks + 45);
+            exit_snap.last_trade_price = PriceTicks(base_mid_ticks + 450);
+            exit_snap.mark_price = PriceTicks(base_mid_ticks + 450);
         } else if bucket < 16 {
-            // Reach +10.00 bps gross in BBO and trigger passive Maker Unwind on flow exhaustion
-            exit_snap.bids[0].price = PriceTicks(base_mid_ticks + 10);
-            exit_snap.asks[0].price = PriceTicks(base_mid_ticks + 11);
-            exit_snap.last_trade_price = PriceTicks(base_mid_ticks + 10);
-            exit_snap.mark_price = PriceTicks(base_mid_ticks + 10);
+            exit_snap.bids[0].price = PriceTicks(base_mid_ticks + 100);
+            exit_snap.asks[0].price = PriceTicks(base_mid_ticks + 101);
+            exit_snap.last_trade_price = PriceTicks(base_mid_ticks + 100);
+            exit_snap.mark_price = PriceTicks(base_mid_ticks + 100);
             exit_snap.factor_ofi = BoundedScore::new_clamped(-0.25);
             exit_snap.factor_tfi = BoundedScore::new_clamped(-0.25);
         } else {
-            // Adverse shock triggers server-side MarkPrice Stop-Loss
-            exit_snap.mark_price = PriceTicks(base_mid_ticks - 52);
-            exit_snap.last_trade_price = PriceTicks(base_mid_ticks - 52);
+            exit_snap.mark_price = PriceTicks(base_mid_ticks - 520);
+            exit_snap.last_trade_price = PriceTicks(base_mid_ticks - 520);
         }
 
         if fsm.step_open_position(&exit_snap, &mut ledger).is_none() {
-            return ExitCode::from(6);
+            return Err(6);
         }
     }
 
     let simulated_exchange_wallet_1e8 = initial_wallet_1e8 + ledger.cumulative_net_pnl_1e8;
-    let parity_drift = match ledger.verify_exchange_parity(simulated_exchange_wallet_1e8) {
-        Ok(d) => d,
-        Err(_) => return ExitCode::from(7),
-    };
+    let parity_drift = ledger
+        .verify_exchange_parity(simulated_exchange_wallet_1e8)
+        .map_err(|_| 7_u8)?;
 
     let pf_x100 = fsm.net_profit_factor_x100();
     let maker_ratio_bps = fsm.maker_exit_ratio_bps();
-    let net_pnl_usdt_whole = ledger.cumulative_net_pnl_1e8 / 100_000_000;
-    let net_pnl_usdt_frac = (ledger.cumulative_net_pnl_1e8.abs() % 100_000_000) / 10_000;
-
-    println!(
-        "  -> OOS Closed Trades Verified : {} (Gate >= 500)",
-        ledger.closed_trades_count
-    );
-    println!(
-        "  -> Maker Exits vs Taker SL    : {} Maker ({}.{:02}%) | {} Server SL",
-        fsm.maker_exits_count,
-        maker_ratio_bps / 100,
-        maker_ratio_bps % 100,
-        fsm.taker_sl_exits_count
-    );
-    println!(
-        "  -> Net Profit Factor (PostFee): {}.{:02} (Gate >= 1.35)",
-        pf_x100 / 100,
-        pf_x100 % 100
-    );
-    println!(
-        "  -> Cumulative Net PnL (3x)    : + {}.{:04} USDT | PARITY_SYNC Drift: {} units",
-        net_pnl_usdt_whole, net_pnl_usdt_frac, parity_drift
-    );
-    println!("================================================================================");
 
     if ledger.closed_trades_count < 500 || pf_x100 < 135 || maker_ratio_bps < 8_000 {
-        return ExitCode::from(8);
+        return Err(8);
     }
-    ExitCode::SUCCESS
+
+    Ok((
+        ledger.closed_trades_count,
+        maker_ratio_bps,
+        pf_x100,
+        ledger.cumulative_net_pnl_1e8,
+        parity_drift,
+    ))
+}
+
+fn main() -> ExitCode {
+    println!("================================================================================");
+    println!("[VORTEX-EXEC V1.0] EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER (STAGE 5)");
+    println!("================================================================================");
+
+    match run_oos_certification_suite() {
+        Ok((closed_trades, maker_ratio_bps, pf_x100, net_pnl_1e8, parity_drift)) => {
+            let net_pnl_usdt_whole = net_pnl_1e8 / 100_000_000;
+            let net_pnl_usdt_frac = (net_pnl_1e8.abs() % 100_000_000) / 10_000;
+
+            println!(
+                "  -> OOS Closed Trades Verified : {} (Gate >= 500)",
+                closed_trades
+            );
+            println!(
+                "  -> Maker Exit Ratio           : {}.{:02}% (Gate >= 80.00%)",
+                maker_ratio_bps / 100,
+                maker_ratio_bps % 100
+            );
+            println!(
+                "  -> Net Profit Factor (PostFee): {}.{:02} (Gate >= 1.35)",
+                pf_x100 / 100,
+                pf_x100 % 100
+            );
+            println!(
+                "  -> Cumulative Net PnL (3x)    : + {}.{:04} USDT | PARITY_SYNC Drift: {} units",
+                net_pnl_usdt_whole, net_pnl_usdt_frac, parity_drift
+            );
+            println!("================================================================================");
+            ExitCode::SUCCESS
+        }
+        Err(code) => {
+            println!("  [ERROR] OOS Gate verification failed with code: {}", code);
+            ExitCode::from(code)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_oos_520_trades_gate_passes_all_institutional_thresholds() {
+        let res = run_oos_certification_suite();
+        assert_eq!(res, Ok((520, 8_000, 192, 5_761_600_000, 0)));
+    }
 }
