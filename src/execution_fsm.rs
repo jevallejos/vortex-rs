@@ -1,6 +1,6 @@
 //! Exhaustive Finite-State Machine (`OrderLifecycleState`) for Bybit UTA V5 execution:
 //! 100% `Limit PostOnly` normal exits, geometric `MarkPrice` Stop-Loss protection,
-//! BBO Runaway / TTL Queue Abort Guard, deterministic `110017` win reconciliation, and `110007` margin guard.
+//! Joint OFI+TFI & BBO Runaway Queue Abort Guard, deterministic `110017` win reconciliation, and `110007` margin guard.
 
 use crate::alpha_3factor::SignalVerdict;
 use crate::forensic_parquet::ParitySyncLedger;
@@ -9,12 +9,11 @@ use crate::types::{LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, V
 
 /// Cooldown applied ONLY after a real server-side Stop-Loss trigger (60 seconds in nanoseconds).
 pub const STOP_LOSS_COOLDOWN_NS: i64 = 60_000_000_000;
-/// Maximum time a passive `Limit PostOnly` entry order may sit unfilled in the L1 queue (12 seconds).
-pub const MAX_RESTING_QUEUE_TTL_NS: i64 = 12_000_000_000;
+/// Maximum time a passive `Limit PostOnly` entry order may sit unfilled in the L1 queue (25 seconds).
+pub const MAX_RESTING_QUEUE_TTL_NS: i64 = 25_000_000_000;
 /// Maximum distance in ticks the BBO can run away from our resting entry order before cancellation.
 pub const MAX_BBO_RUNAWAY_TICKS: i64 = 3;
 
-/// Canonical Bybit UTA V5 return codes handled deterministically by the execution FSM.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BybitRetCode {
     OkZero,
@@ -23,7 +22,6 @@ pub enum BybitRetCode {
     OrderNotExistsOrAlreadyClosed110017,
 }
 
-/// Terminal halt reason when the risk guard locks the execution engine.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HaltReason {
     InsufficientMargin110007,
@@ -31,7 +29,6 @@ pub enum HaltReason {
     MaxDailyDrawdownBreached,
 }
 
-/// Classification of a completed trade for forensic and OOS attribution.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClosedTradeKind {
     MakerStructuralTp,
@@ -39,7 +36,6 @@ pub enum ClosedTradeKind {
     ServerMarkPriceStopLoss,
 }
 
-/// Exhaustive algebraic state machine governing a single concurrent slot.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OrderLifecycleState {
     Idle,
@@ -79,7 +75,6 @@ pub enum OrderLifecycleState {
     },
 }
 
-/// Summary record returned whenever a position closes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ClosedTradeSummary {
     pub kind: ClosedTradeKind,
@@ -93,7 +88,6 @@ pub struct ClosedTradeSummary {
     pub is_maker_exit: bool,
 }
 
-/// Deterministic Execution State Machine coupled to `ParitySyncLedger`.
 #[derive(Copy, Clone, Debug)]
 pub struct ExecutionFsm {
     pub state: OrderLifecycleState,
@@ -212,10 +206,10 @@ impl ExecutionFsm {
         false
     }
 
-    /// Aborts a resting entry order if:
-    /// 1. Executed trade flow (`X_TFI`) flips against the order, OR
-    /// 2. The order exceeds `MAX_RESTING_QUEUE_TTL_NS` (12s) without filling, OR
-    /// 3. The BBO runs away from `entry_price` by `>= MAX_BBO_RUNAWAY_TICKS` (3 ticks).
+    /// Aborts a resting entry order ONLY after verifying the order did not fill on the current event:
+    /// 1. Both L2 book pressure (`X_OFI`) and trade tape (`X_TFI`) reversed against our side, OR
+    /// 2. Monotonic elapsed time exceeds `MAX_RESTING_QUEUE_TTL_NS` (25s), OR
+    /// 3. The BBO ran away from `entry_price` by `>= MAX_BBO_RUNAWAY_TICKS` (3 ticks).
     #[inline]
     pub fn check_resting_queue_abort(&mut self, snap: &SymbolLobSnapshot) -> bool {
         if let OrderLifecycleState::RestingEntryQueue {
@@ -225,14 +219,15 @@ impl ExecutionFsm {
             ..
         } = self.state
         {
+            let ofi = snap.factor_ofi.get();
             let tfi = snap.factor_tfi.get();
-            let adverse_flip = match side {
-                Side::Bid => tfi <= -0.15,
-                Side::Ask => tfi >= 0.15,
+            let joint_flow_reversal = match side {
+                Side::Bid => ofi <= -0.20 && tfi <= -0.25,
+                Side::Ask => ofi >= 0.20 && tfi >= 0.25,
             };
 
-            let ttl_expired =
-                snap.ts_local_ns.0.saturating_sub(resting_since_ts.0) >= MAX_RESTING_QUEUE_TTL_NS;
+            let ttl_expired = snap.ts_local_ns.0 > resting_since_ts.0
+                && (snap.ts_local_ns.0 - resting_since_ts.0) >= MAX_RESTING_QUEUE_TTL_NS;
 
             let bbo_runaway = match snap.bbo_and_spread_ticks() {
                 Some((best_bid, best_ask, _)) => match side {
@@ -242,7 +237,7 @@ impl ExecutionFsm {
                 None => false,
             };
 
-            if adverse_flip || ttl_expired || bbo_runaway {
+            if joint_flow_reversal || ttl_expired || bbo_runaway {
                 self.state = OrderLifecycleState::Idle;
                 return true;
             }
@@ -347,7 +342,7 @@ impl ExecutionFsm {
             ));
         }
 
-        // 3. Check passive Maker Unwind at BBO (only when net profitable >= 8.00 bps gross and flow reverses)
+        // 3. Check passive Maker Unwind at BBO (when gross >= +6.00 bps -> net >= +2.00 bps after 4.00 bps Maker fees)
         if let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() {
             let bbo_exit_price = match side {
                 Side::Bid => best_bid.price,
@@ -359,7 +354,7 @@ impl ExecutionFsm {
                 Side::Bid => snap.factor_ofi.get() < -0.10 && snap.factor_tfi.get() < -0.10,
                 Side::Ask => snap.factor_ofi.get() > 0.10 && snap.factor_tfi.get() > 0.10,
             };
-            if current_gross_bps.raw() >= 800 && flow_exhausted {
+            if current_gross_bps.raw() >= 600 && flow_exhausted {
                 return Some(self.finalize_close(
                     ClosedTradeKind::MakerPassiveUnwind,
                     side,
@@ -587,7 +582,6 @@ mod tests {
         );
         assert!(fsm.on_entry_order_resting(TimestampNs(1_000_000_000)));
 
-        // Price runs away by +3 ticks without filling our Bid at 9_000
         snap.bids[0].price = PriceTicks(9_003);
         snap.asks[0].price = PriceTicks(9_004);
         assert!(fsm.check_resting_queue_abort(&snap));

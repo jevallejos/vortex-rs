@@ -190,8 +190,12 @@ impl FifoQueueSimulator {
                             Side::Ask => row.side == Side::Bid && row.price_ticks.0 >= limit_price.0,
                         };
                         if hits_our_level {
+                            let traded_through = match side {
+                                Side::Bid => row.price_ticks.0 < limit_price.0,
+                                Side::Ask => row.price_ticks.0 > limit_price.0,
+                            };
                             let remaining_after_print = queue_ahead_qty.0 - row.lot_qty.0;
-                            if remaining_after_print <= -order_qty.0 {
+                            if traded_through || remaining_after_print <= -order_qty.0 {
                                 self.total_maker_fills += 1;
                                 self.state = SimulatedOrderState::FilledMaker {
                                     side,
@@ -205,6 +209,26 @@ impl FifoQueueSimulator {
                         }
                     }
                     MarketEventKind::L2BookSnapshot => {
+                        // Check if L2 book stepped completely through our resting level
+                        let book_traded_through = match side {
+                            Side::Bid => {
+                                row.best_ask_ticks.0 > 0 && row.best_ask_ticks.0 <= limit_price.0
+                            }
+                            Side::Ask => {
+                                row.best_bid_ticks.0 > 0 && row.best_bid_ticks.0 >= limit_price.0
+                            }
+                        };
+                        if book_traded_through {
+                            self.total_maker_fills += 1;
+                            self.state = SimulatedOrderState::FilledMaker {
+                                side,
+                                fill_price: limit_price,
+                                filled_qty: order_qty,
+                                fill_ts_ns: row.ts_local_ns,
+                            };
+                            return;
+                        }
+
                         let current_l1_qty = match side {
                             Side::Bid if row.best_bid_ticks.0 == limit_price.0 => row.best_bid_qty.0,
                             Side::Ask if row.best_ask_ticks.0 == limit_price.0 => row.best_ask_qty.0,
@@ -212,7 +236,7 @@ impl FifoQueueSimulator {
                         };
                         if current_l1_qty < last_observed_l1_qty.0 {
                             let drop = last_observed_l1_qty.0 - current_l1_qty;
-                            let conservative_credit = drop / 4;
+                            let conservative_credit = (drop / 4).max(1);
                             queue_ahead_qty = LotQty((queue_ahead_qty.0 - conservative_credit).max(0));
                         }
                         last_observed_l1_qty = LotQty(current_l1_qty);
@@ -301,7 +325,7 @@ fn replay_captured_live_parquet_segments() {
                             ts_local_ns: row.ts_local_ns,
                             mark_price: row.mark_price_ticks,
                             last_trade_price: row.price_ticks,
-                            realized_vol_5m: ScaledBps::from_whole_bps(58),
+                            realized_vol_5m: ScaledBps::from_whole_bps(60),
                             factor_ofi: BoundedScore::new_clamped(f64::from(row.ofi_bps) / 10_000.0),
                             factor_tfi: BoundedScore::new_clamped(f64::from(row.tfi_bps) / 10_000.0),
                             factor_geom: BoundedScore::new_clamped(f64::from(row.geom_bps) / 10_000.0),
@@ -347,22 +371,22 @@ fn replay_captured_live_parquet_segments() {
                             OrderLifecycleState::RestingEntryQueue { .. }
                                 if row.symbol_id == active_sym =>
                             {
-                                if fsm.check_resting_queue_abort(&snap) {
+                                // Evaluate FIFO Fill FIRST before checking queue abort
+                                fifo_sim.on_market_row(&row);
+                                if matches!(
+                                    fifo_sim.state,
+                                    SimulatedOrderState::FilledMaker { .. }
+                                ) {
+                                    let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
+                                } else if matches!(
+                                    fifo_sim.state,
+                                    SimulatedOrderState::RejectedPostOnlyCross
+                                ) {
+                                    fsm.state = OrderLifecycleState::Idle;
+                                    fifo_sim.state = SimulatedOrderState::Inactive;
+                                } else if fsm.check_resting_queue_abort(&snap) {
                                     queue_aborts += 1;
                                     fifo_sim.state = SimulatedOrderState::Inactive;
-                                } else {
-                                    fifo_sim.on_market_row(&row);
-                                    if matches!(
-                                        fifo_sim.state,
-                                        SimulatedOrderState::FilledMaker { .. }
-                                    ) {
-                                        let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
-                                    } else if matches!(
-                                        fifo_sim.state,
-                                        SimulatedOrderState::RejectedPostOnlyCross
-                                    ) {
-                                        fsm.state = OrderLifecycleState::Idle;
-                                    }
                                 }
                             }
                             OrderLifecycleState::PositionOpenMakerExit { .. }

@@ -13,8 +13,8 @@ pub const LOB_DEPTH: usize = 50;
 pub const MAX_ACTIVE_PAIRS: usize = 8;
 /// Magic header identifying a valid VORTEXL2 shared memory region ("VORTEXL2" in ASCII).
 pub const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C32;
-/// Schema version of the shared memory layout (v2 includes live FSM telemetry counters).
-pub const VORTEX_SHM_VERSION: u32 = 2;
+/// Schema version of the shared memory layout (v3 persists open position TP/SL/Side across restarts).
+pub const VORTEX_SHM_VERSION: u32 = 3;
 /// Canonical POSIX shared-memory path on Ubuntu Linux production nodes.
 pub const DEFAULT_LINUX_SHM_PATH: &str = "/dev/shm/vortex_lob.mmap";
 
@@ -38,11 +38,8 @@ pub struct SymbolLobSnapshot {
     pub mark_price: PriceTicks,
     pub last_trade_price: PriceTicks,
     pub realized_vol_5m: ScaledBps,
-    /// Pre-warmed Orthogonal Factor 1: Multi-scale OFI (500ms, 3s, 15s blended).
     pub factor_ofi: BoundedScore,
-    /// Pre-warmed Orthogonal Factor 2: Executed Trade Flow Imbalance (publicTrade tape).
     pub factor_tfi: BoundedScore,
-    /// Pre-warmed Orthogonal Factor 3: Opposite/Same L1-L10 Liquidity Vacuum Ratio.
     pub factor_geom: BoundedScore,
     pub bids: [BookLevel; LOB_DEPTH],
     pub asks: [BookLevel; LOB_DEPTH],
@@ -56,7 +53,6 @@ impl Default for SymbolLobSnapshot {
 }
 
 impl SymbolLobSnapshot {
-    /// Compile-time zeroed snapshot for static shared-memory initialization.
     #[inline]
     #[must_use]
     pub const fn new_empty() -> Self {
@@ -83,14 +79,12 @@ impl SymbolLobSnapshot {
         }
     }
 
-    /// Clears all resting L2 levels prior to applying a full Bybit `"snapshot"` frame.
     #[inline]
     pub fn clear_book(&mut self) {
         self.bids = [BookLevel::default(); LOB_DEPTH];
         self.asks = [BookLevel::default(); LOB_DEPTH];
     }
 
-    /// Applies a single L2 price-level update (`snapshot` or `delta`) in-place without heap allocation.
     #[inline]
     pub fn apply_level_update(&mut self, side: Side, price: PriceTicks, qty: LotQty) {
         if price.0 <= 0 {
@@ -157,7 +151,6 @@ impl SymbolLobSnapshot {
         }
     }
 
-    /// Returns the best bid and best ask (L1 BBO) and the spread in integer ticks.
     #[inline]
     pub const fn bbo_and_spread_ticks(&self) -> Option<(BookLevel, BookLevel, i64)> {
         let best_bid = self.bids[0];
@@ -246,8 +239,13 @@ pub struct VortexShmArena {
     pub heartbeat_ns: AtomicU64,
     /// Live Execution FSM state code (0=Idle, 1=Placing, 2=RestingQueue, 3=PositionOpen, 4=SL, 5=Halted).
     pub exec_state_code: AtomicU64,
+    pub exec_active_slot: AtomicU64,
     pub exec_active_symbol: AtomicU64,
+    pub exec_side: AtomicU64,
     pub exec_entry_ticks: AtomicU64,
+    pub exec_tp_ticks: AtomicU64,
+    pub exec_sl_ticks: AtomicU64,
+    pub exec_resting_since_ns: AtomicU64,
     pub exec_queue_ahead_lots: AtomicU64,
     pub exec_armed_count: AtomicU64,
     pub exec_abort_count: AtomicU64,
@@ -273,8 +271,13 @@ impl VortexShmArena {
             active_pairs: MAX_ACTIVE_PAIRS as u32,
             heartbeat_ns: AtomicU64::new(0),
             exec_state_code: AtomicU64::new(0),
+            exec_active_slot: AtomicU64::new(0),
             exec_active_symbol: AtomicU64::new(0),
+            exec_side: AtomicU64::new(0),
             exec_entry_ticks: AtomicU64::new(0),
+            exec_tp_ticks: AtomicU64::new(0),
+            exec_sl_ticks: AtomicU64::new(0),
+            exec_resting_since_ns: AtomicU64::new(0),
             exec_queue_ahead_lots: AtomicU64::new(0),
             exec_armed_count: AtomicU64::new(0),
             exec_abort_count: AtomicU64::new(0),
@@ -334,7 +337,9 @@ impl MappedShmRegion {
         }
     }
 
-    pub fn open_or_create(path: &Path, initialize_writer: bool) -> Result<Self, VortexError> {
+    /// Opens or creates the shared memory region. If the region is already initialized with
+    /// `VORTEX_SHM_MAGIC` and `VORTEX_SHM_VERSION`, preserves existing atomic FSM state across restarts.
+    pub fn open_or_create(path: &Path, _initialize_writer: bool) -> Result<Self, VortexError> {
         let size = core::mem::size_of::<VortexShmArena>();
         let file = OpenOptions::new()
             .read(true)
@@ -373,10 +378,7 @@ impl MappedShmRegion {
             unsafe {
                 let current_magic = core::ptr::read_volatile(&(*arena_ptr).magic);
                 let current_version = core::ptr::read_volatile(&(*arena_ptr).version);
-                if initialize_writer
-                    || current_magic != VORTEX_SHM_MAGIC
-                    || current_version != VORTEX_SHM_VERSION
-                {
+                if current_magic != VORTEX_SHM_MAGIC || current_version != VORTEX_SHM_VERSION {
                     core::ptr::write(arena_ptr, VortexShmArena::new());
                 }
             }
@@ -388,7 +390,6 @@ impl MappedShmRegion {
 
         #[cfg(not(unix))]
         {
-            let _ = initialize_writer;
             Ok(Self {
                 arena: Box::new(VortexShmArena::new()),
             })
@@ -444,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_seqlock_roundtrip_and_bbo_spread() {
-        let shm_path = std::env::temp_dir().join("vortex_test_shm_region_v2.mmap");
+        let shm_path = std::env::temp_dir().join("vortex_test_shm_region_v3.mmap");
         let region = MappedShmRegion::open_or_create(&shm_path, true);
         assert!(region.is_ok());
         if let Ok(reg) = region {

@@ -33,8 +33,8 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(780_386),
-        realized_vol_5m: ScaledBps::from_whole_bps(42),
+        reference_mid_ticks: PriceTicks(780_091),
+        realized_vol_5m: ScaledBps::from_whole_bps(58),
     },
     CandidateContract {
         name: "ETHUSDT",
@@ -44,8 +44,8 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(226_722),
-        realized_vol_5m: ScaledBps::from_whole_bps(46),
+        reference_mid_ticks: PriceTicks(226_584),
+        realized_vol_5m: ScaledBps::from_whole_bps(60),
     },
     CandidateContract {
         name: "SOLUSDT",
@@ -55,8 +55,8 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(9_469),
-        realized_vol_5m: ScaledBps::from_whole_bps(58),
+        reference_mid_ticks: PriceTicks(9_462),
+        realized_vol_5m: ScaledBps::from_whole_bps(62),
     },
     CandidateContract {
         name: "AVAXUSDT",
@@ -66,8 +66,8 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(8_730),
-        realized_vol_5m: ScaledBps::from_whole_bps(54),
+        reference_mid_ticks: PriceTicks(8_719),
+        realized_vol_5m: ScaledBps::from_whole_bps(60),
     },
     CandidateContract {
         name: "TAOUSDT",
@@ -77,7 +77,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(23_483),
+        reference_mid_ticks: PriceTicks(23_453),
         realized_vol_5m: ScaledBps::from_whole_bps(68),
     },
     CandidateContract {
@@ -88,8 +88,8 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(8_995),
-        realized_vol_5m: ScaledBps::from_whole_bps(62),
+        reference_mid_ticks: PriceTicks(8_992),
+        realized_vol_5m: ScaledBps::from_whole_bps(64),
     },
     CandidateContract {
         name: "XRPUSDT",
@@ -144,8 +144,6 @@ fn find_slot_by_name(name: &str, approved_count: usize) -> Option<(usize, PairSp
     None
 }
 
-/// Scans `data/` to find the highest existing `vortex_l2_segment_XXXXXX.parquet` sequence number
-/// so restarts append monotonically without overwriting historical segments.
 fn discover_max_parquet_seq() -> u64 {
     let data_dir = Path::new("data");
     let entries = match std::fs::read_dir(data_dir) {
@@ -507,8 +505,10 @@ fn main() -> ExitCode {
                 }
                 active_snaps[slot_idx] = snap;
 
-                if let Ok(slot) = arena.slot(slot_idx) {
-                    slot.write_snapshot(&snap);
+                if !daemon_mode {
+                    if let Ok(slot) = arena.slot(slot_idx) {
+                        slot.write_snapshot(&snap);
+                    }
                 }
                 if batch.push_l2_snapshot(&snap).is_err() {
                     return ExitCode::from(2);

@@ -1,6 +1,5 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, Seqlock Hot-State Reader,
-//! Live Shared-Memory Telemetry HUD (`--live`), Realistic L1 Queue Shadow Executor (`--daemon`),
-//! Persistent Shadow Trade Ledger (`data/vortex_shadow_trades.jsonl`), and 520-Trade OOS Gate Verifier.
+//! Non-Volatile SHM v3 Position Rehydration, Live HUD (`--live`), and 520-Trade OOS Verifier.
 
 use core::sync::atomic::Ordering;
 use std::fs::OpenOptions;
@@ -92,7 +91,6 @@ fn append_shadow_trade_jsonl(
     }
 }
 
-/// Executes the deterministic 520-trade Out-of-Sample verification loop.
 pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
     let arena = VortexShmArena::new();
     let spec = APPROVED_SPECS[0];
@@ -267,7 +265,11 @@ fn print_live_shm_hud() -> ExitCode {
 
     let state_code = arena.exec_state_code.load(Ordering::Acquire);
     let active_sym = SymbolId(arena.exec_active_symbol.load(Ordering::Acquire) as u16);
+    let side_code = arena.exec_side.load(Ordering::Acquire);
+    let side_str = if side_code == 1 { "Ask" } else { "Bid" };
     let entry_ticks = arena.exec_entry_ticks.load(Ordering::Acquire);
+    let tp_ticks = arena.exec_tp_ticks.load(Ordering::Acquire);
+    let sl_ticks = arena.exec_sl_ticks.load(Ordering::Acquire);
     let q_ahead = arena.exec_queue_ahead_lots.load(Ordering::Acquire);
     let armed = arena.exec_armed_count.load(Ordering::Acquire);
     let aborts = arena.exec_abort_count.load(Ordering::Acquire);
@@ -285,10 +287,13 @@ fn print_live_shm_hud() -> ExitCode {
 
     println!("------------------------------------------------------------------------------------------");
     println!(
-        "[EXEC FSM LIVE] State: {} | Sym: {} @ {}t (Queue: {} lots) | Armed: {} | Aborts: {} | Fills: {} | Closed: {}",
+        "[EXEC FSM LIVE] State: {} | Sym: {} ({}) @ {}t [TP:{}t / SL:{}t] (Queue: {} lots) | Armed: {} | Aborts: {} | Fills: {} | Closed: {}",
         state_label,
         if state_code == 0 { "-" } else { active_sym.name() },
+        if state_code == 0 { "-" } else { side_str },
         entry_ticks,
+        tp_ticks,
+        sl_ticks,
         q_ahead,
         armed,
         aborts,
@@ -313,8 +318,63 @@ fn run_shadow_execution_daemon() -> ExitCode {
     let mut resting_queue_ahead: LotQty = LotQty(0);
     let mut prev_l1_qty: LotQty = LotQty(0);
 
+    // Hot-Restore any in-progress resting order or open position from /dev/shm/vortex_lob.mmap
+    let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
+    if saved_state_code == 2 || saved_state_code == 3 {
+        let slot_saved = (arena.exec_active_slot.load(Ordering::Acquire) as usize).min(APPROVED_SPECS.len() - 1);
+        let side_saved = if arena.exec_side.load(Ordering::Acquire) == 1 {
+            Side::Ask
+        } else {
+            Side::Bid
+        };
+        let entry_saved = PriceTicks(arena.exec_entry_ticks.load(Ordering::Acquire) as i64);
+        let tp_saved = PriceTicks(arena.exec_tp_ticks.load(Ordering::Acquire) as i64);
+        let sl_saved = PriceTicks(arena.exec_sl_ticks.load(Ordering::Acquire) as i64);
+        let since_saved = TimestampNs(arena.exec_resting_since_ns.load(Ordering::Acquire) as i64);
+        let q_saved = LotQty(arena.exec_queue_ahead_lots.load(Ordering::Acquire) as i64);
+
+        active_slot = slot_saved;
+        resting_queue_ahead = q_saved;
+        prev_l1_qty = q_saved;
+
+        if saved_state_code == 2 {
+            fsm.state = OrderLifecycleState::RestingEntryQueue {
+                side: side_saved,
+                entry_price: entry_saved,
+                qty: LotQty(10),
+                target_excursion: ScaledBps::from_whole_bps(40),
+                sl_trigger_price: sl_saved,
+                resting_since_ts: since_saved,
+            };
+            println!(
+                "[SHM HOT-RESTORE] Rehydrated RestingEntryQueue on {} {:?} @ {}t (Queue: {} lots)",
+                APPROVED_SPECS[active_slot].symbol_id.name(),
+                side_saved,
+                entry_saved.0,
+                q_saved.0
+            );
+        } else {
+            fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+                side: side_saved,
+                entry_price: entry_saved,
+                qty: LotQty(10),
+                tp_maker_price: tp_saved,
+                sl_trigger_price: sl_saved,
+                opened_ts: since_saved,
+            };
+            println!(
+                "[SHM HOT-RESTORE] Rehydrated PositionOpenMakerExit on {} {:?} @ {}t [TP:{}t / SL:{}t]",
+                APPROVED_SPECS[active_slot].symbol_id.name(),
+                side_saved,
+                entry_saved.0,
+                tp_saved.0,
+                sl_saved.0
+            );
+        }
+    }
+
     println!(
-        "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena ({}) with Realistic L1 Queue Shadow FSM.",
+        "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena ({}) with Non-Volatile SHM v3 FSM.",
         shm_path.display()
     );
 
@@ -339,6 +399,8 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                     if let OrderLifecycleState::RestingEntryQueue {
                                         side,
                                         entry_price,
+                                        sl_trigger_price,
+                                        resting_since_ts,
                                         ..
                                     } = fsm.state
                                     {
@@ -349,12 +411,23 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                         resting_queue_ahead = init_q;
                                         prev_l1_qty = init_q;
                                         arena.exec_state_code.store(2, Ordering::Release);
+                                        arena.exec_active_slot.store(s as u64, Ordering::Release);
                                         arena.exec_active_symbol.store(
                                             u64::from(snap.symbol_id.0),
                                             Ordering::Release,
                                         );
+                                        arena.exec_side.store(side as u64, Ordering::Release);
                                         arena.exec_entry_ticks.store(
                                             entry_price.0 as u64,
+                                            Ordering::Release,
+                                        );
+                                        arena.exec_tp_ticks.store(0, Ordering::Release);
+                                        arena.exec_sl_ticks.store(
+                                            sl_trigger_price.0 as u64,
+                                            Ordering::Release,
+                                        );
+                                        arena.exec_resting_since_ns.store(
+                                            resting_since_ts.0 as u64,
                                             Ordering::Release,
                                         );
                                         arena.exec_queue_ahead_lots.store(
@@ -387,30 +460,18 @@ fn run_shadow_execution_daemon() -> ExitCode {
             } => {
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(snap) = slot.read_snapshot(4) {
-                        if fsm.check_resting_queue_abort(&snap) {
-                            arena.exec_abort_count.fetch_add(1, Ordering::Release);
-                            arena.exec_state_code.store(0, Ordering::Release);
-                            arena.exec_queue_ahead_lots.store(0, Ordering::Release);
-                            println!(
-                                "[SHADOW QUEUE ABORT] {} {:?} canceled before fill (TFI: {:+.2} | BestBid: {} | Entry: {})",
-                                snap.symbol_id.name(),
-                                side,
-                                snap.factor_tfi.get(),
-                                snap.bids[0].price.0,
-                                entry_price.0
-                            );
-                            continue;
-                        }
-
+                        // 1. Evaluate FIFO queue depletion and trade-through fill FIRST
                         let traded_through = match side {
                             Side::Bid => {
                                 snap.asks[0].price.0 <= entry_price.0
                                     || (snap.last_trade_price.0 > 0
-                                        && snap.last_trade_price.0 < entry_price.0)
+                                        && snap.last_trade_price.0 <= entry_price.0
+                                        && snap.bids[0].price.0 < entry_price.0)
                             }
                             Side::Ask => {
                                 snap.bids[0].price.0 >= entry_price.0
-                                    || snap.last_trade_price.0 > entry_price.0
+                                    || (snap.last_trade_price.0 >= entry_price.0
+                                        && snap.asks[0].price.0 > entry_price.0)
                             }
                         };
 
@@ -422,7 +483,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
                         if cur_l1_qty < prev_l1_qty.0 {
                             let drop = prev_l1_qty.0 - cur_l1_qty;
                             resting_queue_ahead =
-                                LotQty((resting_queue_ahead.0 - (drop / 4).max(1)).max(0));
+                                LotQty((resting_queue_ahead.0 - (drop / 2).max(1)).max(0));
                             arena.exec_queue_ahead_lots.store(
                                 resting_queue_ahead.0 as u64,
                                 Ordering::Release,
@@ -432,6 +493,26 @@ fn run_shadow_execution_daemon() -> ExitCode {
 
                         if traded_through || resting_queue_ahead.0 == 0 {
                             let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
+                            if let OrderLifecycleState::PositionOpenMakerExit {
+                                tp_maker_price,
+                                sl_trigger_price,
+                                opened_ts,
+                                ..
+                            } = fsm.state
+                            {
+                                arena.exec_tp_ticks.store(
+                                    tp_maker_price.0 as u64,
+                                    Ordering::Release,
+                                );
+                                arena.exec_sl_ticks.store(
+                                    sl_trigger_price.0 as u64,
+                                    Ordering::Release,
+                                );
+                                arena.exec_resting_since_ns.store(
+                                    opened_ts.0 as u64,
+                                    Ordering::Release,
+                                );
+                            }
                             arena.exec_fill_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(3, Ordering::Release);
                             arena.exec_queue_ahead_lots.store(0, Ordering::Release);
@@ -441,6 +522,23 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                 side,
                                 entry_price.0,
                                 snap.sequence_id
+                            );
+                            continue;
+                        }
+
+                        // 2. Only if NOT filled on this event, check joint OFI+TFI reversal / BBO runaway / TTL abort
+                        if fsm.check_resting_queue_abort(&snap) {
+                            arena.exec_abort_count.fetch_add(1, Ordering::Release);
+                            arena.exec_state_code.store(0, Ordering::Release);
+                            arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                            println!(
+                                "[SHADOW QUEUE ABORT] {} {:?} canceled before fill (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | Entry: {})",
+                                snap.symbol_id.name(),
+                                side,
+                                snap.factor_ofi.get(),
+                                snap.factor_tfi.get(),
+                                snap.bids[0].price.0,
+                                entry_price.0
                             );
                         }
                     }
@@ -453,6 +551,8 @@ fn run_shadow_execution_daemon() -> ExitCode {
                         if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
                             arena.exec_closed_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(0, Ordering::Release);
+                            arena.exec_tp_ticks.store(0, Ordering::Release);
+                            arena.exec_sl_ticks.store(0, Ordering::Release);
                             append_shadow_trade_jsonl(
                                 snap.symbol_id.name(),
                                 &summary,
