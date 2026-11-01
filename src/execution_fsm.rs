@@ -1,7 +1,7 @@
 //! Exhaustive Finite-State Machine (`OrderLifecycleState`) for Bybit UTA V5 execution:
 //! 100% `Limit PostOnly` normal exits, Convex MFE Zero-Loss Maker Ratchet,
-//! Thesis-Decay Queue Protection, Controlled Adverse Maker Unwind (-5.50 bps),
-//! Compressed Server `MarkPrice` Stop-Loss (-14.00 bps), and `HMAC-SHA256` Signer.
+//! Strict 1.50s Anti-Burst Queue Residence Floor, Zero Premature Micro-Scratches,
+//! Structural `-28.00 bps` Server `MarkPrice` Stop-Loss, and `HMAC-SHA256` Signer.
 
 use crate::alpha_3factor::SignalVerdict;
 use crate::forensic_parquet::ParitySyncLedger;
@@ -10,20 +10,18 @@ use crate::types::{LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, V
 
 /// Cooldown applied ONLY after a real server-side Stop-Loss trigger (60 seconds in nanoseconds).
 pub const STOP_LOSS_COOLDOWN_NS: i64 = 60_000_000_000;
-/// Grace window after arming before checking thesis-decay in the L1 queue (250 milliseconds).
-pub const THESIS_DECAY_GRACE_NS: i64 = 250_000_000;
-/// Minimum residence time in L1 queue before evaluating non-emergency BBO runaway re-pegs (1.5 seconds).
+/// Strict minimum residence time in L1 queue before ANY non-TTL cancellation is allowed (1.50 seconds).
 pub const MIN_QUEUE_RESIDENCE_NS: i64 = 1_500_000_000;
-/// Maximum time a passive `Limit PostOnly` entry order may sit unfilled in the L1 queue (15 seconds).
-pub const MAX_RESTING_QUEUE_TTL_NS: i64 = 15_000_000_000;
+/// Maximum time a passive `Limit PostOnly` entry order may sit unfilled in the L1 queue (25 seconds).
+pub const MAX_RESTING_QUEUE_TTL_NS: i64 = 25_000_000_000;
 /// Scale-invariant BBO runaway threshold in ScaledBps after 1.5s residence (3.50 bps = 350 units, min 3 ticks).
 pub const BBO_RUNAWAY_SCALED_BPS: i64 = 350;
-/// Compressed server-side MarkPrice Stop-Loss distance (14.00 bps = 1_400 ScaledBps, min 4 ticks).
-pub const SERVER_SL_DISTANCE_SCALED_BPS: i64 = 1_400;
-/// Controlled adverse passive Maker unwind threshold (-5.50 bps gross = -550 ScaledBps).
-pub const ADVERSE_MAKER_UNWIND_SCALED_BPS: i64 = -550;
-/// Maximum hold time for a stagnant net-profitable position before passive Maker slot release (180 seconds).
-pub const STAGNANT_PROFIT_HOLD_NS: i64 = 180_000_000_000;
+/// Structural server-side MarkPrice Stop-Loss distance (28.00 bps = 2_800 ScaledBps, min 4 ticks).
+pub const SERVER_SL_DISTANCE_SCALED_BPS: i64 = 2_800;
+/// Time horizon for harvesting positive stagnant trades >= +4.80 bps gross / +0.80 bps net (60 seconds).
+pub const EARLY_PROFIT_HARVEST_HOLD_NS: i64 = 60_000_000_000;
+/// Maximum hold time before releasing a stagnant slot via passive Maker BBO exit (240 seconds).
+pub const MAX_SLOT_STAGNATION_HOLD_NS: i64 = 240_000_000_000;
 
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -435,11 +433,11 @@ impl ExecutionFsm {
         false
     }
 
-    /// Aborts a resting entry order BEFORE allowing a toxic sweep fill if:
-    /// 1. Immediate joint flow reversal (`X_OFI` and `X_TFI` flipped against our side), OR
-    /// 2. After `250 ms` grace (`THESIS_DECAY_GRACE_NS`), either `X_OFI` or `X_TFI` decayed below `+0.05` (Long) / above `-0.05` (Short), OR
-    /// 3. Monotonic elapsed time exceeds `MAX_RESTING_QUEUE_TTL_NS` (15s), OR
-    /// 4. After `MIN_QUEUE_RESIDENCE_NS` (1.5s anti-burst floor), the BBO ran away by `>= 3.50 bps` (min 3 ticks).
+    /// Evaluates queue cancellation ONLY after `MIN_QUEUE_RESIDENCE_NS` (1.50s) has elapsed
+    /// (preventing sub-second cancel bursts and preserving FIFO queue priority):
+    /// 1. After 1.50s, both L2 book pressure (`X_OFI`) and trade tape (`X_TFI`) reversed against our side, OR
+    /// 2. After 1.50s, the BBO ran away in front of `entry_price` by `>= 3.50 bps` (min 3 ticks), OR
+    /// 3. Monotonic elapsed time exceeds `MAX_RESTING_QUEUE_TTL_NS` (25s).
     #[inline]
     pub fn check_resting_queue_abort(&mut self, snap: &SymbolLobSnapshot) -> bool {
         if let OrderLifecycleState::RestingEntryQueue {
@@ -449,6 +447,13 @@ impl ExecutionFsm {
             ..
         } = self.state
         {
+            let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
+            if elapsed_ns < MIN_QUEUE_RESIDENCE_NS {
+                return false;
+            }
+
+            let ttl_expired = elapsed_ns >= MAX_RESTING_QUEUE_TTL_NS;
+
             let ofi = snap.factor_ofi.get();
             let tfi = snap.factor_tfi.get();
             let joint_flow_reversal = match side {
@@ -456,35 +461,18 @@ impl ExecutionFsm {
                 Side::Ask => ofi >= 0.20 && tfi >= 0.25,
             };
 
-            let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
-            let thesis_decayed = if elapsed_ns >= THESIS_DECAY_GRACE_NS {
-                match side {
-                    Side::Bid => ofi < 0.05 || tfi < 0.05,
-                    Side::Ask => ofi > -0.05 || tfi > -0.05,
-                }
-            } else {
-                false
-            };
-
-            let ttl_expired = elapsed_ns >= MAX_RESTING_QUEUE_TTL_NS;
-
-            let residence_satisfied = elapsed_ns >= MIN_QUEUE_RESIDENCE_NS;
             let runaway_allowance_ticks =
                 ((entry_price.0 * BBO_RUNAWAY_SCALED_BPS) / 1_000_000).max(3);
 
-            let bbo_runaway = if residence_satisfied {
-                match snap.bbo_and_spread_ticks() {
-                    Some((best_bid, best_ask, _)) => match side {
-                        Side::Bid => best_bid.price.0 - entry_price.0 >= runaway_allowance_ticks,
-                        Side::Ask => entry_price.0 - best_ask.price.0 >= runaway_allowance_ticks,
-                    },
-                    None => false,
-                }
-            } else {
-                false
+            let bbo_runaway = match snap.bbo_and_spread_ticks() {
+                Some((best_bid, best_ask, _)) => match side {
+                    Side::Bid => best_bid.price.0 - entry_price.0 >= runaway_allowance_ticks,
+                    Side::Ask => entry_price.0 - best_ask.price.0 >= runaway_allowance_ticks,
+                },
+                None => false,
             };
 
-            if joint_flow_reversal || thesis_decayed || ttl_expired || bbo_runaway {
+            if joint_flow_reversal || ttl_expired || bbo_runaway {
                 self.state = OrderLifecycleState::Idle;
                 return true;
             }
@@ -557,6 +545,7 @@ impl ExecutionFsm {
             snap.mark_price
         };
 
+        // 1. Catastrophic server-side MarkPrice Stop-Loss (-28.00 bps)
         let sl_hit = match side {
             Side::Bid => snap.mark_price.0 <= sl_trigger_price.0,
             Side::Ask => snap.mark_price.0 >= sl_trigger_price.0,
@@ -583,6 +572,7 @@ impl ExecutionFsm {
             ));
         }
 
+        // 2. Passive Limit PostOnly structural Take-Profit fill
         let tp_hit = match side {
             Side::Bid => ref_trade_price.0 >= tp_maker_price.0,
             Side::Ask => ref_trade_price.0 <= tp_maker_price.0,
@@ -598,6 +588,7 @@ impl ExecutionFsm {
             ));
         }
 
+        // 3. Convex MFE Zero-Loss Ratchet & Positive Maker Unwind (zero premature micro-scratches)
         if let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() {
             let bbo_exit_price = match side {
                 Side::Bid => best_bid.price,
@@ -650,20 +641,13 @@ impl ExecutionFsm {
                 && current_gross_bps.raw() >= 520
                 && current_gross_bps.raw() <= (peak_gross_bps.raw() * 70) / 100;
 
-            // Condition C: Stagnant profitable position >= 180s (>= +5.00 bps gross = +1.00 bps net)
+            // Condition C: Time-decayed harvest (>= 60s at >= +4.80 bps gross, or >= 240s slot release)
             let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
-            let stagnant_unwind =
-                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 500;
+            let early_profit_harvest =
+                hold_elapsed >= EARLY_PROFIT_HARVEST_HOLD_NS && current_gross_bps.raw() >= 480;
+            let max_stagnant_release = hold_elapsed >= MAX_SLOT_STAGNATION_HOLD_NS;
 
-            // Condition D: Controlled Adverse Maker Unwind (if position drops <= -5.50 bps gross and OFI is adverse)
-            let strong_adverse_ofi = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.10,
-                Side::Ask => snap.factor_ofi.get() > 0.10,
-            };
-            let adverse_maker_unwind =
-                current_gross_bps.raw() <= ADVERSE_MAKER_UNWIND_SCALED_BPS && strong_adverse_ofi;
-
-            if flow_unwind || mfe_ratchet_unwind || stagnant_unwind || adverse_maker_unwind {
+            if flow_unwind || mfe_ratchet_unwind || early_profit_harvest || max_stagnant_release {
                 return Some(self.finalize_close(
                     ClosedTradeKind::MakerPassiveUnwind,
                     side,
