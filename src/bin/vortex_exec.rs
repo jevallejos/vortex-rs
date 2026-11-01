@@ -1,11 +1,13 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, Seqlock Hot-State Reader,
-//! Non-Volatile SHM v3 Position Rehydration, Live HUD (`--live`), and 520-Trade OOS Verifier.
+//! Non-Volatile SHM v3 Position Rehydration, Asynchronous 1:1 Telegram Notifier,
+//! Live HUD (`--live`), and 520-Trade OOS Verifier.
 
 use core::sync::atomic::Ordering;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -61,6 +63,73 @@ fn now_epoch_ns() -> i64 {
         Ok(d) => d.as_nanos() as i64,
         Err(_) => 1_762_012_800_000_000_000,
     }
+}
+
+/// Reads `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` from `.env` or environment variables
+/// and spawns a non-blocking background worker thread so the 25.0 Hz loop experiences 0 ns I/O latency.
+fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
+    let mut token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+    let mut chat_id = std::env::var("TELEGRAM_CHAT_ID").ok();
+
+    if token.is_none() || chat_id.is_none() {
+        let env_paths = [".env", "/home/ubuntu/vortex-rs/.env", "/home/ubuntu/Denk-sekka/.env"];
+        for p in env_paths {
+            if let Ok(file) = File::open(p) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().map_while(Result::ok) {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, v)) = trimmed.split_once('=') {
+                        let key = k.trim();
+                        let val = v.trim().trim_matches('"').trim_matches('\'').to_owned();
+                        if key == "TELEGRAM_BOT_TOKEN" && !val.is_empty() {
+                            token = Some(val);
+                        } else if key == "TELEGRAM_CHAT_ID" && !val.is_empty() {
+                            chat_id = Some(val);
+                        }
+                    }
+                }
+            }
+            if token.is_some() && chat_id.is_some() {
+                break;
+            }
+        }
+    }
+
+    let (bot_token, target_chat) = match (token, chat_id) {
+        (Some(t), Some(c)) => (t, c),
+        _ => {
+            println!("[TELEGRAM] No TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID found in .env (running silent).");
+            return None;
+        }
+    };
+
+    let (tx, rx) = sync_channel::<String>(64);
+    println!("[TELEGRAM] Asynchronous 1:1 transactional notifier thread active.");
+
+    thread::spawn(move || {
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+        while let Ok(msg) = rx.recv() {
+            let chat_arg = format!("chat_id={}", target_chat);
+            let text_arg = format!("text={}", msg);
+            let _ = Command::new("curl")
+                .args([
+                    "-sS",
+                    "-X",
+                    "POST",
+                    &url,
+                    "-d",
+                    &chat_arg,
+                    "--data-urlencode",
+                    &text_arg,
+                ])
+                .output();
+        }
+    });
+
+    Some(tx)
 }
 
 fn append_shadow_trade_jsonl(
@@ -311,6 +380,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
         Err(_) => return ExitCode::from(9),
     };
     let arena = region.arena();
+    let tg_tx = spawn_async_telegram_notifier();
     let evaluator = OrthogonalFactorState::new();
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
     let mut ledger = ParitySyncLedger::new(10_000_000_000);
@@ -318,7 +388,6 @@ fn run_shadow_execution_daemon() -> ExitCode {
     let mut resting_queue_ahead: LotQty = LotQty(0);
     let mut prev_l1_qty: LotQty = LotQty(0);
 
-    // Hot-Restore any in-progress resting order or open position from /dev/shm/vortex_lob.mmap
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
     if saved_state_code == 2 || saved_state_code == 3 {
         let slot_saved = (arena.exec_active_slot.load(Ordering::Acquire) as usize).min(APPROVED_SPECS.len() - 1);
@@ -374,7 +443,8 @@ fn run_shadow_execution_daemon() -> ExitCode {
     }
 
     println!(
-        "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena ({}) with Non-Volatile SHM v3 FSM.",
+        "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with Exact L1 Queue FSM.",
+        arena.version,
         shm_path.display()
     );
 
@@ -460,19 +530,10 @@ fn run_shadow_execution_daemon() -> ExitCode {
             } => {
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(snap) = slot.read_snapshot(4) {
-                        // 1. Evaluate FIFO queue depletion and trade-through fill FIRST
-                        let traded_through = match side {
-                            Side::Bid => {
-                                snap.asks[0].price.0 <= entry_price.0
-                                    || (snap.last_trade_price.0 > 0
-                                        && snap.last_trade_price.0 <= entry_price.0
-                                        && snap.bids[0].price.0 < entry_price.0)
-                            }
-                            Side::Ask => {
-                                snap.bids[0].price.0 >= entry_price.0
-                                    || (snap.last_trade_price.0 >= entry_price.0
-                                        && snap.asks[0].price.0 > entry_price.0)
-                            }
+                        // Exact physical BBO cross or full queue depletion (no lagging last_trade_price)
+                        let bbo_crossed = match side {
+                            Side::Bid => snap.asks[0].price.0 > 0 && snap.asks[0].price.0 <= entry_price.0,
+                            Side::Ask => snap.bids[0].price.0 > 0 && snap.bids[0].price.0 >= entry_price.0,
                         };
 
                         let cur_l1_qty = match side {
@@ -491,8 +552,10 @@ fn run_shadow_execution_daemon() -> ExitCode {
                         }
                         prev_l1_qty = LotQty(cur_l1_qty);
 
-                        if traded_through || resting_queue_ahead.0 == 0 {
+                        if bbo_crossed || resting_queue_ahead.0 == 0 {
                             let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
+                            let mut tp_t: i64 = 0;
+                            let mut sl_t: i64 = 0;
                             if let OrderLifecycleState::PositionOpenMakerExit {
                                 tp_maker_price,
                                 sl_trigger_price,
@@ -500,14 +563,10 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                 ..
                             } = fsm.state
                             {
-                                arena.exec_tp_ticks.store(
-                                    tp_maker_price.0 as u64,
-                                    Ordering::Release,
-                                );
-                                arena.exec_sl_ticks.store(
-                                    sl_trigger_price.0 as u64,
-                                    Ordering::Release,
-                                );
+                                tp_t = tp_maker_price.0;
+                                sl_t = sl_trigger_price.0;
+                                arena.exec_tp_ticks.store(tp_t as u64, Ordering::Release);
+                                arena.exec_sl_ticks.store(sl_t as u64, Ordering::Release);
                                 arena.exec_resting_since_ns.store(
                                     opened_ts.0 as u64,
                                     Ordering::Release,
@@ -516,17 +575,41 @@ fn run_shadow_execution_daemon() -> ExitCode {
                             arena.exec_fill_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(3, Ordering::Release);
                             arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+
+                            let spec = APPROVED_SPECS[active_slot];
+                            let (e_w, e_f) = spec.format_price_usdt_parts(entry_price);
+                            let (tp_w, tp_f) = spec.format_price_usdt_parts(PriceTicks(tp_t));
+                            let (sl_w, sl_f) = spec.format_price_usdt_parts(PriceTicks(sl_t));
+
                             println!(
-                                "[SHADOW MAKER FILL] {} {:?} filled passively at {} ticks (Seq: {})",
+                                "[SHADOW MAKER FILL] {} {:?} filled passively at {}.{:04} USDT ({}t | TP: {}.{:04} | SL: {}.{:04})",
                                 snap.symbol_id.name(),
                                 side,
+                                e_w,
+                                e_f,
                                 entry_price.0,
-                                snap.sequence_id
+                                tp_w,
+                                tp_f,
+                                sl_w,
+                                sl_f
                             );
+                            if let Some(ref tx) = tg_tx {
+                                let alert = format!(
+                                    "[VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?})\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT\nServer SL: {}.{:04} USDT",
+                                    snap.symbol_id.name(),
+                                    side,
+                                    e_w,
+                                    e_f,
+                                    tp_w,
+                                    tp_f,
+                                    sl_w,
+                                    sl_f
+                                );
+                                let _ = tx.try_send(alert);
+                            }
                             continue;
                         }
 
-                        // 2. Only if NOT filled on this event, check joint OFI+TFI reversal / BBO runaway / TTL abort
                         if fsm.check_resting_queue_abort(&snap) {
                             arena.exec_abort_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(0, Ordering::Release);
@@ -559,13 +642,41 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                 &ledger,
                                 &fsm,
                             );
+
+                            let spec = APPROVED_SPECS[active_slot];
+                            let (en_w, en_f) = spec.format_price_usdt_parts(summary.entry_price);
+                            let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
+                            let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
+
                             println!(
-                                "[SHADOW CLOSE] {} {:?} | Net: {:+.2} bps | Total Trades: {}",
+                                "[SHADOW CLOSE] {} {:?} | {}.{:04} -> {}.{:04} | Net: {:+.2} bps | Total Trades: {}",
                                 snap.symbol_id.name(),
                                 summary.kind,
-                                (summary.net_scaled_bps.raw() as f64) / 100.0,
+                                en_w,
+                                en_f,
+                                ex_w,
+                                ex_f,
+                                net_bps,
                                 ledger.closed_trades_count
                             );
+
+                            if let Some(ref tx) = tg_tx {
+                                let alert = format!(
+                                    "[VORTEX-L2 TRADE CLOSED]\nSymbol: {} ({:?})\nExit Type: {:?}\nPrice: {}.{:04} -> {}.{:04} USDT\nNet PnL: {:+.2} bps (Maker Exit: {})\nTotal Trades: {} | PF: {:.2}",
+                                    snap.symbol_id.name(),
+                                    summary.side,
+                                    summary.kind,
+                                    en_w,
+                                    en_f,
+                                    ex_w,
+                                    ex_f,
+                                    net_bps,
+                                    summary.is_maker_exit,
+                                    ledger.closed_trades_count,
+                                    (fsm.net_profit_factor_x100() as f64) / 100.0
+                                );
+                                let _ = tx.try_send(alert);
+                            }
                         }
                     }
                 }
