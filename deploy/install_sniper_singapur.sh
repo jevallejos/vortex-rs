@@ -119,6 +119,17 @@ sudo tee /usr/local/bin/vortex >/dev/null <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 case "\${1:-live}" in
+    360)
+        echo "=== [1. VORTEX LIVE HUD (SHM v9)] ==="
+        \${BIN_DIR}/vortex_exec --live
+        echo "=== [2. BYBIT V5 LIVE ORDERS & QUEUE TELEMETRY] ==="
+        journalctl -u vortex-exec.service -n 35 --no-pager | grep -E "BYBIT V5|QUEUE|FILL|CLOSE|VETO|REHYDRATE" || true
+        echo "=== [3. CLOSED TRADES LEDGER (COLORIZED + RAW JSONL)] ==="
+        cd "\${VORTEX_DIR}" && \${BIN_DIR}/vortex_exec --trades
+        cat "\${VORTEX_DIR}/data/vortex_shadow_trades.jsonl" || true
+        echo "=== [4. WALK-FORWARD PAR1 REPLAY (1,048,576 REAL EVENTS)] ==="
+        cd "\${VORTEX_DIR}" && \${BIN_DIR}/vortex_replay
+        ;;
     live|-l)
         ${BIN_DIR}/vortex_exec --live
         ;;
