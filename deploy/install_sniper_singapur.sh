@@ -102,7 +102,7 @@ Requires=vortex-tap.service
 Type=simple
 User=${USER}
 WorkingDirectory=${VORTEX_DIR}
-ExecStart=${BIN_DIR}/vortex_exec --daemon
+ExecStart=${BIN_DIR}/vortex_exec --daemon --live-capital
 Restart=always
 RestartSec=1
 Nice=-10
@@ -133,6 +133,13 @@ case "\${1:-live}" in
         ls -lh /dev/shm/vortex_lob.mmap
         ls -lh ${DATA_DIR} | tail -n 10
         ;;
+    follow|-f)
+        ${BIN_DIR}/vortex_exec --live
+        echo "=== [COLORIZED CLOSED TRADES LEDGER (vortex_shadow_trades.jsonl)] ==="
+        cd "${VORTEX_DIR}" && ${BIN_DIR}/vortex_exec --trades
+        echo "=== [VORTEX-L2 LIVE STREAMING FEED (Ctrl+C to exit)] ==="
+        journalctl -u vortex-exec.service -u vortex-tap.service -f -n 30 --output=cat
+        ;;
     logs)
         journalctl -u vortex-tap.service -u vortex-exec.service -n 40 --no-pager
         ;;
@@ -151,7 +158,7 @@ case "\${1:-live}" in
         ${BIN_DIR}/vortex_exec
         ;;
     *)
-        echo "Usage: vortex {live|trades|status|logs|audit|replay|oos|all}"
+        echo "Usage: vortex {live|-f|follow|trades|status|logs|audit|replay|oos|all}"
         exit 1
         ;;
 esac
