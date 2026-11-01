@@ -1,7 +1,6 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, 200.0 Hz Seqlock Reader,
-//! Non-Volatile SHM v9 + JSONL Ledger Rehydration, Convex MFE Maker Ratchet,
-//! Verified 10x Optimal Lot Bybit UTA V5 Live Execution Client (`--live-capital`),
-//! 100% PostOnly Maker-Only Exit Pegging, and 520-Trade OOS Verifier.
+//! Stage 26 Zero-Orphan Exchange Fill Verifier on Queue Aborts, Startup Multi-Symbol Reconciler,
+//! 15s Anti-Chasing Per-Slot Cooldown, Signed Percentage Telemetry (`+/- %`), and 520-Trade OOS Verifier.
 
 use core::sync::atomic::Ordering;
 use std::fs::{File, OpenOptions};
@@ -23,6 +22,8 @@ use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Si
 pub const TOTAL_OOS_TRADES_GATE: usize = 520;
 /// Optimal Live Canary Notional Reference (12.50 USDT in 1e8 fixed-point scale).
 pub const OPTIMAL_LIVE_NOTIONAL_1E8: i64 = 1_250_000_000;
+/// Per-slot anti-chasing cooldown after an unfilled queue abort (15 seconds).
+pub const SLOT_ABORT_COOLDOWN_NS: i64 = 15_000_000_000;
 
 const ANSI_GREEN: &str = "\x1b[1;32m";
 const ANSI_ORANGE: &str = "\x1b[38;5;208m";
@@ -88,17 +89,15 @@ fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static str
     }
 }
 
-/// Optimal lot sizing for a 50.96 USDT wallet at 10x leverage:
-/// Maximizes multi-step lot granularity while using only ~$1.17-$2.26 USDT margin on altcoins.
 #[inline]
 const fn compute_optimal_50usdt_wallet_qty_str(symbol_id: SymbolId) -> &'static str {
     match symbol_id.0 {
-        1 => "0.001", // BTCUSDT: 1 min lot (~$7.79 USDT margin @ 10x)
-        2 => "0.01",  // ETHUSDT: 1 min lot (~$2.26 USDT margin @ 10x)
-        3 => "0.2",   // SOLUSDT: 2 lot steps (~$18.86 notional / ~$1.89 USDT margin @ 10x)
-        4 => "1.4",   // AVAXUSDT: 14 lot steps (~$12.16 notional / ~$1.22 USDT margin @ 10x)
-        5 => "0.05",  // TAOUSDT: 5 lot steps (~$11.67 notional / ~$1.17 USDT margin @ 10x)
-        6 => "14",    // SUIUSDT: 14 lot steps (~$12.53 notional / ~$1.25 USDT margin @ 10x)
+        1 => "0.001",
+        2 => "0.01",
+        3 => "0.2",
+        4 => "1.4",
+        5 => "0.05",
+        6 => "14",
         _ => "1",
     }
 }
@@ -168,7 +167,6 @@ impl BybitV5LiveClient {
             api_secret: secret,
         };
 
-        // Configure 10x leverage across all 6 approved pairs (~$1.20-$2.26 margin per trade)
         for spec in APPROVED_SPECS {
             let sym = spec.symbol_id.name();
             let lev_body = format!(
@@ -179,7 +177,7 @@ impl BybitV5LiveClient {
         }
 
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] 10x Optimal Lot Quantizer (~12.5 USDT notional / ~$1.25 margin) + 100% PostOnly Exit active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 26 Zero-Orphan Verifier + 10x Optimal Lot + Signed % Telemetry active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -256,7 +254,8 @@ impl BybitV5LiveClient {
         let _ = self.post_v5("/v5/order/cancel-all", &body);
     }
 
-    fn get_open_position_size(&self, symbol: &str) -> (bool, String) {
+    /// Queries `/v5/position/list` and returns `(has_open_position, size_str, side_str)`.
+    fn get_open_position_info(&self, symbol: &str) -> (bool, String, String) {
         let query = format!("category=linear&symbol={}", symbol);
         if let Some(resp) = self.get_v5("/v5/position/list", &query) {
             if let Some(list) = resp
@@ -269,14 +268,47 @@ impl BybitV5LiveClient {
                         .get("size")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("0");
+                    let side_str = first
+                        .get("side")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("None");
                     let size_f = size_str.parse::<f64>().unwrap_or(0.0);
                     if size_f > 0.0 {
-                        return (true, size_str.to_owned());
+                        return (true, size_str.to_owned(), side_str.to_owned());
                     }
                 }
             }
         }
-        (false, String::from("0"))
+        (false, String::from("0"), String::from("None"))
+    }
+
+    fn get_open_position_size(&self, symbol: &str) -> (bool, String) {
+        let (open, sz, _) = self.get_open_position_info(symbol);
+        (open, sz)
+    }
+
+    /// Audits all 6 approved pairs on startup to ensure zero untracked orphan positions exist outside the active SHM slot.
+    fn audit_and_clean_untracked_orphans(&self, tracked_symbol: Option<&str>) {
+        for spec in APPROVED_SPECS {
+            let sym = spec.symbol_id.name();
+            if Some(sym) == tracked_symbol {
+                continue;
+            }
+            self.cancel_all_symbol_orders(sym);
+            let (has_orphan, orphan_qty, orphan_side) = self.get_open_position_info(sym);
+            if has_orphan {
+                let close_side = if orphan_side == "Buy" { "Sell" } else { "Buy" };
+                println!(
+                    "{}🟠 [BYBIT V5 ORPHAN CLEANUP] Found untracked orphan position on {} (side={} size={}) — closing with reduceOnly{}",
+                    ANSI_ORANGE, sym, orphan_side, orphan_qty, ANSI_RESET
+                );
+                let close_body = format!(
+                    "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Market\",\"qty\":\"{}\",\"reduceOnly\":true,\"positionIdx\":0}}",
+                    sym, close_side, orphan_qty
+                );
+                let _ = self.post_v5("/v5/order/create", &close_body);
+            }
+        }
     }
 
     fn place_post_only_entry(
@@ -287,6 +319,16 @@ impl BybitV5LiveClient {
         entry_price: PriceTicks,
         sl_price: PriceTicks,
     ) -> bool {
+        // Pre-flight guard: never send a new entry order if an open position already exists on Bybit
+        let (already_open, existing_qty) = self.get_open_position_size(symbol);
+        if already_open {
+            println!(
+                "{}🟠 [BYBIT V5 DUPLICATE GUARD] {} already has open size={} on exchange — skipping duplicate entry{}",
+                ANSI_ORANGE, symbol, existing_qty, ANSI_RESET
+            );
+            return false;
+        }
+
         let (ew, ef) = spec.format_price_usdt_parts(entry_price);
         let (sw, sf) = spec.format_price_usdt_parts(sl_price);
         let bybit_side = match side {
@@ -324,8 +366,6 @@ impl BybitV5LiveClient {
         }
     }
 
-    /// 100% PostOnly Maker-Only Exit Peg Loop (Zero Taker Market order fee bleed on normal exits).
-    /// Re-reads the live SHM slot on each cycle to peg `Limit PostOnly reduceOnly` at the latest BBO.
     fn execute_maker_only_verified_close(
         &self,
         arena: &VortexShmArena,
@@ -451,9 +491,9 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
     );
 
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 STAGE 25 — LIVE CAPITAL 10x OPTIMAL LOT ACTIVE]\nBybit UTA V5 Verified Real Execution (~12.5 USDT notional / ~$1.25 margin) armed in sniper-singapur."
+        "🟢 [VORTEX-L2 STAGE 26 — ZERO-ORPHAN LIVE CAPITAL ARMED]\nBybit UTA V5 Fill-on-Abort Guard + Signed % Telemetry (+X.XXX% | +X.XX% @ 10x) active."
     } else {
-        "🟢 [VORTEX-L2 STAGE 25 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟢 [VORTEX-L2 STAGE 26 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
 
@@ -588,8 +628,10 @@ fn print_colorized_shadow_trades() -> ExitCode {
                 losses += 1;
             }
 
+            let net_pct_1x = net_bps / 100.0;
+            let net_pct_10x = net_bps / 10.0;
             println!(
-                "  {}{} [TRADE #{} {:<7}] {:<9} {:<4} {:<20} | {}t -> {}t | Net: {:+.2} bps (Maker={}){}",
+                "  {}{} [TRADE #{} {:<7}] {:<9} {:<4} {:<20} | {}t -> {}t | Net: {:+.2} bps ({:+.3}% | {:+.2}% @10x) (Maker={}){}",
                 color,
                 icon,
                 idx + 1,
@@ -600,6 +642,8 @@ fn print_colorized_shadow_trades() -> ExitCode {
                 en_t,
                 ex_t,
                 net_bps,
+                net_pct_1x,
+                net_pct_10x,
                 is_maker,
                 ANSI_RESET
             );
@@ -607,9 +651,11 @@ fn print_colorized_shadow_trades() -> ExitCode {
     }
 
     let (sum_color, sum_icon, _) = classify_pnl_badge(total_net_bps);
+    let total_pct_1x = total_net_bps / 100.0;
+    let total_pct_10x = total_net_bps / 10.0;
     println!("------------------------------------------------------------------------------------------");
     println!(
-        "  {}{} [LEDGER SUMMARY] Total: {} (�� Wins: {} | 🟠 Scratches: {} | 🔴 Losses: {}) | CumNet: {:+.2} bps{}",
+        "  {}{} [LEDGER SUMMARY] Total: {} (🟢 Wins: {} | 🟠 Scratches: {} | 🔴 Losses: {}) | CumNet: {:+.2} bps ({:+.3}% | {:+.2}% @10x){}",
         sum_color,
         sum_icon,
         wins + scratches + losses,
@@ -617,6 +663,8 @@ fn print_colorized_shadow_trades() -> ExitCode {
         scratches,
         losses,
         total_net_bps,
+        total_pct_1x,
+        total_pct_10x,
         ANSI_RESET
     );
     ExitCode::SUCCESS
@@ -854,7 +902,7 @@ fn print_live_shm_hud() -> ExitCode {
 
     println!("------------------------------------------------------------------------------------------");
     println!(
-        "[EXEC FSM LIVE] State: {}{} {}{} | Sym: {} ({}) @ {}t [Peak:{}t | TP:{}t | SL:{}t] (Q: {} lots) | 🟡Armed: {} | 🟠Aborts: {} | 🟡Fills: {} | 🟢Closed: {}",
+        "[EXEC FSM LIVE] State: {}{} {}{} | Sym: {} ({}) @ {}t [Peak:{}t | TP:{}t | SL:{}t] (Q: {} lots) | ��Armed: {} | 🟠Aborts: {} | 🟡Fills: {} | 🟢Closed: {}",
         st_col,
         st_icon,
         state_label,
@@ -892,10 +940,13 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut prev_l1_qty: LotQty = LotQty(0);
     let mut prev_cum_trade_lots: LotQty = LotQty(0);
     let mut last_seen_seq = [0_u64; 6];
+    let mut slot_cooldown_until_ns = [0_i64; 6];
 
     rehydrate_shadow_ledger(&mut ledger, &mut fsm, arena);
 
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
+    let mut tracked_sym_on_startup: Option<&'static str> = None;
+
     if saved_state_code == 2 || saved_state_code == 3 {
         let slot_saved = (arena.exec_active_slot.load(Ordering::Acquire) as usize).min(APPROVED_SPECS.len() - 1);
         let sym_name = APPROVED_SPECS[slot_saved].symbol_id.name();
@@ -903,10 +954,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         let mut valid_to_restore = true;
         if let Some(ref client) = live_client {
             if saved_state_code == 3 {
-                let (has_pos, _) = client.get_open_position_size(sym_name);
+                let (has_pos, real_sz) = client.get_open_position_size(sym_name);
                 if !has_pos {
                     println!(
-                        "{}🟠 [BYBIT V5 LIVE SYNC] Clearing simulated SHM position on {} (0.00 real size on Bybit) to start 100% real{}",
+                        "{}🟠 [BYBIT V5 LIVE SYNC] Clearing simulated SHM position on {} (0.00 real size on Bybit){}",
                         ANSI_ORANGE, sym_name, ANSI_RESET
                     );
                     arena.exec_state_code.store(0, Ordering::Release);
@@ -915,12 +966,23 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                     arena.exec_sl_ticks.store(0, Ordering::Release);
                     arena.exec_queue_ahead_lots.store(0, Ordering::Release);
                     valid_to_restore = false;
+                } else {
+                    tracked_sym_on_startup = Some(sym_name);
+                    println!(
+                        "{}🟢 [BYBIT V5 LIVE SYNC] Verified active exchange position on {} (open size={}){}",
+                        ANSI_GREEN, sym_name, real_sz, ANSI_RESET
+                    );
                 }
             } else {
                 client.cancel_all_symbol_orders(sym_name);
-                arena.exec_state_code.store(0, Ordering::Release);
-                arena.exec_queue_ahead_lots.store(0, Ordering::Release);
-                valid_to_restore = false;
+                let (filled_while_resting, _) = client.get_open_position_size(sym_name);
+                if filled_while_resting {
+                    tracked_sym_on_startup = Some(sym_name);
+                } else {
+                    arena.exec_state_code.store(0, Ordering::Release);
+                    arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                    valid_to_restore = false;
+                }
             }
         }
 
@@ -941,39 +1003,29 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
             resting_queue_ahead = q_saved;
             prev_l1_qty = q_saved;
 
-            if saved_state_code == 2 {
-                fsm.state = OrderLifecycleState::RestingEntryQueue {
-                    side: side_saved,
-                    entry_price: entry_saved,
-                    qty: LotQty(10),
-                    target_excursion: ScaledBps::from_whole_bps(40),
-                    sl_trigger_price: sl_saved,
-                    resting_since_ts: since_saved,
-                };
-                println!(
-                    "{}🟡 [SHM HOT-RESTORE] Rehydrated RestingEntryQueue on {} {:?} @ {}t (Queue: {} lots){}",
-                    ANSI_YELLOW, sym_name, side_saved, entry_saved.0, q_saved.0, ANSI_RESET
-                );
-            } else {
-                fsm.state = OrderLifecycleState::PositionOpenMakerExit {
-                    side: side_saved,
-                    entry_price: entry_saved,
-                    peak_favorable_price: if peak_saved.0 > 0 { peak_saved } else { entry_saved },
-                    qty: LotQty(10),
-                    tp_maker_price: tp_saved,
-                    sl_trigger_price: sl_saved,
-                    opened_ts: since_saved,
-                };
-                println!(
-                    "{}🟡 [SHM HOT-RESTORE] Rehydrated PositionOpenMakerExit on {} {:?} @ {}t [Peak:{}t | TP:{}t | SL:{}t]{}",
-                    ANSI_YELLOW, sym_name, side_saved, entry_saved.0, peak_saved.0, tp_saved.0, sl_saved.0, ANSI_RESET
-                );
-            }
+            fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+                side: side_saved,
+                entry_price: entry_saved,
+                peak_favorable_price: if peak_saved.0 > 0 { peak_saved } else { entry_saved },
+                qty: LotQty(10),
+                tp_maker_price: tp_saved,
+                sl_trigger_price: sl_saved,
+                opened_ts: since_saved,
+            };
+            arena.exec_state_code.store(3, Ordering::Release);
+            println!(
+                "{}🟡 [SHM HOT-RESTORE] Rehydrated PositionOpenMakerExit on {} {:?} @ {}t [Peak:{}t | TP:{}t | SL:{}t]{}",
+                ANSI_YELLOW, sym_name, side_saved, entry_saved.0, peak_saved.0, tp_saved.0, sl_saved.0, ANSI_RESET
+            );
         }
     }
 
+    if let Some(ref client) = live_client {
+        client.audit_and_clean_untracked_orphans(tracked_sym_on_startup);
+    }
+
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (10x Optimal Lot){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 26 Zero-Orphan Guard){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),
@@ -998,6 +1050,11 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 continue;
                             }
                             last_seen_seq[s] = snap.sequence_id;
+
+                            if snap.ts_local_ns.0 < slot_cooldown_until_ns[s] {
+                                s += 1;
+                                continue;
+                            }
 
                             if let Ok(verdict) = evaluator.evaluate_entry_signal(&spec, &snap) {
                                 if let Ok(true) =
@@ -1028,28 +1085,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             continue;
                         }
                         last_seen_seq[active_slot] = snap.sequence_id;
-
-                        if fsm.check_resting_queue_abort(&snap) {
-                            arena.exec_abort_count.fetch_add(1, Ordering::Release);
-                            arena.exec_state_code.store(0, Ordering::Release);
-                            arena.exec_queue_ahead_lots.store(0, Ordering::Release);
-                            if let Some(ref client) = live_client {
-                                client.cancel_all_symbol_orders(snap.symbol_id.name());
-                            }
-                            println!(
-                                "{}🟠 [QUEUE ABORT] {} {:?} canceled before fill (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | BestAsk: {} | Entry: {}){}",
-                                ANSI_ORANGE,
-                                snap.symbol_id.name(),
-                                side,
-                                snap.factor_ofi.get(),
-                                snap.factor_tfi.get(),
-                                snap.bids[0].price.0,
-                                snap.asks[0].price.0,
-                                entry_price.0,
-                                ANSI_RESET
-                            );
-                            continue;
-                        }
 
                         let level_swept = match side {
                             Side::Bid => snap.asks[0].price.0 > 0 && snap.asks[0].price.0 < entry_price.0,
@@ -1096,54 +1131,103 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 Side::Bid => snap.factor_ofi.get() <= -0.10,
                                 Side::Ask => snap.factor_ofi.get() >= 0.10,
                             };
-                        if toxic_sweep {
-                            fsm.state = OrderLifecycleState::Idle;
-                            arena.exec_abort_count.fetch_add(1, Ordering::Release);
-                            arena.exec_state_code.store(0, Ordering::Release);
-                            arena.exec_queue_ahead_lots.store(0, Ordering::Release);
-                            if let Some(ref client) = live_client {
-                                client.cancel_all_symbol_orders(snap.symbol_id.name());
-                            }
-                            println!(
-                                "{}🟠 [TOXIC SWEEP VETO] {} {:?} aborted on adverse L1 sweep (OFI: {:+.2} | Queue left: {} lots){}",
-                                ANSI_ORANGE,
-                                snap.symbol_id.name(),
-                                side,
-                                snap.factor_ofi.get(),
-                                resting_queue_ahead.0,
-                                ANSI_RESET
-                            );
-                            continue;
-                        }
 
-                        if level_swept || resting_queue_ahead.0 == 0 {
+                        // Check if FSM wants to abort resting order
+                        let want_abort = toxic_sweep || fsm.check_resting_queue_abort(&snap);
+                        let mut filled_on_exchange_during_abort = false;
+
+                        if want_abort {
                             if let Some(ref client) = live_client {
                                 client.cancel_all_symbol_orders(snap.symbol_id.name());
                                 let (real_filled, real_qty) =
                                     client.get_open_position_size(snap.symbol_id.name());
-                                if !real_filled {
-                                    fsm.state = OrderLifecycleState::Idle;
-                                    arena.exec_abort_count.fetch_add(1, Ordering::Release);
-                                    arena.exec_state_code.store(0, Ordering::Release);
-                                    arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                                if real_filled {
+                                    // CRITICAL STAGE 26 GUARD: Order filled on Bybit right before cancel arrived!
+                                    // Promote to PositionOpenMakerExit instead of abandoning as an orphan!
+                                    filled_on_exchange_during_abort = true;
                                     println!(
-                                        "{}🟠 [BYBIT V5 REAL QUEUE UNFILLED] {} {:?} did not fill on exchange before queue end (reset to Idle){}",
-                                        ANSI_ORANGE,
+                                        "{}🟢 [BYBIT V5 FILL-ON-ABORT RECOVERED] {} {:?} filled on exchange before cancel arrived (open size={}) — managing position!{}",
+                                        ANSI_GREEN,
                                         snap.symbol_id.name(),
                                         side,
+                                        real_qty,
                                         ANSI_RESET
                                     );
-                                    continue;
                                 }
+                            }
+
+                            if !filled_on_exchange_during_abort {
+                                fsm.state = OrderLifecycleState::Idle;
+                                slot_cooldown_until_ns[active_slot] =
+                                    snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
+                                arena.exec_abort_count.fetch_add(1, Ordering::Release);
+                                arena.exec_state_code.store(0, Ordering::Release);
+                                arena.exec_queue_ahead_lots.store(0, Ordering::Release);
                                 println!(
-                                    "{}🟢 [BYBIT V5 REAL FILL CONFIRMED] {} {:?} real open size={}{}",
-                                    ANSI_GREEN,
+                                    "{}🟠 [QUEUE ABORT] {} {:?} canceled before fill (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | BestAsk: {} | Entry: {} | 15s Slot Cooldown){}",
+                                    ANSI_ORANGE,
                                     snap.symbol_id.name(),
                                     side,
-                                    real_qty,
+                                    snap.factor_ofi.get(),
+                                    snap.factor_tfi.get(),
+                                    snap.bids[0].price.0,
+                                    snap.asks[0].price.0,
+                                    entry_price.0,
                                     ANSI_RESET
                                 );
+                                continue;
                             }
+                        }
+
+                        if filled_on_exchange_during_abort || level_swept || resting_queue_ahead.0 == 0 {
+                            if !filled_on_exchange_during_abort {
+                                if let Some(ref client) = live_client {
+                                    client.cancel_all_symbol_orders(snap.symbol_id.name());
+                                    let (real_filled, real_qty) =
+                                        client.get_open_position_size(snap.symbol_id.name());
+                                    if !real_filled {
+                                        fsm.state = OrderLifecycleState::Idle;
+                                        slot_cooldown_until_ns[active_slot] =
+                                            snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
+                                        arena.exec_abort_count.fetch_add(1, Ordering::Release);
+                                        arena.exec_state_code.store(0, Ordering::Release);
+                                        arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                                        println!(
+                                            "{}🟠 [BYBIT V5 REAL QUEUE UNFILLED] {} {:?} did not fill on exchange before queue end (reset to Idle){}",
+                                            ANSI_ORANGE,
+                                            snap.symbol_id.name(),
+                                            side,
+                                            ANSI_RESET
+                                        );
+                                        continue;
+                                    }
+                                    println!(
+                                        "{}🟢 [BYBIT V5 REAL FILL CONFIRMED] {} {:?} real open size={}{}",
+                                        ANSI_GREEN,
+                                        snap.symbol_id.name(),
+                                        side,
+                                        real_qty,
+                                        ANSI_RESET
+                                    );
+                                }
+                            }
+
+                            // Reconstruct state before calling on_entry_filled_maker in case check_resting_queue_abort set it to Idle
+                            let spec = APPROVED_SPECS[active_slot];
+                            let sl_dist_ticks =
+                                ((entry_price.0 * 5_200) / 1_000_000).max(2);
+                            let sl_trig = match side {
+                                Side::Bid => PriceTicks(entry_price.0 - sl_dist_ticks),
+                                Side::Ask => PriceTicks(entry_price.0 + sl_dist_ticks),
+                            };
+                            fsm.state = OrderLifecycleState::RestingEntryQueue {
+                                side,
+                                entry_price,
+                                qty: LotQty(10),
+                                target_excursion: ScaledBps::from_whole_bps(40),
+                                sl_trigger_price: sl_trig,
+                                resting_since_ts: snap.ts_local_ns,
+                            };
 
                             let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
                             let mut tp_t: i64 = 0;
@@ -1169,7 +1253,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             arena.exec_state_code.store(3, Ordering::Release);
                             arena.exec_queue_ahead_lots.store(0, Ordering::Release);
 
-                            let spec = APPROVED_SPECS[active_slot];
                             let (e_w, e_f) = spec.format_price_usdt_parts(entry_price);
                             let (tp_w, tp_f) = spec.format_price_usdt_parts(PriceTicks(tp_t));
                             let (sl_w, sl_f) = spec.format_price_usdt_parts(PriceTicks(sl_t));
@@ -1248,9 +1331,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
                             let net_pct_1x = net_bps / 100.0;
                             let net_pct_10x = net_bps / 10.0;
-                            let trade_usdt = ((OPTIMAL_LIVE_NOTIONAL_1E8 as f64) / 100_000_000.0) * (net_bps / 10_000.0);
+                            let trade_usdt = ((OPTIMAL_LIVE_NOTIONAL_1E8 as f64) / 100_000_000.0)
+                                * (net_bps / 10_000.0);
                             let cum_usdt = (ledger.cumulative_net_pnl_1e8 as f64) / 100_000_000.0;
-                            let cum_bps = (cum_usdt / ((OPTIMAL_LIVE_NOTIONAL_1E8 as f64) / 100_000_000.0)) * 10_000.0;
+                            let cum_bps = (cum_usdt
+                                / ((OPTIMAL_LIVE_NOTIONAL_1E8 as f64) / 100_000_000.0))
+                                * 10_000.0;
                             let cum_pct_1x = cum_bps / 100.0;
                             let cum_pct_10x = cum_bps / 10.0;
                             let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id);
