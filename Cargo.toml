@@ -17,6 +17,10 @@ path = "src/bin/vortex_tap.rs"
 name = "vortex_replay"
 path = "src/bin/vortex_replay.rs"
 
+[[bin]]
+name = "vortex_exec"
+path = "src/bin/vortex_exec.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
