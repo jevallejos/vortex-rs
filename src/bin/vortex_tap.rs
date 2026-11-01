@@ -15,7 +15,6 @@ use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexSh
 use vortex_rs::types::{LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
 
 const BYBIT_PUBLIC_LINEAR_WS: &str = "wss://stream.bybit.com/v5/public/linear";
-/// Rolling retention cap (~1,048,576 events) to prevent disk exhaustion on sniper-singapur.
 const MAX_PARQUET_RING_FILES: u64 = 4_096;
 
 #[derive(Copy, Clone, Debug)]
@@ -35,7 +34,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(779_116),
+        reference_mid_ticks: PriceTicks(779_279),
         realized_vol_5m: ScaledBps::from_whole_bps(58),
     },
     CandidateContract {
@@ -46,7 +45,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(226_333),
+        reference_mid_ticks: PriceTicks(226_474),
         realized_vol_5m: ScaledBps::from_whole_bps(60),
     },
     CandidateContract {
@@ -57,7 +56,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(9_446),
+        reference_mid_ticks: PriceTicks(9_454),
         realized_vol_5m: ScaledBps::from_whole_bps(62),
     },
     CandidateContract {
@@ -68,7 +67,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(8_676),
+        reference_mid_ticks: PriceTicks(8_664),
         realized_vol_5m: ScaledBps::from_whole_bps(60),
     },
     CandidateContract {
@@ -79,7 +78,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(23_346),
+        reference_mid_ticks: PriceTicks(23_352),
         realized_vol_5m: ScaledBps::from_whole_bps(68),
     },
     CandidateContract {
@@ -90,7 +89,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(8_971),
+        reference_mid_ticks: PriceTicks(8_982),
         realized_vol_5m: ScaledBps::from_whole_bps(64),
     },
     CandidateContract {
@@ -211,6 +210,7 @@ fn process_bybit_ws_frame(
         let snap = &mut active_snaps[slot_idx];
         if msg_type == "snapshot" {
             snap.clear_book();
+            snap.last_trade_price = PriceTicks(0);
             factor_states[slot_idx].reset();
         }
 
@@ -389,6 +389,8 @@ fn run_live_bybit_ws_loop(
     while s < approved_slots {
         factor_states[s].reset();
         active_snaps[s].clear_book();
+        active_snaps[s].mark_price = PriceTicks(0);
+        active_snaps[s].last_trade_price = PriceTicks(0);
         active_snaps[s].factor_ofi = vortex_rs::types::BoundedScore::ZERO;
         active_snaps[s].factor_tfi = vortex_rs::types::BoundedScore::ZERO;
         active_snaps[s].factor_geom = vortex_rs::types::BoundedScore::ZERO;

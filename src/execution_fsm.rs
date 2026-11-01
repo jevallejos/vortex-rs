@@ -1,6 +1,6 @@
 //! Exhaustive Finite-State Machine (`OrderLifecycleState`) for Bybit UTA V5 execution:
-//! 100% `Limit PostOnly` normal exits, geometric `MarkPrice` Stop-Loss protection,
-//! 2-Tick BBO Runaway Guard, and Zero-Allocation FIPS 180-4 / RFC 2104 `HMAC-SHA256` Signer.
+//! 100% `Limit PostOnly` normal exits, Convex MFE Zero-Loss Maker Ratchet,
+//! Scale-Invariant 8.00 bps BBO Runaway Guard, and FIPS 180-4 / RFC 2104 `HMAC-SHA256` Signer.
 
 use crate::alpha_3factor::SignalVerdict;
 use crate::forensic_parquet::ParitySyncLedger;
@@ -9,10 +9,12 @@ use crate::types::{LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, V
 
 /// Cooldown applied ONLY after a real server-side Stop-Loss trigger (60 seconds in nanoseconds).
 pub const STOP_LOSS_COOLDOWN_NS: i64 = 60_000_000_000;
-/// Maximum time a passive `Limit PostOnly` entry order may sit unfilled in the L1 queue (20 seconds).
-pub const MAX_RESTING_QUEUE_TTL_NS: i64 = 20_000_000_000;
-/// Maximum distance in ticks the BBO can run away in front of our resting order before re-arming (2 ticks).
-pub const MAX_BBO_RUNAWAY_TICKS: i64 = 2;
+/// Maximum time a passive `Limit PostOnly` entry order may sit unfilled in the L1 queue (25 seconds).
+pub const MAX_RESTING_QUEUE_TTL_NS: i64 = 25_000_000_000;
+/// Scale-invariant BBO runaway threshold in ScaledBps (8.00 bps = 800 units, minimum 3 ticks).
+pub const BBO_RUNAWAY_SCALED_BPS: i64 = 800;
+/// Maximum hold time for a stagnant net-profitable position before passive Maker slot release (180 seconds).
+pub const STAGNANT_PROFIT_HOLD_NS: i64 = 180_000_000_000;
 
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -25,7 +27,6 @@ const SHA256_K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-/// Pure-Rust FIPS 180-4 SHA-256 streaming hasher (zero external C/OpenSSL dependencies).
 #[derive(Copy, Clone, Debug)]
 struct Sha256State {
     h: [u32; 8],
@@ -210,8 +211,7 @@ pub fn hmac_sha256_hex_segments(secret: &[u8], segments: &[&[u8]]) -> [u8; 64] {
     hex_out
 }
 
-/// Computes the canonical Bybit UTA V5 `X-BAPI-SIGN` header value:
-/// `HMAC_SHA256(secret, timestamp_ms + api_key + recv_window + payload)`.
+/// Computes the canonical Bybit UTA V5 `X-BAPI-SIGN` header value.
 #[inline]
 #[must_use]
 pub fn sign_bybit_v5_hmac_sha256(
@@ -276,6 +276,7 @@ pub enum OrderLifecycleState {
     PositionOpenMakerExit {
         side: Side,
         entry_price: PriceTicks,
+        peak_favorable_price: PriceTicks,
         qty: LotQty,
         tp_maker_price: PriceTicks,
         sl_trigger_price: PriceTicks,
@@ -424,6 +425,10 @@ impl ExecutionFsm {
         false
     }
 
+    /// Aborts a resting entry order if:
+    /// 1. Both L2 book pressure (`X_OFI`) and trade tape (`X_TFI`) reversed against our side, OR
+    /// 2. Monotonic elapsed time exceeds `MAX_RESTING_QUEUE_TTL_NS` (25s), OR
+    /// 3. The BBO ran away in front of `entry_price` by `>= 8.00 bps` (minimum 3 ticks).
     #[inline]
     pub fn check_resting_queue_abort(&mut self, snap: &SymbolLobSnapshot) -> bool {
         if let OrderLifecycleState::RestingEntryQueue {
@@ -443,10 +448,14 @@ impl ExecutionFsm {
             let ttl_expired = snap.ts_local_ns.0 > resting_since_ts.0
                 && (snap.ts_local_ns.0 - resting_since_ts.0) >= MAX_RESTING_QUEUE_TTL_NS;
 
+            // Scale-invariant runaway distance: 8.00 bps of entry_price (minimum 3 ticks)
+            let runaway_allowance_ticks =
+                ((entry_price.0 * BBO_RUNAWAY_SCALED_BPS) / 1_000_000).max(3);
+
             let bbo_runaway = match snap.bbo_and_spread_ticks() {
                 Some((best_bid, best_ask, _)) => match side {
-                    Side::Bid => best_bid.price.0 - entry_price.0 >= MAX_BBO_RUNAWAY_TICKS,
-                    Side::Ask => entry_price.0 - best_ask.price.0 >= MAX_BBO_RUNAWAY_TICKS,
+                    Side::Bid => best_bid.price.0 - entry_price.0 >= runaway_allowance_ticks,
+                    Side::Ask => entry_price.0 - best_ask.price.0 >= runaway_allowance_ticks,
                 },
                 None => false,
             };
@@ -479,6 +488,7 @@ impl ExecutionFsm {
             self.state = OrderLifecycleState::PositionOpenMakerExit {
                 side,
                 entry_price,
+                peak_favorable_price: entry_price,
                 qty,
                 tp_maker_price,
                 sl_trigger_price,
@@ -489,23 +499,41 @@ impl ExecutionFsm {
         false
     }
 
+    /// Evaluates open position with Convex MFE Zero-Loss Maker Ratchet:
+    /// - Updates `peak_favorable_price` on every tick.
+    /// - Triggers Server Stop-Loss if `mark_price` breaches `sl_trigger_price`.
+    /// - Triggers `MakerStructuralTp` if price reaches `tp_maker_price`.
+    /// - Triggers `MakerPassiveUnwind` at BBO if:
+    ///   (a) Position reached MFE `>= +8.50 bps` gross and retraced to `<= +6.00 bps` (while still `>= +5.20 bps` gross / `+1.20 bps` net), OR
+    ///   (b) Current gross excursion is `>= +6.00 bps` (`+2.00 bps` net) and `X_OFI` reversed against the position (`< -0.05` Long / `> +0.05` Short), OR
+    ///   (c) Position has been open `>= 180s` with gross excursion `>= +5.00 bps` (`+1.00 bps` net) to release the single slot.
     #[inline]
     pub fn step_open_position(
         &mut self,
         snap: &SymbolLobSnapshot,
         ledger: &mut ParitySyncLedger,
     ) -> Option<ClosedTradeSummary> {
-        let (side, entry_price, qty, tp_maker_price, sl_trigger_price) = match self.state {
-            OrderLifecycleState::PositionOpenMakerExit {
-                side,
-                entry_price,
-                qty,
-                tp_maker_price,
-                sl_trigger_price,
-                ..
-            } => (side, entry_price, qty, tp_maker_price, sl_trigger_price),
-            _ => return None,
-        };
+        let (side, entry_price, mut peak_favorable_price, qty, tp_maker_price, sl_trigger_price, opened_ts) =
+            match self.state {
+                OrderLifecycleState::PositionOpenMakerExit {
+                    side,
+                    entry_price,
+                    peak_favorable_price,
+                    qty,
+                    tp_maker_price,
+                    sl_trigger_price,
+                    opened_ts,
+                } => (
+                    side,
+                    entry_price,
+                    peak_favorable_price,
+                    qty,
+                    tp_maker_price,
+                    sl_trigger_price,
+                    opened_ts,
+                ),
+                _ => return None,
+            };
 
         let ref_trade_price = if snap.last_trade_price.0 > 0 {
             snap.last_trade_price
@@ -513,6 +541,7 @@ impl ExecutionFsm {
             snap.mark_price
         };
 
+        // 1. Check catastrophic server-side MarkPrice Stop-Loss first
         let sl_hit = match side {
             Side::Bid => snap.mark_price.0 <= sl_trigger_price.0,
             Side::Ask => snap.mark_price.0 >= sl_trigger_price.0,
@@ -539,6 +568,7 @@ impl ExecutionFsm {
             ));
         }
 
+        // 2. Check passive Limit PostOnly structural Take-Profit fill
         let tp_hit = match side {
             Side::Bid => ref_trade_price.0 >= tp_maker_price.0,
             Side::Ask => ref_trade_price.0 <= tp_maker_price.0,
@@ -554,18 +584,65 @@ impl ExecutionFsm {
             ));
         }
 
+        // 3. Update MFE Peak Favorable Price and evaluate Convex Maker Unwind at BBO
         if let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() {
             let bbo_exit_price = match side {
                 Side::Bid => best_bid.price,
                 Side::Ask => best_ask.price,
             };
+
+            match side {
+                Side::Bid => {
+                    if bbo_exit_price.0 > peak_favorable_price.0 {
+                        peak_favorable_price = bbo_exit_price;
+                    }
+                    if ref_trade_price.0 > peak_favorable_price.0 {
+                        peak_favorable_price = ref_trade_price;
+                    }
+                }
+                Side::Ask => {
+                    if peak_favorable_price.0 == 0 || bbo_exit_price.0 < peak_favorable_price.0 {
+                        peak_favorable_price = bbo_exit_price;
+                    }
+                    if ref_trade_price.0 > 0 && ref_trade_price.0 < peak_favorable_price.0 {
+                        peak_favorable_price = ref_trade_price;
+                    }
+                }
+            }
+
+            self.state = OrderLifecycleState::PositionOpenMakerExit {
+                side,
+                entry_price,
+                peak_favorable_price,
+                qty,
+                tp_maker_price,
+                sl_trigger_price,
+                opened_ts,
+            };
+
             let current_gross_bps =
                 Self::compute_gross_scaled_bps(side, entry_price, bbo_exit_price);
-            let flow_exhausted = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.10 && snap.factor_tfi.get() < -0.10,
-                Side::Ask => snap.factor_ofi.get() > 0.10 && snap.factor_tfi.get() > 0.10,
+            let peak_gross_bps =
+                Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
+
+            // Condition A: Flow reversal while in net Maker profit (>= +6.00 bps gross = +2.00 bps net)
+            let ofi_reversed = match side {
+                Side::Bid => snap.factor_ofi.get() < -0.05,
+                Side::Ask => snap.factor_ofi.get() > 0.05,
             };
-            if current_gross_bps.raw() >= 600 && flow_exhausted {
+            let flow_unwind = current_gross_bps.raw() >= 600 && ofi_reversed;
+
+            // Condition B: MFE Zero-Loss Ratchet (reached >= +8.50 bps gross, protecting >= +5.20 bps gross / +1.20 bps net)
+            let mfe_ratchet_unwind = peak_gross_bps.raw() >= 850
+                && current_gross_bps.raw() >= 520
+                && current_gross_bps.raw() <= (peak_gross_bps.raw() * 70) / 100;
+
+            // Condition C: Stagnant profitable position >= 180s (>= +5.00 bps gross = +1.00 bps net)
+            let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
+            let stagnant_unwind =
+                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 500;
+
+            if flow_unwind || mfe_ratchet_unwind || stagnant_unwind {
                 return Some(self.finalize_close(
                     ClosedTradeKind::MakerPassiveUnwind,
                     side,
@@ -752,7 +829,6 @@ mod tests {
 
     #[test]
     fn test_hmac_sha256_rfc4231_and_bybit_v5_signature() {
-        // RFC 4231 Test Case 2: key = "Jefe", data = "what do ya want for nothing?"
         let sig = hmac_sha256_hex_segments(b"Jefe", &[b"what do ya want for nothing?"]);
         assert_eq!(
             core::str::from_utf8(&sig),
@@ -767,6 +843,70 @@ mod tests {
             "TESTSECRET",
         );
         assert_eq!(bybit_sig.len(), 64);
+    }
+
+    #[test]
+    fn test_mfe_zero_loss_ratchet_locks_profit_on_taousdt_retrace() {
+        let spec = PairSpec {
+            symbol_id: SymbolId(5),
+            tick_size_1e8: 1_000_000,
+            lot_step_1e8: 1_000_000,
+            empirical_taker_exit_prob_pct: 20,
+        };
+        let mut fsm = ExecutionFsm::new(10_000_000_000, 1_500_000_000);
+        let mut ledger = ParitySyncLedger::new(5_000_000_000);
+
+        let mut snap = SymbolLobSnapshot {
+            symbol_id: SymbolId(5),
+            is_eligible: true,
+            sequence_id: 1,
+            ts_exchange_ns: TimestampNs(1_000_000_000),
+            ts_local_ns: TimestampNs(1_000_000_000),
+            mark_price: PriceTicks(23_347),
+            last_trade_price: PriceTicks(23_347),
+            realized_vol_5m: ScaledBps::from_whole_bps(68),
+            ..SymbolLobSnapshot::default()
+        };
+        snap.bids[0] = BookLevel {
+            price: PriceTicks(23_346),
+            qty: LotQty(200),
+        };
+        snap.asks[0] = BookLevel {
+            price: PriceTicks(23_347),
+            qty: LotQty(200),
+        };
+
+        let verdict = SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Ask,
+            target_excursion_scaled_bps: ScaledBps::from_whole_bps(48),
+            estimated_cost_rt_scaled_bps: ScaledBps(490),
+        };
+        assert_eq!(
+            fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10)),
+            Ok(true)
+        );
+        assert!(fsm.on_entry_order_resting(TimestampNs(1_025_000_000)));
+        assert!(fsm.on_entry_filled_maker(TimestampNs(1_050_000_000)));
+
+        // Price drops favorably to 233.19 USDT (23_319 ticks -> +11.99 bps gross MFE), TFI is 0.00
+        snap.bids[0].price = PriceTicks(23_318);
+        snap.asks[0].price = PriceTicks(23_319);
+        snap.last_trade_price = PriceTicks(23_319);
+        snap.mark_price = PriceTicks(23_319);
+        snap.factor_ofi = BoundedScore::new_clamped(-0.10);
+        assert!(fsm.step_open_position(&snap, &mut ledger).is_none());
+
+        // Price retraces to 233.33 USDT (23_333 ticks -> +5.99 bps gross <= 70% of 11.99 bps peak)
+        snap.bids[0].price = PriceTicks(23_332);
+        snap.asks[0].price = PriceTicks(23_333);
+        snap.last_trade_price = PriceTicks(23_333);
+        snap.mark_price = PriceTicks(23_333);
+        let closed = fsm.step_open_position(&snap, &mut ledger);
+        assert!(closed.is_some());
+        if let Some(s) = closed {
+            assert_eq!(s.kind, ClosedTradeKind::MakerPassiveUnwind);
+            assert!(s.net_scaled_bps.raw() > 150);
+        }
     }
 
     #[test]
@@ -812,9 +952,9 @@ mod tests {
         );
         assert!(fsm.on_entry_order_resting(TimestampNs(1_000_000_000)));
 
-        // Price runs away by +2 ticks in front of our Bid at 9_000
-        snap.bids[0].price = PriceTicks(9_002);
-        snap.asks[0].price = PriceTicks(9_003);
+        // Price runs away by +8 ticks (>= 8.00 bps of 9_000) without filling our Bid
+        snap.bids[0].price = PriceTicks(9_008);
+        snap.asks[0].price = PriceTicks(9_009);
         assert!(fsm.check_resting_queue_abort(&snap));
         assert_eq!(fsm.state, OrderLifecycleState::Idle);
     }

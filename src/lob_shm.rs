@@ -13,8 +13,8 @@ pub const LOB_DEPTH: usize = 50;
 pub const MAX_ACTIVE_PAIRS: usize = 8;
 /// Magic header identifying a valid VORTEXL2 shared memory region ("VORTEXL2" in ASCII).
 pub const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C32;
-/// Schema version of the shared memory layout (v4 adds cumulative publicTrade lot counters).
-pub const VORTEX_SHM_VERSION: u32 = 4;
+/// Schema version of the shared memory layout (v5 adds MFE peak price tracking).
+pub const VORTEX_SHM_VERSION: u32 = 5;
 /// Canonical POSIX shared-memory path on Ubuntu Linux production nodes.
 pub const DEFAULT_LINUX_SHM_PATH: &str = "/dev/shm/vortex_lob.mmap";
 
@@ -246,6 +246,7 @@ pub struct VortexShmArena {
     pub exec_active_symbol: AtomicU64,
     pub exec_side: AtomicU64,
     pub exec_entry_ticks: AtomicU64,
+    pub exec_peak_ticks: AtomicU64,
     pub exec_tp_ticks: AtomicU64,
     pub exec_sl_ticks: AtomicU64,
     pub exec_resting_since_ns: AtomicU64,
@@ -278,6 +279,7 @@ impl VortexShmArena {
             exec_active_symbol: AtomicU64::new(0),
             exec_side: AtomicU64::new(0),
             exec_entry_ticks: AtomicU64::new(0),
+            exec_peak_ticks: AtomicU64::new(0),
             exec_tp_ticks: AtomicU64::new(0),
             exec_sl_ticks: AtomicU64::new(0),
             exec_resting_since_ns: AtomicU64::new(0),
@@ -446,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_seqlock_roundtrip_and_bbo_spread() {
-        let shm_path = std::env::temp_dir().join("vortex_test_shm_region_v4.mmap");
+        let shm_path = std::env::temp_dir().join("vortex_test_shm_region_v5.mmap");
         let region = MappedShmRegion::open_or_create(&shm_path, true);
         assert!(region.is_ok());
         if let Ok(reg) = region {

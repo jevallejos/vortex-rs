@@ -1,5 +1,5 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, 200.0 Hz Seqlock Reader,
-//! Non-Volatile SHM v4 + JSONL Ledger Rehydration, Level-Wiped Fill Detection,
+//! Non-Volatile SHM v5 + JSONL Ledger Rehydration, Convex MFE Maker Ratchet,
 //! Multi-Alias Telegram Notifier, Live HUD (`--live`), and 520-Trade OOS Verifier.
 
 use core::sync::atomic::Ordering;
@@ -138,7 +138,7 @@ fn spawn_async_telegram_notifier() -> Option<SyncSender<String>> {
     println!("[TELEGRAM] Asynchronous 1:1 transactional notifier thread active.");
 
     let _ = tx.try_send(
-        "[VORTEX-L2 STAGE 14 ONLINE] 200Hz SHM v4 Execution Engine active in sniper-singapur."
+        "[VORTEX-L2 STAGE 15 ONLINE] 200Hz SHM v5 Execution Engine + MFE Zero-Loss Ratchet active."
             .to_owned(),
     );
 
@@ -429,6 +429,7 @@ fn print_live_shm_hud() -> ExitCode {
     let side_code = arena.exec_side.load(Ordering::Acquire);
     let side_str = if side_code == 1 { "Ask" } else { "Bid" };
     let entry_ticks = arena.exec_entry_ticks.load(Ordering::Acquire);
+    let peak_ticks = arena.exec_peak_ticks.load(Ordering::Acquire);
     let tp_ticks = arena.exec_tp_ticks.load(Ordering::Acquire);
     let sl_ticks = arena.exec_sl_ticks.load(Ordering::Acquire);
     let q_ahead = arena.exec_queue_ahead_lots.load(Ordering::Acquire);
@@ -448,11 +449,12 @@ fn print_live_shm_hud() -> ExitCode {
 
     println!("------------------------------------------------------------------------------------------");
     println!(
-        "[EXEC FSM LIVE] State: {} | Sym: {} ({}) @ {}t [TP:{}t / SL:{}t] (Queue: {} lots) | Armed: {} | Aborts: {} | Fills: {} | Closed: {}",
+        "[EXEC FSM LIVE] State: {} | Sym: {} ({}) @ {}t [Peak:{}t | TP:{}t | SL:{}t] (Q: {} lots) | Armed: {} | Aborts: {} | Fills: {} | Closed: {}",
         state_label,
         if state_code == 0 { "-" } else { active_sym.name() },
         if state_code == 0 { "-" } else { side_str },
         entry_ticks,
+        peak_ticks,
         tp_ticks,
         sl_ticks,
         q_ahead,
@@ -493,6 +495,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
             Side::Bid
         };
         let entry_saved = PriceTicks(arena.exec_entry_ticks.load(Ordering::Acquire) as i64);
+        let peak_saved = PriceTicks(arena.exec_peak_ticks.load(Ordering::Acquire) as i64);
         let tp_saved = PriceTicks(arena.exec_tp_ticks.load(Ordering::Acquire) as i64);
         let sl_saved = PriceTicks(arena.exec_sl_ticks.load(Ordering::Acquire) as i64);
         let since_saved = TimestampNs(arena.exec_resting_since_ns.load(Ordering::Acquire) as i64);
@@ -522,16 +525,18 @@ fn run_shadow_execution_daemon() -> ExitCode {
             fsm.state = OrderLifecycleState::PositionOpenMakerExit {
                 side: side_saved,
                 entry_price: entry_saved,
+                peak_favorable_price: if peak_saved.0 > 0 { peak_saved } else { entry_saved },
                 qty: LotQty(10),
                 tp_maker_price: tp_saved,
                 sl_trigger_price: sl_saved,
                 opened_ts: since_saved,
             };
             println!(
-                "[SHM HOT-RESTORE] Rehydrated PositionOpenMakerExit on {} {:?} @ {}t [TP:{}t / SL:{}t]",
+                "[SHM HOT-RESTORE] Rehydrated PositionOpenMakerExit on {} {:?} @ {}t [Peak:{}t | TP:{}t | SL:{}t]",
                 APPROVED_SPECS[active_slot].symbol_id.name(),
                 side_saved,
                 entry_saved.0,
+                peak_saved.0,
                 tp_saved.0,
                 sl_saved.0
             );
@@ -539,7 +544,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
     }
 
     println!(
-        "[DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with 5ms Event-Driven Queue FSM.",
+        "[DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) with MFE Ratchet & 5ms FSM.",
         arena.version,
         shm_path.display()
     );
@@ -595,6 +600,10 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                             entry_price.0 as u64,
                                             Ordering::Release,
                                         );
+                                        arena.exec_peak_ticks.store(
+                                            entry_price.0 as u64,
+                                            Ordering::Release,
+                                        );
                                         arena.exec_tp_ticks.store(0, Ordering::Release);
                                         arena.exec_sl_ticks.store(
                                             sl_trigger_price.0 as u64,
@@ -639,9 +648,6 @@ fn run_shadow_execution_daemon() -> ExitCode {
                         }
                         last_seen_seq[active_slot] = snap.sequence_id;
 
-                        // Physical LOB Law:
-                        // - For Bid at entry_price: if BestBid < entry_price OR BestAsk <= entry_price, the entire entry_price Bid level was swept.
-                        // - For Ask at entry_price: if BestAsk > entry_price OR BestBid >= entry_price, the entire entry_price Ask level was swept.
                         let level_swept = match side {
                             Side::Bid => {
                                 (snap.bids[0].price.0 > 0 && snap.bids[0].price.0 < entry_price.0)
@@ -653,7 +659,6 @@ fn run_shadow_execution_daemon() -> ExitCode {
                             }
                         };
 
-                        // 1. Drain 100% of real publicTrade volume executed against our resting side
                         let cur_cum_trade = match side {
                             Side::Bid => snap.cum_sell_trade_lots.0,
                             Side::Ask => snap.cum_buy_trade_lots.0,
@@ -671,7 +676,6 @@ fn run_shadow_execution_daemon() -> ExitCode {
                         }
                         prev_cum_trade_lots = LotQty(cur_cum_trade);
 
-                        // 2. Drain conservative 25% of net L1 size reductions
                         let cur_l1_qty = match side {
                             Side::Bid if snap.bids[0].price.0 == entry_price.0 => snap.bids[0].qty.0,
                             Side::Ask if snap.asks[0].price.0 == entry_price.0 => snap.asks[0].qty.0,
@@ -702,6 +706,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
                             {
                                 tp_t = tp_maker_price.0;
                                 sl_t = sl_trigger_price.0;
+                                arena.exec_peak_ticks.store(entry_price.0 as u64, Ordering::Release);
                                 arena.exec_tp_ticks.store(tp_t as u64, Ordering::Release);
                                 arena.exec_sl_ticks.store(sl_t as u64, Ordering::Release);
                                 arena.exec_resting_since_ns.store(
@@ -777,6 +782,7 @@ fn run_shadow_execution_daemon() -> ExitCode {
                         if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
                             arena.exec_closed_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(0, Ordering::Release);
+                            arena.exec_peak_ticks.store(0, Ordering::Release);
                             arena.exec_tp_ticks.store(0, Ordering::Release);
                             arena.exec_sl_ticks.store(0, Ordering::Release);
                             append_shadow_trade_jsonl(
@@ -820,6 +826,15 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                 );
                                 let _ = tx.try_send(alert);
                             }
+                        } else if let OrderLifecycleState::PositionOpenMakerExit {
+                            peak_favorable_price,
+                            ..
+                        } = fsm.state
+                        {
+                            arena.exec_peak_ticks.store(
+                                peak_favorable_price.0 as u64,
+                                Ordering::Release,
+                            );
                         }
                     }
                 }
