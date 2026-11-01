@@ -1189,10 +1189,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 ANSI_RESET
                             );
                             if let Some(ref tx) = tg_tx {
+                                let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id);
                                 let alert = format!(
-                                    "🟡 [VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?})\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT\nServer SL: {}.{:04} USDT",
+                                    "🟡 [VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?}) | Qty: {}\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT (+0.400% | +4.00% @ 10x)\nServer SL: {}.{:04} USDT (-0.520% | -5.20% @ 10x)",
                                     snap.symbol_id.name(),
                                     side,
+                                    qty_str,
                                     e_w,
                                     e_f,
                                     tp_w,
@@ -1244,10 +1246,18 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let (en_w, en_f) = spec.format_price_usdt_parts(summary.entry_price);
                             let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
                             let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
+                            let net_pct_1x = net_bps / 100.0;
+                            let net_pct_10x = net_bps / 10.0;
+                            let trade_usdt = ((OPTIMAL_LIVE_NOTIONAL_1E8 as f64) / 100_000_000.0) * (net_bps / 10_000.0);
+                            let cum_usdt = (ledger.cumulative_net_pnl_1e8 as f64) / 100_000_000.0;
+                            let cum_bps = (cum_usdt / ((OPTIMAL_LIVE_NOTIONAL_1E8 as f64) / 100_000_000.0)) * 10_000.0;
+                            let cum_pct_1x = cum_bps / 100.0;
+                            let cum_pct_10x = cum_bps / 10.0;
+                            let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id);
                             let (c_col, c_icon, c_badge) = classify_pnl_badge(net_bps);
 
                             println!(
-                                "{}{} [TRADE CLOSE — {}] {} {:?} | {}.{:04} -> {}.{:04} | Net: {:+.2} bps | Total Trades: {}{}",
+                                "{}{} [TRADE CLOSE — {}] {} {:?} | {}.{:04} -> {}.{:04} | Net: {:+.2} bps ({:+.3}% | {:+.2}% @10x | {:+.4} USDT) | Total Trades: {}{}",
                                 c_col,
                                 c_icon,
                                 c_badge,
@@ -1258,23 +1268,36 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 ex_w,
                                 ex_f,
                                 net_bps,
+                                net_pct_1x,
+                                net_pct_10x,
+                                trade_usdt,
                                 ledger.closed_trades_count,
                                 ANSI_RESET
                             );
 
                             if let Some(ref tx) = tg_tx {
                                 let alert = format!(
-                                    "{} [VORTEX-L2 TRADE {}]\nSymbol: {} ({:?})\nExit Type: {:?}\nPrice: {}.{:04} -> {}.{:04} USDT\nNet PnL: {:+.2} bps (Maker Exit: {})\nTotal Trades: {} | PF: {:.2}",
+                                    "{} [VORTEX-L2 TRADE {} ({:+.3}% | {:+.2}% @ 10x)]\nSymbol: {} ({:?}) | Qty: {}\nExit Type: {:?}\nPrice: {}.{:04} -> {}.{:04} USDT\nNet PnL: {:+.2} bps ({:+.3}% | {:+.2}% @ 10x | {:+.4} USDT)\nCum PnL: {:+.2} bps ({:+.3}% | {:+.2}% @ 10x | {:+.4} USDT)\nMaker Exit: {} | Total Trades: {} | PF: {:.2}",
                                     c_icon,
                                     c_badge,
+                                    net_pct_1x,
+                                    net_pct_10x,
                                     snap.symbol_id.name(),
                                     summary.side,
+                                    qty_str,
                                     summary.kind,
                                     en_w,
                                     en_f,
                                     ex_w,
                                     ex_f,
                                     net_bps,
+                                    net_pct_1x,
+                                    net_pct_10x,
+                                    trade_usdt,
+                                    cum_bps,
+                                    cum_pct_1x,
+                                    cum_pct_10x,
+                                    cum_usdt,
                                     summary.is_maker_exit,
                                     ledger.closed_trades_count,
                                     (fsm.net_profit_factor_x100() as f64) / 100.0
