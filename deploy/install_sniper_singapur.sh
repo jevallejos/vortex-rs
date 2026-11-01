@@ -20,13 +20,16 @@ for legacy_svc in bot-sniper.service doctor-blythe.service; do
     fi
 done
 
-echo "[BINARY FETCH] Attempting zero-jitter download of pre-built Linux x86_64 binaries..."
+sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
+
+echo "[BINARY FETCH] Downloading pre-built Linux x86_64 binaries from GitHub Release..."
 if curl -fsSL "${RELEASE_URL}" -o "/tmp/vortex-linux-x86_64.tar.gz"; then
     tar -xzf "/tmp/vortex-linux-x86_64.tar.gz" -C "${BIN_DIR}"
     rm -f "/tmp/vortex-linux-x86_64.tar.gz"
     echo "[OK] Pre-built LTO binaries installed into ${BIN_DIR} (0% compilation CPU jitter)."
 else
     echo "[FALLBACK] Building once under idle CPU priority..."
+    sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev build-essential
     if ! command -v cargo >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
         export PATH="${HOME}/.cargo/bin:${PATH}"
@@ -41,7 +44,7 @@ chmod +x "${BIN_DIR}/vortex_tap" "${BIN_DIR}/vortex_replay" "${BIN_DIR}/vortex_e
 
 sudo tee /etc/systemd/system/vortex-tap.service >/dev/null <<EOF
 [Unit]
-Description=VORTEX-L2 Immortal L2 + PublicTrade Ingestion & Pair Eligibility Daemon
+Description=VORTEX-L2 Immortal Bybit V5 WebSocket L2 + PublicTrade Ingestion Daemon
 After=network-online.target
 Wants=network-online.target
 
@@ -64,7 +67,7 @@ EOF
 
 sudo tee /etc/systemd/system/vortex-exec.service >/dev/null <<EOF
 [Unit]
-Description=VORTEX-L2 Execution FSM & Parity Sync Engine (VORTEX-RS-V1.0)
+Description=VORTEX-L2 Execution FSM & Shadow Parity Engine (VORTEX-RS-V1.0)
 After=vortex-tap.service
 Requires=vortex-tap.service
 
@@ -88,10 +91,17 @@ EOF
 sudo tee /usr/local/bin/vortex >/dev/null <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-case "\${1:-status}" in
+case "\${1:-live}" in
+    live|-l)
+        ${BIN_DIR}/vortex_exec --live
+        ;;
     status|-s)
         systemctl status vortex-tap.service vortex-exec.service --no-pager
         ls -lh /dev/shm/vortex_lob.mmap
+        ls -lh ${DATA_DIR} | tail -n 10
+        ;;
+    logs)
+        journalctl -u vortex-tap.service -u vortex-exec.service -n 40 --no-pager
         ;;
     audit|-a)
         ${BIN_DIR}/vortex_tap
@@ -108,7 +118,7 @@ case "\${1:-status}" in
         ${BIN_DIR}/vortex_exec
         ;;
     *)
-        echo "Usage: vortex {status|audit|replay|oos|all}"
+        echo "Usage: vortex {live|status|logs|audit|replay|oos|all}"
         exit 1
         ;;
 esac
@@ -118,7 +128,7 @@ sudo chmod +x /usr/local/bin/vortex
 sudo systemctl daemon-reload
 sudo systemctl enable vortex-tap.service vortex-exec.service
 sudo systemctl restart vortex-tap.service vortex-exec.service
-sleep 1
+sleep 3
 
-echo "[OK] VORTEX-L2 systemd services enabled and running perpetually (Type=simple)."
-vortex all
+echo "[OK] VORTEX-L2 Live Bybit V5 WebSocket Daemons active."
+vortex live

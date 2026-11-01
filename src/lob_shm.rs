@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
-use crate::types::{BoundedScore, LotQty, PriceTicks, ScaledBps, SymbolId, TimestampNs, VortexError};
+use crate::types::{BoundedScore, LotQty, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs, VortexError};
 
 /// Canonical depth of Bybit `orderbook.50` stream.
 pub const LOB_DEPTH: usize = 50;
@@ -83,6 +83,84 @@ impl SymbolLobSnapshot {
         }
     }
 
+    /// Clears all resting L2 levels prior to applying a full Bybit `"snapshot"` frame.
+    #[inline]
+    pub fn clear_book(&mut self) {
+        self.bids = [BookLevel::default(); LOB_DEPTH];
+        self.asks = [BookLevel::default(); LOB_DEPTH];
+    }
+
+    /// Applies a single L2 price-level update (`snapshot` or `delta`) in-place without heap allocation.
+    /// Bids are maintained sorted descending; Asks are maintained sorted ascending.
+    #[inline]
+    pub fn apply_level_update(&mut self, side: Side, price: PriceTicks, qty: LotQty) {
+        if price.0 <= 0 {
+            return;
+        }
+        let levels = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+
+        // 1. Check if price level already exists
+        let mut existing_idx: Option<usize> = None;
+        let mut i = 0;
+        while i < LOB_DEPTH {
+            if levels[i].price.0 == price.0 {
+                existing_idx = Some(i);
+                break;
+            }
+            if levels[i].price.0 == 0 {
+                break;
+            }
+            i += 1;
+        }
+
+        if let Some(idx) = existing_idx {
+            if qty.0 <= 0 {
+                // Remove level by shifting remaining levels left
+                let mut k = idx;
+                while k + 1 < LOB_DEPTH {
+                    levels[k] = levels[k + 1];
+                    k += 1;
+                }
+                levels[LOB_DEPTH - 1] = BookLevel::default();
+            } else {
+                levels[idx].qty = qty;
+            }
+            return;
+        }
+
+        if qty.0 <= 0 {
+            return;
+        }
+
+        // 2. Find insertion index preserving sort order
+        let mut ins_idx = LOB_DEPTH;
+        let mut j = 0;
+        while j < LOB_DEPTH {
+            let cur_p = levels[j].price.0;
+            let should_insert_before = match side {
+                Side::Bid => cur_p == 0 || price.0 > cur_p,
+                Side::Ask => cur_p == 0 || price.0 < cur_p,
+            };
+            if should_insert_before {
+                ins_idx = j;
+                break;
+            }
+            j += 1;
+        }
+
+        if ins_idx < LOB_DEPTH {
+            let mut m = LOB_DEPTH - 1;
+            while m > ins_idx {
+                levels[m] = levels[m - 1];
+                m -= 1;
+            }
+            levels[ins_idx] = BookLevel { price, qty };
+        }
+    }
+
     /// Returns the best bid and best ask (L1 BBO) and the spread in integer ticks.
     #[inline]
     pub const fn bbo_and_spread_ticks(&self) -> Option<(BookLevel, BookLevel, i64)> {
@@ -128,7 +206,6 @@ impl SeqlockSymbolSlot {
         }
     }
 
-    /// Single-writer lock-free update (`vortex-tap`).
     #[inline]
     pub fn write_snapshot(&self, snap: &SymbolLobSnapshot) {
         let s0 = self.seq.load(Ordering::Relaxed);
@@ -142,7 +219,6 @@ impl SeqlockSymbolSlot {
         self.seq.store(s_odd.wrapping_add(1), Ordering::Release);
     }
 
-    /// Lock-free optimistic read (`vortex-exec`).
     #[inline]
     pub fn read_snapshot(&self, max_retries: usize) -> Result<SymbolLobSnapshot, VortexError> {
         for _ in 0..max_retries {
@@ -224,7 +300,6 @@ extern "C" {
 }
 
 /// Cross-process memory-mapped wrapper for `VortexShmArena`.
-/// Uses POSIX `mmap(MAP_SHARED)` on `/dev/shm/vortex_lob.mmap` on Linux and heap-backed fallback on Windows.
 #[derive(Debug)]
 pub struct MappedShmRegion {
     #[cfg(unix)]
@@ -236,7 +311,6 @@ pub struct MappedShmRegion {
 }
 
 impl MappedShmRegion {
-    /// Returns the default OS path (`/dev/shm/vortex_lob.mmap` on Linux, temp dir on Windows).
     #[must_use]
     pub fn default_shm_path() -> PathBuf {
         let dev_shm = Path::new("/dev/shm");
@@ -247,7 +321,6 @@ impl MappedShmRegion {
         }
     }
 
-    /// Opens or creates the shared memory region at `path`.
     pub fn open_or_create(path: &Path, initialize_writer: bool) -> Result<Self, VortexError> {
         let size = core::mem::size_of::<VortexShmArena>();
         let file = OpenOptions::new()
@@ -305,7 +378,6 @@ impl MappedShmRegion {
         }
     }
 
-    /// Returns a shared reference to the underlying `VortexShmArena`.
     #[inline]
     #[must_use]
     pub fn arena(&self) -> &VortexShmArena {
@@ -336,6 +408,23 @@ impl Drop for MappedShmRegion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_l2_delta_book_maintenance_sorted_and_zero_removal() {
+        let mut snap = SymbolLobSnapshot::new_empty();
+        snap.apply_level_update(Side::Bid, PriceTicks(100), LotQty(50));
+        snap.apply_level_update(Side::Bid, PriceTicks(102), LotQty(30));
+        snap.apply_level_update(Side::Bid, PriceTicks(101), LotQty(40));
+        assert_eq!(snap.bids[0].price, PriceTicks(102));
+        assert_eq!(snap.bids[1].price, PriceTicks(101));
+        assert_eq!(snap.bids[2].price, PriceTicks(100));
+
+        // Remove middle bid level (qty = 0)
+        snap.apply_level_update(Side::Bid, PriceTicks(101), LotQty(0));
+        assert_eq!(snap.bids[0].price, PriceTicks(102));
+        assert_eq!(snap.bids[1].price, PriceTicks(100));
+        assert_eq!(snap.bids[2].price, PriceTicks(0));
+    }
 
     #[test]
     fn test_seqlock_roundtrip_and_bbo_spread() {

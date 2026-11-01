@@ -1,16 +1,20 @@
 //! Binary 1 (`vortex_tap`): Immortal L2 + publicTrade ingestion daemon,
-//! Microeconomic Pair Eligibility Auditor (`Tick-to-Price Guard <= 1.50 bps`),
-//! and Seqlock shared-memory writer over `/dev/shm/vortex_lob.mmap`.
+//! Bybit UTA V5 Live WebSocket client (`wss://stream.bybit.com/v5/public/linear`),
+//! Microeconomic Pair Eligibility Auditor, and Seqlock/PAR1 writer.
 
 use core::sync::atomic::Ordering;
+use std::path::Path;
 use std::process::ExitCode;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use tungstenite::{connect, Message};
 use vortex_rs::alpha_3factor::OrthogonalFactorState;
-use vortex_rs::forensic_parquet::ColumnarParquetBatch;
-use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, MAX_ACTIVE_PAIRS};
+use vortex_rs::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind};
+use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena, MAX_ACTIVE_PAIRS};
 use vortex_rs::types::{LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
+
+const BYBIT_PUBLIC_LINEAR_WS: &str = "wss://stream.bybit.com/v5/public/linear";
 
 #[derive(Copy, Clone, Debug)]
 struct CandidateContract {
@@ -129,6 +133,286 @@ fn now_epoch_ns() -> i64 {
     }
 }
 
+fn find_slot_by_name(name: &str, approved_count: usize) -> Option<(usize, PairSpec)> {
+    let mut idx = 0;
+    while idx < approved_count && idx < CANDIDATE_UNIVERSE.len() {
+        if CANDIDATE_UNIVERSE[idx].name == name {
+            return Some((idx, CANDIDATE_UNIVERSE[idx].spec));
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn process_bybit_ws_frame(
+    raw_json: &str,
+    approved_slots: usize,
+    arena: &VortexShmArena,
+    factor_states: &mut [OrthogonalFactorState; MAX_ACTIVE_PAIRS],
+    active_snaps: &mut [SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+    batch: &mut ColumnarParquetBatch,
+    parquet_seq: &mut u64,
+) {
+    let parsed: serde_json::Value = match serde_json::from_str(raw_json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let topic = match parsed.get("topic").and_then(serde_json::Value::as_str) {
+        Some(t) => t,
+        None => return,
+    };
+
+    let local_ns = now_epoch_ns();
+    let exch_ms = parsed
+        .get("ts")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(local_ns / 1_000_000);
+    let exch_ns = exch_ms.saturating_mul(1_000_000);
+    arena.heartbeat_ns.store(local_ns as u64, Ordering::Release);
+
+    if let Some(sym_name) = topic.strip_prefix("orderbook.50.") {
+        let (slot_idx, spec) = match find_slot_by_name(sym_name, approved_slots) {
+            Some(pair) => pair,
+            None => return,
+        };
+        let msg_type = parsed
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("delta");
+        let data = match parsed.get("data") {
+            Some(d) => d,
+            None => return,
+        };
+
+        let snap = &mut active_snaps[slot_idx];
+        if msg_type == "snapshot" {
+            snap.clear_book();
+        }
+
+        if let Some(bids) = data.get("b").and_then(serde_json::Value::as_array) {
+            for entry in bids {
+                if let Some(arr) = entry.as_array() {
+                    if arr.len() >= 2 {
+                        if let (Some(p_str), Some(q_str)) = (arr[0].as_str(), arr[1].as_str()) {
+                            if let (Ok(p), Ok(q)) =
+                                (spec.parse_price_ticks(p_str), spec.parse_lot_qty(q_str))
+                            {
+                                snap.apply_level_update(Side::Bid, p, q);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(asks) = data.get("a").and_then(serde_json::Value::as_array) {
+            for entry in asks {
+                if let Some(arr) = entry.as_array() {
+                    if arr.len() >= 2 {
+                        if let (Some(p_str), Some(q_str)) = (arr[0].as_str(), arr[1].as_str()) {
+                            if let (Ok(p), Ok(q)) =
+                                (spec.parse_price_ticks(p_str), spec.parse_lot_qty(q_str))
+                            {
+                                snap.apply_level_update(Side::Ask, p, q);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let seq_u = data
+            .get("u")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(snap.sequence_id.wrapping_add(1));
+        snap.sequence_id = seq_u;
+        snap.ts_exchange_ns = TimestampNs(exch_ns);
+        snap.ts_local_ns = TimestampNs(local_ns);
+
+        if let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() {
+            let mid = PriceTicks((best_bid.price.0 + best_ask.price.0) / 2);
+            snap.mark_price = mid;
+            if snap.last_trade_price.0 <= 0 {
+                snap.last_trade_price = mid;
+            }
+            snap.is_eligible = spec
+                .validate_eligibility(mid, snap.realized_vol_5m)
+                .is_ok();
+        }
+
+        factor_states[slot_idx].on_l2_snapshot(snap);
+        if let Ok(slot) = arena.slot(slot_idx) {
+            slot.write_snapshot(snap);
+        }
+
+        if batch.push_l2_snapshot(snap).is_err() {
+            flush_parquet_batch(batch, parquet_seq);
+            let _ = batch.push_l2_snapshot(snap);
+        }
+    } else if let Some(sym_name) = topic.strip_prefix("publicTrade.") {
+        let (slot_idx, spec) = match find_slot_by_name(sym_name, approved_slots) {
+            Some(pair) => pair,
+            None => return,
+        };
+        let trades = match parsed.get("data").and_then(serde_json::Value::as_array) {
+            Some(arr) => arr,
+            None => return,
+        };
+
+        let snap = &mut active_snaps[slot_idx];
+        for tr in trades {
+            let side_str = tr
+                .get("S")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Buy");
+            let p_str = match tr.get("p").and_then(serde_json::Value::as_str) {
+                Some(s) => s,
+                None => continue,
+            };
+            let v_str = match tr.get("v").and_then(serde_json::Value::as_str) {
+                Some(s) => s,
+                None => continue,
+            };
+            let side = if side_str == "Sell" {
+                Side::Ask
+            } else {
+                Side::Bid
+            };
+
+            if let (Ok(price), Ok(qty)) = (spec.parse_price_ticks(p_str), spec.parse_lot_qty(v_str))
+            {
+                let tfi = factor_states[slot_idx].on_public_trade(side, qty);
+                snap.last_trade_price = price;
+                snap.mark_price = price;
+                snap.factor_tfi = tfi;
+                snap.ts_exchange_ns = TimestampNs(exch_ns);
+                snap.ts_local_ns = TimestampNs(local_ns);
+
+                if let Ok(slot) = arena.slot(slot_idx) {
+                    slot.write_snapshot(snap);
+                }
+
+                let row = ColumnarMarketRow {
+                    symbol_id: snap.symbol_id,
+                    event_kind: MarketEventKind::PublicTradePrint,
+                    side,
+                    sequence_id: snap.sequence_id,
+                    ts_exchange_ns: TimestampNs(exch_ns),
+                    ts_local_ns: TimestampNs(local_ns),
+                    price_ticks: price,
+                    lot_qty: qty,
+                    best_bid_ticks: snap.bids[0].price,
+                    best_ask_ticks: snap.asks[0].price,
+                    best_bid_qty: snap.bids[0].qty,
+                    best_ask_qty: snap.asks[0].qty,
+                    mark_price_ticks: snap.mark_price,
+                    ofi_bps: snap.factor_ofi.to_bps_i32(),
+                    tfi_bps: snap.factor_tfi.to_bps_i32(),
+                    geom_bps: snap.factor_geom.to_bps_i32(),
+                };
+                if batch.push_row(&row).is_err() {
+                    flush_parquet_batch(batch, parquet_seq);
+                    let _ = batch.push_row(&row);
+                }
+            }
+        }
+    }
+}
+
+fn flush_parquet_batch(batch: &mut ColumnarParquetBatch, parquet_seq: &mut u64) {
+    if batch.is_empty() {
+        return;
+    }
+    let data_dir = Path::new("data");
+    let _ = std::fs::create_dir_all(data_dir);
+    *parquet_seq = parquet_seq.wrapping_add(1);
+    let file_path = data_dir.join(format!("vortex_l2_segment_{:06}.parquet", *parquet_seq));
+    if let Ok(checksum) = batch.write_to_file(&file_path) {
+        println!(
+            "[PAR1 FLUSH] Wrote {} live events to {} (FNV1a64: 0x{:016X})",
+            batch.len(),
+            file_path.display(),
+            checksum
+        );
+    }
+    batch.clear();
+}
+
+fn run_live_bybit_ws_loop(
+    approved_slots: usize,
+    arena: &VortexShmArena,
+    factor_states: &mut [OrthogonalFactorState; MAX_ACTIVE_PAIRS],
+    active_snaps: &mut [SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
+    batch: &mut ColumnarParquetBatch,
+) -> ! {
+    let subscribe_payload = r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","publicTrade.BTCUSDT","orderbook.50.ETHUSDT","publicTrade.ETHUSDT","orderbook.50.SOLUSDT","publicTrade.SOLUSDT","orderbook.50.AVAXUSDT","publicTrade.AVAXUSDT","orderbook.50.TAOUSDT","publicTrade.TAOUSDT","orderbook.50.SUIUSDT","publicTrade.SUIUSDT"]}"#;
+    let mut parquet_seq: u64 = 0;
+
+    loop {
+        println!(
+            "[BYBIT V5 WS] Connecting to {} (6 institutional pairs)...",
+            BYBIT_PUBLIC_LINEAR_WS
+        );
+        match connect(BYBIT_PUBLIC_LINEAR_WS) {
+            Ok((mut socket, _response)) => {
+                println!("[BYBIT V5 WS] Connected. Subscribing to orderbook.50 + publicTrade...");
+                if socket
+                    .send(Message::Text(subscribe_payload.to_owned()))
+                    .is_err()
+                {
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+                let mut last_ping = Instant::now();
+
+                loop {
+                    if last_ping.elapsed() >= Duration::from_secs(20) {
+                        if socket
+                            .send(Message::Text(r#"{"op":"ping"}"#.to_owned()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                        last_ping = Instant::now();
+                    }
+
+                    match socket.read() {
+                        Ok(Message::Text(txt)) => {
+                            process_bybit_ws_frame(
+                                &txt,
+                                approved_slots,
+                                arena,
+                                factor_states,
+                                active_snaps,
+                                batch,
+                                &mut parquet_seq,
+                            );
+                        }
+                        Ok(Message::Ping(payload)) => {
+                            if socket.send(Message::Pong(payload)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Message::Close(_)) | Err(_) => {
+                            println!("[BYBIT V5 WS] Stream closed or reset. Reconnecting in 2s...");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                println!(
+                    "[BYBIT V5 WS] Connection error ({}). Retrying in 2s...",
+                    e
+                );
+            }
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+}
+
 fn main() -> ExitCode {
     let daemon_mode = std::env::args().any(|a| a == "--daemon");
     let shm_path = MappedShmRegion::default_shm_path();
@@ -227,6 +511,7 @@ fn main() -> ExitCode {
         Err(_) => return ExitCode::from(4),
     };
     let _ = std::fs::remove_file(&out_path);
+    batch.clear();
 
     println!("--------------------------------------------------------------------------------");
     println!(
@@ -238,26 +523,13 @@ fn main() -> ExitCode {
     println!("================================================================================");
 
     if daemon_mode {
-        println!("[DAEMON 25.0 Hz] Entering immortal Seqlock writer loop (40 ms tick interval)...");
-        let mut tick_counter: u64 = 1;
-        loop {
-            thread::sleep(Duration::from_millis(40));
-            tick_counter = tick_counter.wrapping_add(1);
-            let ts = now_epoch_ns();
-            arena.heartbeat_ns.store(ts as u64, Ordering::Release);
-
-            let mut s = 0;
-            while s < approved_slots {
-                active_snaps[s].sequence_id = tick_counter;
-                active_snaps[s].ts_local_ns = TimestampNs(ts);
-                active_snaps[s].ts_exchange_ns = TimestampNs(ts);
-                factor_states[s].on_l2_snapshot(&mut active_snaps[s]);
-                if let Ok(slot) = arena.slot(s) {
-                    slot.write_snapshot(&active_snaps[s]);
-                }
-                s += 1;
-            }
-        }
+        run_live_bybit_ws_loop(
+            approved_slots,
+            arena,
+            &mut factor_states,
+            &mut active_snaps,
+            &mut batch,
+        );
     }
 
     ExitCode::SUCCESS

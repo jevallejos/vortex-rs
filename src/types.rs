@@ -1,4 +1,5 @@
-//! Compile-time dimensional safety (Newtype pattern) and microeconomic friction guards.
+//! Compile-time dimensional safety (Newtype pattern), fixed-point ASCII parsers,
+//! and microeconomic friction guards.
 
 use core::fmt;
 
@@ -18,7 +19,6 @@ pub struct LotQty(pub i64);
 pub struct TimestampNs(pub i64);
 
 /// Basis points scaled by 100 (1 bps = 100 units; 1.50 bps = 150 units; 35.00 bps = 3500 units).
-/// Eliminates IEEE-754 floating-point drift in fee and threshold comparisons.
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScaledBps(pub i64);
@@ -57,8 +57,6 @@ impl BoundedScore {
     /// Compile-time neutral score (0.0).
     pub const ZERO: Self = Self(0.0);
 
-    /// Creates a bounded score in compile-time or runtime contexts, clamping non-finite values
-    /// to 0.0 and bounding to [-1.0, +1.0].
     #[inline]
     #[must_use]
     #[allow(clippy::manual_clamp)]
@@ -81,7 +79,6 @@ impl BoundedScore {
         self.0
     }
 
-    /// Converts score in [-1.0, +1.0] to integer basis points [-10_000, +10_000] for binary storage.
     #[inline]
     #[must_use]
     pub fn to_bps_i32(self) -> i32 {
@@ -93,6 +90,25 @@ impl BoundedScore {
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SymbolId(pub u16);
+
+impl SymbolId {
+    #[inline]
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self.0 {
+            1 => "BTCUSDT",
+            2 => "ETHUSDT",
+            3 => "SOLUSDT",
+            4 => "AVAXUSDT",
+            5 => "TAOUSDT",
+            6 => "SUIUSDT",
+            7 => "XRPUSDT",
+            8 => "ZEREBROUSDT",
+            9 => "WALUSDT",
+            _ => "UNKNOWN",
+        }
+    }
+}
 
 /// Trade and book side.
 #[repr(u8)]
@@ -106,6 +122,7 @@ pub enum Side {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum VortexError {
     InvalidPriceOrTickSpec,
+    AsciiDecimalParseError,
     TickBpsExceedsInstitutionalCap {
         observed_scaled_bps: ScaledBps,
         max_allowed_scaled_bps: ScaledBps,
@@ -145,7 +162,7 @@ impl fmt::Display for VortexError {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PairSpec {
     pub symbol_id: SymbolId,
-    /// Price of 1 tick scaled by 1e8 (e.g., 0.0001 USDT -> 10_000).
+    /// Price of 1 tick scaled by 1e8 (e.g., 0.10 USDT -> 10_000_000).
     pub tick_size_1e8: i64,
     /// Quantity step scaled by 1e8.
     pub lot_step_1e8: i64,
@@ -154,7 +171,84 @@ pub struct PairSpec {
 }
 
 impl PairSpec {
-    /// Computes relative tick size in ScaledBps (1 bps = 100 units) at a given mid price in ticks.
+    /// Parses a decimal ASCII string (e.g., `"77670.50"`) directly into an integer scaled by `1e8`
+    /// with zero floating-point intermediate representation and zero heap allocation.
+    #[inline]
+    pub fn parse_decimal_1e8(raw: &str) -> Result<i64, VortexError> {
+        let bytes = raw.trim().as_bytes();
+        if bytes.is_empty() {
+            return Err(VortexError::AsciiDecimalParseError);
+        }
+        let mut int_part: i64 = 0;
+        let mut frac_part: i64 = 0;
+        let mut frac_scale: i64 = 100_000_000;
+        let mut in_frac = false;
+        let mut seen_digit = false;
+
+        for &b in bytes {
+            if b == b'.' {
+                if in_frac {
+                    return Err(VortexError::AsciiDecimalParseError);
+                }
+                in_frac = true;
+                continue;
+            }
+            if !b.is_ascii_digit() {
+                return Err(VortexError::AsciiDecimalParseError);
+            }
+            seen_digit = true;
+            let digit = i64::from(b - b'0');
+            if !in_frac {
+                int_part = int_part
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add(digit))
+                    .ok_or(VortexError::AsciiDecimalParseError)?;
+            } else if frac_scale >= 10 {
+                frac_scale /= 10;
+                frac_part += digit * frac_scale;
+            }
+        }
+        if !seen_digit {
+            return Err(VortexError::AsciiDecimalParseError);
+        }
+        int_part
+            .checked_mul(100_000_000)
+            .and_then(|v| v.checked_add(frac_part))
+            .ok_or(VortexError::AsciiDecimalParseError)
+    }
+
+    /// Converts an ASCII price string from Bybit into exact `PriceTicks`.
+    #[inline]
+    pub fn parse_price_ticks(&self, raw: &str) -> Result<PriceTicks, VortexError> {
+        if self.tick_size_1e8 <= 0 {
+            return Err(VortexError::InvalidPriceOrTickSpec);
+        }
+        let val_1e8 = Self::parse_decimal_1e8(raw)?;
+        let ticks = (val_1e8 + (self.tick_size_1e8 / 2)) / self.tick_size_1e8;
+        Ok(PriceTicks(ticks))
+    }
+
+    /// Converts an ASCII quantity string from Bybit into exact `LotQty`.
+    #[inline]
+    pub fn parse_lot_qty(&self, raw: &str) -> Result<LotQty, VortexError> {
+        if self.lot_step_1e8 <= 0 {
+            return Err(VortexError::InvalidPriceOrTickSpec);
+        }
+        let val_1e8 = Self::parse_decimal_1e8(raw)?;
+        let lots = (val_1e8 + (self.lot_step_1e8 / 2)) / self.lot_step_1e8;
+        Ok(LotQty(lots))
+    }
+
+    /// Formats `PriceTicks` back into `(whole_usdt, frac_4digits)` for human HUD display.
+    #[inline]
+    #[must_use]
+    pub const fn format_price_usdt_parts(&self, ticks: PriceTicks) -> (i64, i64) {
+        let total_1e8 = ticks.0.saturating_mul(self.tick_size_1e8);
+        let whole = total_1e8 / 100_000_000;
+        let frac4 = (total_1e8.abs() % 100_000_000) / 10_000;
+        (whole, frac4)
+    }
+
     #[inline]
     pub const fn compute_tick_scaled_bps(&self, mid_price_ticks: PriceTicks) -> Result<ScaledBps, VortexError> {
         if mid_price_ticks.0 <= 0 || self.tick_size_1e8 <= 0 || self.lot_step_1e8 <= 0 {
@@ -164,7 +258,6 @@ impl PairSpec {
         Ok(ScaledBps(scaled))
     }
 
-    /// Evaluates the Tick-to-Price Guard (<= 1.50 bps) and 5-minute realized volatility capability (>= 35.00 bps).
     #[inline]
     pub const fn validate_eligibility(
         &self,
@@ -190,7 +283,6 @@ impl PairSpec {
         Ok(tick_bps)
     }
 
-    /// Computes expected round-trip friction cost in ScaledBps and enforces the 3x Friction Barrier.
     #[inline]
     #[allow(clippy::manual_clamp)]
     pub const fn passes_3x_friction_barrier(
@@ -229,8 +321,6 @@ impl PairSpec {
         Ok(ScaledBps(round_trip_cost))
     }
 
-    /// Pre-validates Bybit UTA V5 server-side Stop-Loss geometry against LastPrice and MarkPrice
-    /// to prevent `retCode 10001` rejections.
     #[inline]
     pub const fn validate_stop_loss_geometry(
         side: Side,
@@ -276,6 +366,19 @@ impl PairSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fixed_point_decimal_parser_exact_ticks_and_lots() {
+        let btc_spec = PairSpec {
+            symbol_id: SymbolId(1),
+            tick_size_1e8: 10_000_000, // 0.10 USDT
+            lot_step_1e8: 100_000,     // 0.001 BTC
+            empirical_taker_exit_prob_pct: 20,
+        };
+        assert_eq!(btc_spec.parse_price_ticks("77670.50"), Ok(PriceTicks(776_705)));
+        assert_eq!(btc_spec.parse_lot_qty("0.254"), Ok(LotQty(254)));
+        assert_eq!(btc_spec.parse_lot_qty("0"), Ok(LotQty(0)));
+    }
 
     #[test]
     fn test_tick_to_price_guard_rejects_wide_tick_altcoin() {

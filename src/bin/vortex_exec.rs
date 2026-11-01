@@ -1,10 +1,10 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, Seqlock Hot-State Reader,
-//! and Pre-Production Out-of-Sample Gate Verifier (`N = 520` trades, `PF >= 1.35`, `Maker% >= 80%`).
+//! Live Shared-Memory Telemetry HUD (`--live`), and 520-Trade OOS Gate Verifier.
 
 use core::sync::atomic::Ordering;
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use vortex_rs::execution_fsm::ExecutionFsm;
@@ -14,16 +14,56 @@ use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Si
 
 pub const TOTAL_OOS_TRADES_GATE: usize = 520;
 
-/// Executes the deterministic 520-trade Out-of-Sample verification loop and returns
-/// `(closed_trades, maker_ratio_bps, profit_factor_x100, net_pnl_1e8, parity_drift)`.
-pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
-    let arena = VortexShmArena::new();
-    let spec = PairSpec {
+const APPROVED_SPECS: [PairSpec; 6] = [
+    PairSpec {
         symbol_id: SymbolId(1),
         tick_size_1e8: 10_000_000,
         lot_step_1e8: 100_000,
         empirical_taker_exit_prob_pct: 20,
-    };
+    },
+    PairSpec {
+        symbol_id: SymbolId(2),
+        tick_size_1e8: 1_000_000,
+        lot_step_1e8: 1_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(3),
+        tick_size_1e8: 1_000_000,
+        lot_step_1e8: 10_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(4),
+        tick_size_1e8: 100_000,
+        lot_step_1e8: 10_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(5),
+        tick_size_1e8: 1_000_000,
+        lot_step_1e8: 1_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(6),
+        tick_size_1e8: 10_000,
+        lot_step_1e8: 100_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+];
+
+fn now_epoch_ns() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i64,
+        Err(_) => 1_762_012_800_000_000_000,
+    }
+}
+
+/// Executes the deterministic 520-trade Out-of-Sample verification loop.
+pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
+    let arena = VortexShmArena::new();
+    let spec = APPROVED_SPECS[0];
 
     let initial_wallet_1e8: i64 = 10_000_000_000;
     let mut ledger = ParitySyncLedger::new(initial_wallet_1e8);
@@ -129,7 +169,78 @@ pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
     ))
 }
 
+fn print_live_shm_hud() -> ExitCode {
+    let shm_path = MappedShmRegion::default_shm_path();
+    let region = match MappedShmRegion::open_or_create(&shm_path, false) {
+        Ok(r) => r,
+        Err(_) => return ExitCode::from(9),
+    };
+    let arena = region.arena();
+    let hb_ns = arena.heartbeat_ns.load(Ordering::Acquire) as i64;
+    let age_ms = ((now_epoch_ns().saturating_sub(hb_ns)).max(0)) / 1_000_000;
+    let evaluator = OrthogonalFactorState::new();
+
+    println!("==========================================================================================");
+    println!(
+        "[VORTEX LIVE HUD] SHM: {} | Heartbeat Age: {} ms",
+        shm_path.display(),
+        age_ms
+    );
+    println!("------------------------------------------------------------------------------------------");
+    println!(
+        "{:<4} | {:<10} | {:>12} | {:>12} | {:>12} | {:>5} | {:>6} | {:>6} | {:>6} | VERDICT",
+        "SLOT", "SYMBOL", "SEQ_ID", "BEST_BID", "BEST_ASK", "SPR_T", "X_OFI", "X_TFI", "X_GEOM"
+    );
+    println!("------------------------------------------------------------------------------------------");
+
+    let mut slot_idx = 0;
+    while slot_idx < APPROVED_SPECS.len() {
+        let spec = APPROVED_SPECS[slot_idx];
+        if let Ok(slot) = arena.slot(slot_idx) {
+            if let Ok(snap) = slot.read_snapshot(8) {
+                let (b_whole, b_frac) = spec.format_price_usdt_parts(snap.bids[0].price);
+                let (a_whole, a_frac) = spec.format_price_usdt_parts(snap.asks[0].price);
+                let spread_t = match snap.bbo_and_spread_ticks() {
+                    Some((_, _, s)) => s,
+                    None => 0,
+                };
+                let verdict_str = match evaluator.evaluate_entry_signal(&spec, &snap) {
+                    Ok(SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }) => "AUTH_LONG_MKR",
+                    Ok(SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. }) => "AUTH_SHORT_MKR",
+                    Ok(SignalVerdict::SpoofingVeto) => "SPOOF_VETO",
+                    Ok(SignalVerdict::NeutralNoAction) => "NEUTRAL_WAIT",
+                    Err(_) => "GUARD_VETO",
+                };
+
+                println!(
+                    "  {}  | {:<10} | {:>12} | {:>7}.{:04} | {:>7}.{:04} | {:>5} | {:>+6.2} | {:>+6.2} | {:>+6.2} | {}",
+                    slot_idx,
+                    snap.symbol_id.name(),
+                    snap.sequence_id,
+                    b_whole,
+                    b_frac,
+                    a_whole,
+                    a_frac,
+                    spread_t,
+                    snap.factor_ofi.get(),
+                    snap.factor_tfi.get(),
+                    snap.factor_geom.get(),
+                    verdict_str
+                );
+            }
+        }
+        slot_idx += 1;
+    }
+    println!("==========================================================================================");
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
+    let live_hud_mode = std::env::args().any(|a| a == "--live");
+    if live_hud_mode {
+        return print_live_shm_hud();
+    }
+
     let daemon_mode = std::env::args().any(|a| a == "--daemon");
     println!("================================================================================");
     println!("[VORTEX-EXEC V1.0] EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER (STAGE 5)");
@@ -173,15 +284,53 @@ fn main() -> ExitCode {
             Err(_) => return ExitCode::from(9),
         };
         let arena = region.arena();
+        let evaluator = OrthogonalFactorState::new();
+        let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
+        let mut ledger = ParitySyncLedger::new(10_000_000_000);
+        let mut active_slot: usize = 0;
+
         println!(
-            "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena ({}) with 0 ms warmup.",
+            "[DAEMON 25.0 Hz] Attached to MAP_SHARED arena ({}) in Shadow Execution Mode.",
             shm_path.display()
         );
+
         loop {
             thread::sleep(Duration::from_millis(40));
-            let _hb = arena.heartbeat_ns.load(Ordering::Acquire);
-            if let Ok(slot0) = arena.slot(0) {
-                let _ = slot0.read_snapshot(4);
+            let mut s = 0;
+            while s < APPROVED_SPECS.len() {
+                let spec = APPROVED_SPECS[s];
+                if let Ok(slot) = arena.slot(s) {
+                    if let Ok(snap) = slot.read_snapshot(4) {
+                        if let Ok(verdict) = evaluator.evaluate_entry_signal(&spec, &snap) {
+                            if let Ok(true) =
+                                fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
+                            {
+                                active_slot = s;
+                                let _ = fsm.on_entry_order_resting(snap.ts_local_ns);
+                                let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
+                                println!(
+                                    "[SHADOW ENTRY] Armed & filled Maker entry on {} (Seq: {}, OFI: {:+.2}, TFI: {:+.2})",
+                                    snap.symbol_id.name(),
+                                    snap.sequence_id,
+                                    snap.factor_ofi.get(),
+                                    snap.factor_tfi.get()
+                                );
+                            }
+                        }
+                        if s == active_slot {
+                            if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
+                                println!(
+                                    "[SHADOW CLOSE] {} {:?} | Net: {:+.2} bps | Total Trades: {}",
+                                    snap.symbol_id.name(),
+                                    summary.kind,
+                                    (summary.net_scaled_bps.raw() as f64) / 100.0,
+                                    ledger.closed_trades_count
+                                );
+                            }
+                        }
+                    }
+                }
+                s += 1;
             }
         }
     }
