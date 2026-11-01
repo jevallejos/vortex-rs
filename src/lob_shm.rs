@@ -13,8 +13,8 @@ pub const LOB_DEPTH: usize = 50;
 pub const MAX_ACTIVE_PAIRS: usize = 8;
 /// Magic header identifying a valid VORTEXL2 shared memory region ("VORTEXL2" in ASCII).
 pub const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C32;
-/// Schema version of the shared memory layout.
-pub const VORTEX_SHM_VERSION: u32 = 1;
+/// Schema version of the shared memory layout (v2 includes live FSM telemetry counters).
+pub const VORTEX_SHM_VERSION: u32 = 2;
 /// Canonical POSIX shared-memory path on Ubuntu Linux production nodes.
 pub const DEFAULT_LINUX_SHM_PATH: &str = "/dev/shm/vortex_lob.mmap";
 
@@ -91,7 +91,6 @@ impl SymbolLobSnapshot {
     }
 
     /// Applies a single L2 price-level update (`snapshot` or `delta`) in-place without heap allocation.
-    /// Bids are maintained sorted descending; Asks are maintained sorted ascending.
     #[inline]
     pub fn apply_level_update(&mut self, side: Side, price: PriceTicks, qty: LotQty) {
         if price.0 <= 0 {
@@ -102,7 +101,6 @@ impl SymbolLobSnapshot {
             Side::Ask => &mut self.asks,
         };
 
-        // 1. Check if price level already exists
         let mut existing_idx: Option<usize> = None;
         let mut i = 0;
         while i < LOB_DEPTH {
@@ -118,7 +116,6 @@ impl SymbolLobSnapshot {
 
         if let Some(idx) = existing_idx {
             if qty.0 <= 0 {
-                // Remove level by shifting remaining levels left
                 let mut k = idx;
                 while k + 1 < LOB_DEPTH {
                     levels[k] = levels[k + 1];
@@ -135,7 +132,6 @@ impl SymbolLobSnapshot {
             return;
         }
 
-        // 2. Find insertion index preserving sort order
         let mut ins_idx = LOB_DEPTH;
         let mut j = 0;
         while j < LOB_DEPTH {
@@ -248,6 +244,15 @@ pub struct VortexShmArena {
     pub version: u32,
     pub active_pairs: u32,
     pub heartbeat_ns: AtomicU64,
+    /// Live Execution FSM state code (0=Idle, 1=Placing, 2=RestingQueue, 3=PositionOpen, 4=SL, 5=Halted).
+    pub exec_state_code: AtomicU64,
+    pub exec_active_symbol: AtomicU64,
+    pub exec_entry_ticks: AtomicU64,
+    pub exec_queue_ahead_lots: AtomicU64,
+    pub exec_armed_count: AtomicU64,
+    pub exec_abort_count: AtomicU64,
+    pub exec_fill_count: AtomicU64,
+    pub exec_closed_count: AtomicU64,
     pub slots: [SeqlockSymbolSlot; MAX_ACTIVE_PAIRS],
 }
 
@@ -267,6 +272,14 @@ impl VortexShmArena {
             version: VORTEX_SHM_VERSION,
             active_pairs: MAX_ACTIVE_PAIRS as u32,
             heartbeat_ns: AtomicU64::new(0),
+            exec_state_code: AtomicU64::new(0),
+            exec_active_symbol: AtomicU64::new(0),
+            exec_entry_ticks: AtomicU64::new(0),
+            exec_queue_ahead_lots: AtomicU64::new(0),
+            exec_armed_count: AtomicU64::new(0),
+            exec_abort_count: AtomicU64::new(0),
+            exec_fill_count: AtomicU64::new(0),
+            exec_closed_count: AtomicU64::new(0),
             slots: [
                 SeqlockSymbolSlot::new(),
                 SeqlockSymbolSlot::new(),
@@ -359,7 +372,11 @@ impl MappedShmRegion {
             // SAFETY: `arena_ptr` points to a valid page-aligned `MAP_SHARED` region of `size` bytes.
             unsafe {
                 let current_magic = core::ptr::read_volatile(&(*arena_ptr).magic);
-                if initialize_writer || current_magic != VORTEX_SHM_MAGIC {
+                let current_version = core::ptr::read_volatile(&(*arena_ptr).version);
+                if initialize_writer
+                    || current_magic != VORTEX_SHM_MAGIC
+                    || current_version != VORTEX_SHM_VERSION
+                {
                     core::ptr::write(arena_ptr, VortexShmArena::new());
                 }
             }
@@ -419,7 +436,6 @@ mod tests {
         assert_eq!(snap.bids[1].price, PriceTicks(101));
         assert_eq!(snap.bids[2].price, PriceTicks(100));
 
-        // Remove middle bid level (qty = 0)
         snap.apply_level_update(Side::Bid, PriceTicks(101), LotQty(0));
         assert_eq!(snap.bids[0].price, PriceTicks(102));
         assert_eq!(snap.bids[1].price, PriceTicks(100));
@@ -428,7 +444,7 @@ mod tests {
 
     #[test]
     fn test_seqlock_roundtrip_and_bbo_spread() {
-        let shm_path = std::env::temp_dir().join("vortex_test_shm_region.mmap");
+        let shm_path = std::env::temp_dir().join("vortex_test_shm_region_v2.mmap");
         let region = MappedShmRegion::open_or_create(&shm_path, true);
         assert!(region.is_ok());
         if let Ok(reg) = region {

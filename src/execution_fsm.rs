@@ -1,6 +1,6 @@
 //! Exhaustive Finite-State Machine (`OrderLifecycleState`) for Bybit UTA V5 execution:
 //! 100% `Limit PostOnly` normal exits, geometric `MarkPrice` Stop-Loss protection,
-//! deterministic `110017` win reconciliation (zero false quarantine), and `110007` margin guard.
+//! BBO Runaway / TTL Queue Abort Guard, deterministic `110017` win reconciliation, and `110007` margin guard.
 
 use crate::alpha_3factor::SignalVerdict;
 use crate::forensic_parquet::ParitySyncLedger;
@@ -9,17 +9,17 @@ use crate::types::{LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, V
 
 /// Cooldown applied ONLY after a real server-side Stop-Loss trigger (60 seconds in nanoseconds).
 pub const STOP_LOSS_COOLDOWN_NS: i64 = 60_000_000_000;
+/// Maximum time a passive `Limit PostOnly` entry order may sit unfilled in the L1 queue (12 seconds).
+pub const MAX_RESTING_QUEUE_TTL_NS: i64 = 12_000_000_000;
+/// Maximum distance in ticks the BBO can run away from our resting entry order before cancellation.
+pub const MAX_BBO_RUNAWAY_TICKS: i64 = 3;
 
 /// Canonical Bybit UTA V5 return codes handled deterministically by the execution FSM.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BybitRetCode {
-    /// `retCode = 0`: Request accepted.
     OkZero,
-    /// `retCode = 10001`: Parameter or Stop-Loss MarkPrice geometry violation.
     SlGeometryError10001,
-    /// `retCode = 110007`: Insufficient available margin in UTA wallet.
     InsufficientMargin110007,
-    /// `retCode = 110017`: Order does not exist or position was already closed.
     OrderNotExistsOrAlreadyClosed110017,
 }
 
@@ -34,11 +34,8 @@ pub enum HaltReason {
 /// Classification of a completed trade for forensic and OOS attribution.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClosedTradeKind {
-    /// Passive `Limit PostOnly` Take-Profit at structural target (`35..80 bps`).
     MakerStructuralTp,
-    /// Passive `Limit PostOnly` BBO unwind when flow exhausts in profit.
     MakerPassiveUnwind,
-    /// Catastrophic server-side `MarkPrice` Stop-Loss (`Taker` fee + `1 tick` slippage).
     ServerMarkPriceStopLoss,
 }
 
@@ -117,7 +114,6 @@ impl Default for ExecutionFsm {
 }
 
 impl ExecutionFsm {
-    /// Creates a new Execution FSM with fixed notional (`1e8` scale) and daily drawdown limit.
     #[inline]
     #[must_use]
     pub const fn new(notional_per_trade_1e8: i64, max_daily_drawdown_1e8: i64) -> Self {
@@ -133,7 +129,6 @@ impl ExecutionFsm {
         }
     }
 
-    /// Evaluates transition from `Idle` to `PlacingEntryMaker` using a validated `SignalVerdict`.
     #[inline]
     pub fn try_arm_maker_entry(
         &mut self,
@@ -168,7 +163,6 @@ impl ExecutionFsm {
             Side::Ask => best_ask.price,
         };
 
-        // Structural Stop-Loss distance: 52.00 bps (scaled 5_200), minimum 4 ticks away
         let sl_distance_ticks = ((entry_price.0 * 5_200) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
@@ -194,7 +188,6 @@ impl ExecutionFsm {
         Ok(true)
     }
 
-    /// Confirms that the `Limit PostOnly` entry order is resting on the L1 queue without crossing.
     #[inline]
     pub fn on_entry_order_resting(&mut self, ts_ns: TimestampNs) -> bool {
         if let OrderLifecycleState::PlacingEntryMaker {
@@ -219,16 +212,37 @@ impl ExecutionFsm {
         false
     }
 
-    /// Aborts a resting entry order if executed trade flow (`X_TFI`) flips against the order before fill.
+    /// Aborts a resting entry order if:
+    /// 1. Executed trade flow (`X_TFI`) flips against the order, OR
+    /// 2. The order exceeds `MAX_RESTING_QUEUE_TTL_NS` (12s) without filling, OR
+    /// 3. The BBO runs away from `entry_price` by `>= MAX_BBO_RUNAWAY_TICKS` (3 ticks).
     #[inline]
     pub fn check_resting_queue_abort(&mut self, snap: &SymbolLobSnapshot) -> bool {
-        if let OrderLifecycleState::RestingEntryQueue { side, .. } = self.state {
+        if let OrderLifecycleState::RestingEntryQueue {
+            side,
+            entry_price,
+            resting_since_ts,
+            ..
+        } = self.state
+        {
             let tfi = snap.factor_tfi.get();
             let adverse_flip = match side {
                 Side::Bid => tfi <= -0.15,
                 Side::Ask => tfi >= 0.15,
             };
-            if adverse_flip {
+
+            let ttl_expired =
+                snap.ts_local_ns.0.saturating_sub(resting_since_ts.0) >= MAX_RESTING_QUEUE_TTL_NS;
+
+            let bbo_runaway = match snap.bbo_and_spread_ticks() {
+                Some((best_bid, best_ask, _)) => match side {
+                    Side::Bid => best_bid.price.0 - entry_price.0 >= MAX_BBO_RUNAWAY_TICKS,
+                    Side::Ask => entry_price.0 - best_ask.price.0 >= MAX_BBO_RUNAWAY_TICKS,
+                },
+                None => false,
+            };
+
+            if adverse_flip || ttl_expired || bbo_runaway {
                 self.state = OrderLifecycleState::Idle;
                 return true;
             }
@@ -236,7 +250,6 @@ impl ExecutionFsm {
         false
     }
 
-    /// Transitions from `RestingEntryQueue` to `PositionOpenMakerExit` upon passive L1 fill.
     #[inline]
     pub fn on_entry_filled_maker(&mut self, fill_ts_ns: TimestampNs) -> bool {
         if let OrderLifecycleState::RestingEntryQueue {
@@ -267,9 +280,6 @@ impl ExecutionFsm {
         false
     }
 
-    /// Evaluates open position against current L2 + `MarkPrice` state.
-    /// Executes 100% passive Maker exits (`MakerStructuralTp` or `MakerPassiveUnwind`)
-    /// or triggers catastrophic server-side `MarkPrice` Stop-Loss.
     #[inline]
     pub fn step_open_position(
         &mut self,
@@ -288,13 +298,18 @@ impl ExecutionFsm {
             _ => return None,
         };
 
+        let ref_trade_price = if snap.last_trade_price.0 > 0 {
+            snap.last_trade_price
+        } else {
+            snap.mark_price
+        };
+
         // 1. Check catastrophic server-side MarkPrice Stop-Loss first
         let sl_hit = match side {
             Side::Bid => snap.mark_price.0 <= sl_trigger_price.0,
             Side::Ask => snap.mark_price.0 >= sl_trigger_price.0,
         };
         if sl_hit {
-            // Apply 1 tick adverse Taker slippage on emergency SL
             let sl_fill_price = match side {
                 Side::Bid => PriceTicks((sl_trigger_price.0 - 1).max(1)),
                 Side::Ask => PriceTicks(sl_trigger_price.0 + 1),
@@ -318,8 +333,8 @@ impl ExecutionFsm {
 
         // 2. Check passive Limit PostOnly structural Take-Profit fill
         let tp_hit = match side {
-            Side::Bid => snap.last_trade_price.0 >= tp_maker_price.0,
-            Side::Ask => snap.last_trade_price.0 <= tp_maker_price.0,
+            Side::Bid => ref_trade_price.0 >= tp_maker_price.0,
+            Side::Ask => ref_trade_price.0 <= tp_maker_price.0,
         };
         if tp_hit {
             return Some(self.finalize_close(
@@ -338,7 +353,8 @@ impl ExecutionFsm {
                 Side::Bid => best_bid.price,
                 Side::Ask => best_ask.price,
             };
-            let current_gross_bps = Self::compute_gross_scaled_bps(side, entry_price, bbo_exit_price);
+            let current_gross_bps =
+                Self::compute_gross_scaled_bps(side, entry_price, bbo_exit_price);
             let flow_exhausted = match side {
                 Side::Bid => snap.factor_ofi.get() < -0.10 && snap.factor_tfi.get() < -0.10,
                 Side::Ask => snap.factor_ofi.get() > 0.10 && snap.factor_tfi.get() > 0.10,
@@ -358,8 +374,6 @@ impl ExecutionFsm {
         None
     }
 
-    /// Handles Bybit UTA V5 return codes deterministically, including `110017` without
-    /// penalizing winning trades with quarantine, and `110007` immediate margin halt.
     #[inline]
     pub fn on_exchange_retcode(
         &mut self,
@@ -451,13 +465,11 @@ impl ExecutionFsm {
         };
 
         let fee_scaled_bps = if is_maker_exit {
-            // Maker entry (2.00 bps) + Maker exit (2.00 bps) = 4.00 bps (400 ScaledBps)
             ScaledBps(
                 ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw()
                     + ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw(),
             )
         } else {
-            // Maker entry (2.00 bps) + Taker SL exit (5.50 bps) = 7.50 bps (750 ScaledBps)
             ScaledBps(
                 ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw()
                     + ScaledBps::BYBIT_VIP0_TAKER_FEE_BPS.raw(),
@@ -473,7 +485,6 @@ impl ExecutionFsm {
 
         if is_maker_exit {
             self.maker_exits_count += 1;
-            // Zero quarantine on winning Maker exits
             self.cooldown_until_ns = TimestampNs(0);
         } else {
             self.taker_sl_exits_count += 1;
@@ -507,7 +518,6 @@ impl ExecutionFsm {
         }
     }
 
-    /// Computes Net Profit Factor scaled by 100 (e.g., 241 = 2.41 Profit Factor).
     #[inline]
     #[must_use]
     pub const fn net_profit_factor_x100(&self) -> i64 {
@@ -517,7 +527,6 @@ impl ExecutionFsm {
         (self.gross_profit_accum_1e8 * 100) / self.gross_loss_accum_1e8
     }
 
-    /// Computes percentage of all closed trades exited passively as Maker (scaled by 100, e.g., 8230 = 82.30%).
     #[inline]
     #[must_use]
     pub const fn maker_exit_ratio_bps(&self) -> u64 {
@@ -533,7 +542,57 @@ impl ExecutionFsm {
 mod tests {
     use super::*;
     use crate::lob_shm::BookLevel;
-    use crate::types::SymbolId;
+    use crate::types::{BoundedScore, SymbolId};
+
+    #[test]
+    fn test_fsm_resting_queue_aborts_on_bbo_runaway_or_ttl() {
+        let spec = PairSpec {
+            symbol_id: SymbolId(6),
+            tick_size_1e8: 10_000,
+            lot_step_1e8: 100_000_000,
+            empirical_taker_exit_prob_pct: 20,
+        };
+        let mut fsm = ExecutionFsm::new(10_000_000_000, 1_500_000_000);
+        let mut snap = SymbolLobSnapshot {
+            symbol_id: SymbolId(6),
+            is_eligible: true,
+            sequence_id: 1,
+            ts_exchange_ns: TimestampNs(1_000_000_000),
+            ts_local_ns: TimestampNs(1_000_000_000),
+            mark_price: PriceTicks(9_000),
+            last_trade_price: PriceTicks(9_000),
+            realized_vol_5m: ScaledBps::from_whole_bps(60),
+            factor_ofi: BoundedScore::new_clamped(0.80),
+            factor_tfi: BoundedScore::new_clamped(0.90),
+            factor_geom: BoundedScore::new_clamped(0.30),
+            ..SymbolLobSnapshot::default()
+        };
+        snap.bids[0] = BookLevel {
+            price: PriceTicks(9_000),
+            qty: LotQty(5_000),
+        };
+        snap.asks[0] = BookLevel {
+            price: PriceTicks(9_001),
+            qty: LotQty(2_000),
+        };
+
+        let verdict = SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps::from_whole_bps(45),
+            estimated_cost_rt_scaled_bps: ScaledBps(517),
+        };
+        assert_eq!(
+            fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(100)),
+            Ok(true)
+        );
+        assert!(fsm.on_entry_order_resting(TimestampNs(1_000_000_000)));
+
+        // Price runs away by +3 ticks without filling our Bid at 9_000
+        snap.bids[0].price = PriceTicks(9_003);
+        snap.asks[0].price = PriceTicks(9_004);
+        assert!(fsm.check_resting_queue_abort(&snap));
+        assert_eq!(fsm.state, OrderLifecycleState::Idle);
+    }
 
     #[test]
     fn test_fsm_100pct_maker_lifecycle_and_zero_quarantine_on_win_110017() {
@@ -579,7 +638,6 @@ mod tests {
         assert!(fsm.on_entry_order_resting(TimestampNs(1_025_000_000)));
         assert!(fsm.on_entry_filled_maker(TimestampNs(1_050_000_000)));
 
-        // Simulate price reaching +42 bps (100_420 ticks) and Bybit returning 110017 on order check
         snap.last_trade_price = PriceTicks(100_420);
         snap.mark_price = PriceTicks(100_420);
         snap.ts_local_ns = TimestampNs(5_000_000_000);
@@ -593,9 +651,8 @@ mod tests {
         if let Some(summary) = closed {
             assert_eq!(summary.kind, ClosedTradeKind::MakerStructuralTp);
             assert!(summary.is_maker_exit);
-            assert_eq!(summary.net_scaled_bps, ScaledBps(3_800)); // +42.00 bps gross - 4.00 bps Maker fees = +38.00 bps
+            assert_eq!(summary.net_scaled_bps, ScaledBps(3_800));
         }
-        // Winning 110017 must NEVER trigger pair cooldown quarantine
         assert_eq!(fsm.cooldown_until_ns, TimestampNs(0));
         assert_eq!(fsm.state, OrderLifecycleState::Idle);
     }
@@ -644,7 +701,6 @@ mod tests {
         assert!(fsm.on_entry_order_resting(TimestampNs(2_025_000_000)));
         assert!(fsm.on_entry_filled_maker(TimestampNs(2_050_000_000)));
 
-        // Breach server-side MarkPrice Stop-Loss (99_480 ticks)
         snap.mark_price = PriceTicks(99_480);
         snap.last_trade_price = PriceTicks(99_480);
         snap.ts_local_ns = TimestampNs(10_000_000_000);
@@ -661,7 +717,6 @@ mod tests {
             TimestampNs(10_000_000_000 + STOP_LOSS_COOLDOWN_NS)
         );
 
-        // Verify retCode 110007 immediately halts the engine
         let _ = fsm.on_exchange_retcode(BybitRetCode::InsufficientMargin110007, &snap, &mut ledger);
         assert_eq!(
             fsm.state,

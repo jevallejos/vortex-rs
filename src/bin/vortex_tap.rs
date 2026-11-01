@@ -1,6 +1,6 @@
 //! Binary 1 (`vortex_tap`): Immortal L2 + publicTrade ingestion daemon,
 //! Bybit UTA V5 Live WebSocket client (`wss://stream.bybit.com/v5/public/linear`),
-//! Microeconomic Pair Eligibility Auditor, and Seqlock/PAR1 writer.
+//! Microeconomic Pair Eligibility Auditor, and Append-Only Seqlock/PAR1 writer.
 
 use core::sync::atomic::Ordering;
 use std::path::Path;
@@ -33,7 +33,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(780_997),
+        reference_mid_ticks: PriceTicks(780_386),
         realized_vol_5m: ScaledBps::from_whole_bps(42),
     },
     CandidateContract {
@@ -44,7 +44,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(226_776),
+        reference_mid_ticks: PriceTicks(226_722),
         realized_vol_5m: ScaledBps::from_whole_bps(46),
     },
     CandidateContract {
@@ -55,7 +55,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(9_474),
+        reference_mid_ticks: PriceTicks(9_469),
         realized_vol_5m: ScaledBps::from_whole_bps(58),
     },
     CandidateContract {
@@ -66,7 +66,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 10_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(8_749),
+        reference_mid_ticks: PriceTicks(8_730),
         realized_vol_5m: ScaledBps::from_whole_bps(54),
     },
     CandidateContract {
@@ -77,7 +77,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 1_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(23_524),
+        reference_mid_ticks: PriceTicks(23_483),
         realized_vol_5m: ScaledBps::from_whole_bps(68),
     },
     CandidateContract {
@@ -88,7 +88,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
         },
-        reference_mid_ticks: PriceTicks(9_012),
+        reference_mid_ticks: PriceTicks(8_995),
         realized_vol_5m: ScaledBps::from_whole_bps(62),
     },
     CandidateContract {
@@ -142,6 +142,29 @@ fn find_slot_by_name(name: &str, approved_count: usize) -> Option<(usize, PairSp
         idx += 1;
     }
     None
+}
+
+/// Scans `data/` to find the highest existing `vortex_l2_segment_XXXXXX.parquet` sequence number
+/// so restarts append monotonically without overwriting historical segments.
+fn discover_max_parquet_seq() -> u64 {
+    let data_dir = Path::new("data");
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut max_seq: u64 = 0;
+    for entry in entries.flatten() {
+        if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+            if let Some(num_str) = stem.strip_prefix("vortex_l2_segment_") {
+                if let Ok(n) = num_str.parse::<u64>() {
+                    if n > max_seq {
+                        max_seq = n;
+                    }
+                }
+            }
+        }
+    }
+    max_seq
 }
 
 fn process_bybit_ws_frame(
@@ -347,7 +370,6 @@ fn run_live_bybit_ws_loop(
     active_snaps: &mut [SymbolLobSnapshot; MAX_ACTIVE_PAIRS],
     batch: &mut ColumnarParquetBatch,
 ) -> ! {
-    // Wipe any synthetic audit accumulators before connecting to live exchange stream
     let mut s = 0;
     while s < approved_slots {
         factor_states[s].reset();
@@ -359,7 +381,11 @@ fn run_live_bybit_ws_loop(
     }
 
     let subscribe_payload = r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","publicTrade.BTCUSDT","orderbook.50.ETHUSDT","publicTrade.ETHUSDT","orderbook.50.SOLUSDT","publicTrade.SOLUSDT","orderbook.50.AVAXUSDT","publicTrade.AVAXUSDT","orderbook.50.TAOUSDT","publicTrade.TAOUSDT","orderbook.50.SUIUSDT","publicTrade.SUIUSDT"]}"#;
-    let mut parquet_seq: u64 = 0;
+    let mut parquet_seq: u64 = discover_max_parquet_seq();
+    println!(
+        "[PAR1 APPEND-ONLY] Resuming columnar segment sequence from #{:06}",
+        parquet_seq + 1
+    );
 
     loop {
         println!(

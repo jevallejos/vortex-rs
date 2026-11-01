@@ -214,7 +214,8 @@ fn print_live_shm_hud() -> ExitCode {
 
     println!("==========================================================================================");
     println!(
-        "[VORTEX LIVE HUD] SHM: {} | Heartbeat Age: {} ms",
+        "[VORTEX LIVE HUD] SHM v{}: {} | Heartbeat Age: {} ms",
+        arena.version,
         shm_path.display(),
         age_ms
     );
@@ -263,6 +264,37 @@ fn print_live_shm_hud() -> ExitCode {
         }
         slot_idx += 1;
     }
+
+    let state_code = arena.exec_state_code.load(Ordering::Acquire);
+    let active_sym = SymbolId(arena.exec_active_symbol.load(Ordering::Acquire) as u16);
+    let entry_ticks = arena.exec_entry_ticks.load(Ordering::Acquire);
+    let q_ahead = arena.exec_queue_ahead_lots.load(Ordering::Acquire);
+    let armed = arena.exec_armed_count.load(Ordering::Acquire);
+    let aborts = arena.exec_abort_count.load(Ordering::Acquire);
+    let fills = arena.exec_fill_count.load(Ordering::Acquire);
+    let closed = arena.exec_closed_count.load(Ordering::Acquire);
+
+    let state_label = match state_code {
+        0 => "IDLE (SCANNING)",
+        1 => "PLACING_MAKER",
+        2 => "RESTING_L1_QUEUE",
+        3 => "POSITION_OPEN_MAKER_TP",
+        4 => "EMERGENCY_SL",
+        _ => "HALTED_GUARD",
+    };
+
+    println!("------------------------------------------------------------------------------------------");
+    println!(
+        "[EXEC FSM LIVE] State: {} | Sym: {} @ {}t (Queue: {} lots) | Armed: {} | Aborts: {} | Fills: {} | Closed: {}",
+        state_label,
+        if state_code == 0 { "-" } else { active_sym.name() },
+        entry_ticks,
+        q_ahead,
+        armed,
+        aborts,
+        fills,
+        closed
+    );
     println!("==========================================================================================");
     ExitCode::SUCCESS
 }
@@ -291,6 +323,8 @@ fn run_shadow_execution_daemon() -> ExitCode {
 
         match fsm.state {
             OrderLifecycleState::Idle => {
+                arena.exec_state_code.store(0, Ordering::Release);
+                arena.exec_queue_ahead_lots.store(0, Ordering::Release);
                 let mut s = 0;
                 while s < APPROVED_SPECS.len() {
                     let spec = APPROVED_SPECS[s];
@@ -302,8 +336,11 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                 {
                                     active_slot = s;
                                     let _ = fsm.on_entry_order_resting(snap.ts_local_ns);
-                                    if let OrderLifecycleState::RestingEntryQueue { side, .. } =
-                                        fsm.state
+                                    if let OrderLifecycleState::RestingEntryQueue {
+                                        side,
+                                        entry_price,
+                                        ..
+                                    } = fsm.state
                                     {
                                         let init_q = match side {
                                             Side::Bid => snap.bids[0].qty,
@@ -311,6 +348,21 @@ fn run_shadow_execution_daemon() -> ExitCode {
                                         };
                                         resting_queue_ahead = init_q;
                                         prev_l1_qty = init_q;
+                                        arena.exec_state_code.store(2, Ordering::Release);
+                                        arena.exec_active_symbol.store(
+                                            u64::from(snap.symbol_id.0),
+                                            Ordering::Release,
+                                        );
+                                        arena.exec_entry_ticks.store(
+                                            entry_price.0 as u64,
+                                            Ordering::Release,
+                                        );
+                                        arena.exec_queue_ahead_lots.store(
+                                            resting_queue_ahead.0 as u64,
+                                            Ordering::Release,
+                                        );
+                                        arena.exec_armed_count.fetch_add(1, Ordering::Release);
+
                                         println!(
                                             "[SHADOW QUEUE ARMED] {} {:?} resting at L1 (Queue ahead: {} lots | Seq: {} | OFI: {:+.2} | TFI: {:+.2})",
                                             snap.symbol_id.name(),
@@ -335,22 +387,26 @@ fn run_shadow_execution_daemon() -> ExitCode {
             } => {
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(snap) = slot.read_snapshot(4) {
-                        // 1. Check if trade flow flipped against our resting order before fill
                         if fsm.check_resting_queue_abort(&snap) {
+                            arena.exec_abort_count.fetch_add(1, Ordering::Release);
+                            arena.exec_state_code.store(0, Ordering::Release);
+                            arena.exec_queue_ahead_lots.store(0, Ordering::Release);
                             println!(
-                                "[SHADOW QUEUE ABORT] {} {:?} canceled before fill due to adverse TFI flip ({:+.2})",
+                                "[SHADOW QUEUE ABORT] {} {:?} canceled before fill (TFI: {:+.2} | BestBid: {} | Entry: {})",
                                 snap.symbol_id.name(),
                                 side,
-                                snap.factor_tfi.get()
+                                snap.factor_tfi.get(),
+                                snap.bids[0].price.0,
+                                entry_price.0
                             );
                             continue;
                         }
 
-                        // 2. Update FIFO queue ahead via trade-through or conservative 25% L1 depletion
                         let traded_through = match side {
                             Side::Bid => {
                                 snap.asks[0].price.0 <= entry_price.0
-                                    || snap.last_trade_price.0 < entry_price.0
+                                    || (snap.last_trade_price.0 > 0
+                                        && snap.last_trade_price.0 < entry_price.0)
                             }
                             Side::Ask => {
                                 snap.bids[0].price.0 >= entry_price.0
@@ -367,11 +423,18 @@ fn run_shadow_execution_daemon() -> ExitCode {
                             let drop = prev_l1_qty.0 - cur_l1_qty;
                             resting_queue_ahead =
                                 LotQty((resting_queue_ahead.0 - (drop / 4).max(1)).max(0));
+                            arena.exec_queue_ahead_lots.store(
+                                resting_queue_ahead.0 as u64,
+                                Ordering::Release,
+                            );
                         }
                         prev_l1_qty = LotQty(cur_l1_qty);
 
                         if traded_through || resting_queue_ahead.0 == 0 {
                             let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
+                            arena.exec_fill_count.fetch_add(1, Ordering::Release);
+                            arena.exec_state_code.store(3, Ordering::Release);
+                            arena.exec_queue_ahead_lots.store(0, Ordering::Release);
                             println!(
                                 "[SHADOW MAKER FILL] {} {:?} filled passively at {} ticks (Seq: {})",
                                 snap.symbol_id.name(),
@@ -388,6 +451,8 @@ fn run_shadow_execution_daemon() -> ExitCode {
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(snap) = slot.read_snapshot(4) {
                         if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
+                            arena.exec_closed_count.fetch_add(1, Ordering::Release);
+                            arena.exec_state_code.store(0, Ordering::Release);
                             append_shadow_trade_jsonl(
                                 snap.symbol_id.name(),
                                 &summary,
@@ -411,7 +476,9 @@ fn run_shadow_execution_daemon() -> ExitCode {
             }
 
             OrderLifecycleState::EmergencyStopTriggered { .. }
-            | OrderLifecycleState::HaltedByRiskGuard { .. } => {}
+            | OrderLifecycleState::HaltedByRiskGuard { .. } => {
+                arena.exec_state_code.store(5, Ordering::Release);
+            }
         }
     }
 }
