@@ -488,7 +488,7 @@ impl BybitV5LiveClient {
                         };
                     }
                 }
-                let peg_price = if attempt < 3 {
+                let peg_price = if summary.gross_scaled_bps.raw() >= 600 && attempt < 5 {
                     ExecutionFsm::clamp_maker_exit_to_profit_floor(
                         open_side,
                         entry_price,
@@ -1153,8 +1153,21 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         ANSI_RESET
     );
 
+    let mut last_price_seq = [0_u64; 6];
     loop {
         thread::sleep(Duration::from_millis(5));
+        let mut p_slot = 0;
+        while p_slot < APPROVED_SPECS.len() {
+            if let Ok(sl_ref) = arena.slot(p_slot) {
+                if let Ok(p_snap) = sl_ref.read_snapshot(2) {
+                    if p_snap.sequence_id != last_price_seq[p_slot] {
+                        last_price_seq[p_slot] = p_snap.sequence_id;
+                        adaptive_gov.observe_market_price(p_slot, &p_snap);
+                    }
+                }
+            }
+            p_slot += 1;
+        }
 
         match fsm.state {
             OrderLifecycleState::Idle => {
@@ -1176,7 +1189,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 continue;
                             }
                             last_seen_seq[s] = snap.sequence_id;
-                            adaptive_gov.observe_market_price(s, &snap);
 
                             if snap.ts_local_ns.0 < slot_cooldown_until_ns[s] {
                                 s += 1;
@@ -1469,6 +1481,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let spec = APPROVED_SPECS[active_slot];
                             let default_clamped_px = if !summary.is_maker_exit {
                                 summary.exit_price
+                            } else if summary.gross_scaled_bps.raw() >= 600 {
+                                ExecutionFsm::clamp_maker_exit_to_profit_floor(
+                                    summary.side,
+                                    summary.entry_price,
+                                    summary.exit_price,
+                                )
                             } else {
                                 ExecutionFsm::clamp_defensive_zero_loss_floor(
                                     summary.side,

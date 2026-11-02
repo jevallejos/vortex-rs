@@ -640,7 +640,7 @@ impl ExecutionFsm {
             };
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= 15_000_000_000
-                && current_gross_bps.raw() >= 440
+                && current_gross_bps.raw() >= 600
                 && joint_adverse;
             let struggling_rescue = !in_trend_free_ride_zone
                 && hold_elapsed >= 45_000_000_000
@@ -1151,23 +1151,22 @@ impl OnlineAdaptiveGovernor {
 
         match side {
             Side::Bid => {
-                if self_drift_bps < -350 || self_ext_bps > 2_200 {
+                if self_drift_bps < -120 || self_ext_bps > 1_800 {
                     return false;
                 }
-                if slot_idx > 0 && btc_drift_bps < -300 {
+                if slot_idx > 0 && (self_drift_bps < -45 || btc_drift_bps < -25) {
                     return false;
                 }
             }
             Side::Ask => {
-                if self_drift_bps > 350 || self_ext_bps < -2_200 {
+                if self_drift_bps > 120 || self_ext_bps < -1_800 {
                     return false;
                 }
-                if slot_idx > 0 && btc_drift_bps > 300 {
+                if slot_idx > 0 && (self_drift_bps > 45 || btc_drift_bps > 25) {
                     return false;
                 }
             }
         }
-
         let cand_comp = (0.45 * candidate_snap.factor_ofi.get()
             + 0.35 * candidate_snap.factor_tfi.get()
             + 0.20 * candidate_snap.factor_geom.get())

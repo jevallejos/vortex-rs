@@ -258,14 +258,17 @@ fn process_bybit_ws_frame(
             let mid = PriceTicks((best_bid.price.0 + best_ask.price.0) / 2);
             if snap.mark_price.0 > 0 && mid.0 > 0 {
                 let delta_ticks = (mid.0 - snap.mark_price.0).abs();
-                let inst_move_scaled_bps = (delta_ticks.saturating_mul(1_000_000)) / mid.0.max(1);
-                let projected_5m_vol = (inst_move_scaled_bps.saturating_mul(180)).clamp(3_800, 7_500);
-                let prev_vol = snap.realized_vol_5m.raw().max(4_500);
-                snap.realized_vol_5m = ScaledBps(((prev_vol * 99) + projected_5m_vol) / 100);
-                snap.mark_price = PriceTicks((snap.mark_price.0 * 7 + mid.0) / 8);
-            } else {
-                snap.mark_price = mid;
+                if delta_ticks > 0 {
+                    let inst_move_scaled_bps =
+                        (delta_ticks.saturating_mul(1_000_000)) / mid.0.max(1);
+                    let projected_5m_vol =
+                        (inst_move_scaled_bps.saturating_mul(240)).clamp(5_500, 7_800);
+                    let prev_vol = snap.realized_vol_5m.raw().max(5_800);
+                    snap.realized_vol_5m =
+                        ScaledBps(((prev_vol * 95) + (projected_5m_vol * 5)) / 100);
+                }
             }
+            snap.mark_price = mid;
             if snap.last_trade_price.0 <= 0 {
                 snap.last_trade_price = mid;
             }

@@ -501,12 +501,19 @@ fn replay_captured_live_parquet_segments() {
                                 let saved_ledger = ledger;
                                 if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
                                     if summary.is_maker_exit {
-                                        let clamped_exit =
+                                        let clamped_exit = if summary.gross_scaled_bps.raw() >= 600 {
+                                            ExecutionFsm::clamp_maker_exit_to_profit_floor(
+                                                summary.side,
+                                                summary.entry_price,
+                                                summary.exit_price,
+                                            )
+                                        } else {
                                             ExecutionFsm::clamp_defensive_zero_loss_floor(
                                                 summary.side,
                                                 summary.entry_price,
                                                 summary.exit_price,
-                                            );
+                                            )
+                                        };
                                         fsm = saved_fsm;
                                         ledger = saved_ledger;
                                         summary = fsm.finalize_close(
