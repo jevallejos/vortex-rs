@@ -66,7 +66,7 @@ EOF
 
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Stage 26/27 Live Capital)
+Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Stage 31.1 Live Capital)
 After=vortex-tap.service
 Requires=vortex-tap.service
 

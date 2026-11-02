@@ -58,7 +58,7 @@ vortex all
 ## 3. Comandos de Desarrollo y Certificacion en Windows (`PS D:\Desarrollo\vortex-rs>`)
 
 ```powershell
-# 1. Ejecutar la suite completa de pruebas unitarias y de integracion (16/16 tests + Gate OOS de 520 trades)
+# 1. Ejecutar la suite completa de pruebas unitarias y de integracion (17/17 tests + Gate OOS de 520 trades)
 cargo test -- --nocapture
 
 # 2. Ejecutar el linter estatico estricto (Cero warnings, cero .unwrap(), cero .expect(), cero panic!)

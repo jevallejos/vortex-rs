@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
-use vortex_rs::execution_fsm::{ExecutionFsm, OrderLifecycleState};
+use vortex_rs::execution_fsm::{ExecutionFsm, OnlineAdaptiveGovernor, OrderLifecycleState};
 use vortex_rs::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind, ParitySyncLedger};
 use vortex_rs::lob_shm::{BookLevel, SymbolLobSnapshot};
 use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
@@ -275,7 +275,6 @@ fn replay_captured_live_parquet_segments() {
         Ok(e) => e,
         Err(_) => return,
     };
-
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let p = entry.path();
@@ -284,17 +283,19 @@ fn replay_captured_live_parquet_segments() {
         }
     }
     paths.sort();
-
     if paths.is_empty() {
         return;
     }
 
     let evaluator = OrthogonalFactorState::new();
+    let mut adaptive_gov = OnlineAdaptiveGovernor::new();
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
     let mut ledger = ParitySyncLedger::new(10_000_000_000);
     let mut fifo_sim = FifoQueueSimulator::new();
+    let mut btc_leader_snap = SymbolLobSnapshot::default();
+    let mut slot_cooldown_until_ns = [0_i64; 6];
     let mut active_sym = SymbolId(0);
-
+    let mut active_slot: usize = 0;
     let mut verified_files: u64 = 0;
     let mut total_live_rows: usize = 0;
     let mut total_l2_events: u64 = 0;
@@ -309,7 +310,6 @@ fn replay_captured_live_parquet_segments() {
         if let Ok(batch) = ColumnarParquetBatch::read_from_file(path) {
             verified_files += 1;
             total_live_rows += batch.len();
-
             let mut idx = 0;
             while idx < batch.len() {
                 if let Some(row) = batch.row_at(idx) {
@@ -317,8 +317,7 @@ fn replay_captured_live_parquet_segments() {
                         MarketEventKind::L2BookSnapshot => total_l2_events += 1,
                         MarketEventKind::PublicTradePrint => total_trade_prints += 1,
                     }
-
-                    if let Some((_, spec)) = spec_for_symbol(row.symbol_id) {
+                    if let Some((slot_idx, spec)) = spec_for_symbol(row.symbol_id) {
                         let mut snap = SymbolLobSnapshot {
                             symbol_id: row.symbol_id,
                             is_eligible: true,
@@ -341,31 +340,48 @@ fn replay_captured_live_parquet_segments() {
                             price: row.best_ask_ticks,
                             qty: row.best_ask_qty,
                         };
+                        if slot_idx == 0 {
+                            btc_leader_snap = snap;
+                        }
 
                         match fsm.state {
                             OrderLifecycleState::Idle => {
+                                if snap.ts_local_ns.0 < slot_cooldown_until_ns[slot_idx] {
+                                    idx += 1;
+                                    continue;
+                                }
                                 if let Ok(verdict) = evaluator.evaluate_entry_signal(&spec, &snap) {
                                     if matches!(verdict, SignalVerdict::SpoofingVeto) {
                                         spoof_vetoes += 1;
-                                    } else if let Ok(true) =
-                                        fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
-                                    {
-                                        if let OrderLifecycleState::PlacingEntryMaker {
+                                    } else if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
+                                        if adaptive_gov.authorizes_adaptive_entry(
+                                            slot_idx,
                                             side,
-                                            entry_price,
-                                            qty,
-                                            ..
-                                        } = fsm.state
-                                        {
-                                            active_sym = row.symbol_id;
-                                            signals_armed += 1;
-                                            fifo_sim.submit_post_only(
-                                                side,
-                                                entry_price,
-                                                qty,
-                                                row.ts_local_ns,
-                                            );
-                                            let _ = fsm.on_entry_order_resting(row.ts_local_ns);
+                                            &snap,
+                                            &btc_leader_snap,
+                                        ) {
+                                            if let Ok(true) =
+                                                fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
+                                            {
+                                                if let OrderLifecycleState::PlacingEntryMaker {
+                                                    side: s_arm,
+                                                    entry_price,
+                                                    qty,
+                                                    ..
+                                                } = fsm.state
+                                                {
+                                                    active_sym = row.symbol_id;
+                                                    active_slot = slot_idx;
+                                                    signals_armed += 1;
+                                                    fifo_sim.submit_post_only(
+                                                        s_arm,
+                                                        entry_price,
+                                                        qty,
+                                                        row.ts_local_ns,
+                                                    );
+                                                    let _ = fsm.on_entry_order_resting(row.ts_local_ns);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -375,13 +391,12 @@ fn replay_captured_live_parquet_segments() {
                             {
                                 if fsm.check_resting_queue_abort(&snap) {
                                     queue_aborts += 1;
+                                    slot_cooldown_until_ns[active_slot] =
+                                        snap.ts_local_ns.0 + 15_000_000_000;
                                     fifo_sim.state = SimulatedOrderState::Inactive;
                                 } else {
                                     fifo_sim.on_market_row(&row);
-                                    if matches!(
-                                        fifo_sim.state,
-                                        SimulatedOrderState::FilledMaker { .. }
-                                    ) {
+                                    if matches!(fifo_sim.state, SimulatedOrderState::FilledMaker { .. }) {
                                         let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
                                     } else if matches!(
                                         fifo_sim.state,
@@ -395,13 +410,40 @@ fn replay_captured_live_parquet_segments() {
                             OrderLifecycleState::PositionOpenMakerExit { .. }
                                 if row.symbol_id == active_sym =>
                             {
-                                if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
+                                let saved_fsm = fsm;
+                                let saved_ledger = ledger;
+                                if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
+                                    if summary.is_maker_exit {
+                                        let clamped_exit =
+                                            ExecutionFsm::clamp_defensive_zero_loss_floor(
+                                                summary.side,
+                                                summary.entry_price,
+                                                summary.exit_price,
+                                            );
+                                        fsm = saved_fsm;
+                                        ledger = saved_ledger;
+                                        summary = fsm.finalize_close(
+                                            summary.kind,
+                                            summary.side,
+                                            summary.entry_price,
+                                            clamped_exit,
+                                            snap.ts_local_ns,
+                                            &mut ledger,
+                                        );
+                                    }
+                                    adaptive_gov.observe_closed_trade(
+                                        active_slot,
+                                        summary.side,
+                                        summary.net_scaled_bps,
+                                        summary.is_maker_exit,
+                                        snap.ts_local_ns,
+                                    );
+                                    slot_cooldown_until_ns[active_slot] =
+                                        snap.ts_local_ns.0 + 15_000_000_000;
                                     fifo_sim.state = SimulatedOrderState::Inactive;
                                     net_bps_accum += summary.net_scaled_bps.raw();
-                                    let (en_w, en_f) =
-                                        spec.format_price_usdt_parts(summary.entry_price);
-                                    let (ex_w, ex_f) =
-                                        spec.format_price_usdt_parts(summary.exit_price);
+                                    let (en_w, en_f) = spec.format_price_usdt_parts(summary.entry_price);
+                                    let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
                                     let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
                                     let (col, icon, badge) = if net_bps >= 0.20 {
                                         ("\x1b[1;32m", "🟢", "WIN")
@@ -412,19 +454,9 @@ fn replay_captured_live_parquet_segments() {
                                     };
                                     println!(
                                         "  {}{} [REAL PAR1 TRADE #{:<2} {:<7}] {:<8} {:<3} {:?} | {}.{:04} -> {}.{:04} USDT | Net: {:+.2} bps (Maker={})\x1b[0m",
-                                        col,
-                                        icon,
-                                        ledger.closed_trades_count,
-                                        badge,
-                                        row.symbol_id.name(),
-                                        format!("{:?}", summary.side),
-                                        summary.kind,
-                                        en_w,
-                                        en_f,
-                                        ex_w,
-                                        ex_f,
-                                        net_bps,
-                                        summary.is_maker_exit
+                                        col, icon, ledger.closed_trades_count, badge,
+                                        row.symbol_id.name(), format!("{:?}", summary.side),
+                                        summary.kind, en_w, en_f, ex_w, ex_f, net_bps, summary.is_maker_exit
                                     );
                                 }
                             }
@@ -436,23 +468,16 @@ fn replay_captured_live_parquet_segments() {
             }
         }
     }
-
     let pf_x100 = fsm.net_profit_factor_x100();
     let maker_ratio_bps = fsm.maker_exit_ratio_bps();
-
     println!(
         "  -> Live PAR1 Archives Verified: {} files | {} total events ({} L2 / {} Trades)",
         verified_files, total_live_rows, total_l2_events, total_trade_prints
     );
     println!(
         "  -> Live Walk-Forward Replay   : 🟠SpoofVetoes={} | 🟡Armed={} | 🟠QueueAborts={} | 🟡Fills={} | 🟢Closed={}",
-        spoof_vetoes,
-        signals_armed,
-        queue_aborts,
-        fifo_sim.total_maker_fills,
-        ledger.closed_trades_count
+        spoof_vetoes, signals_armed, queue_aborts, fifo_sim.total_maker_fills, ledger.closed_trades_count
     );
-
     let net_total_bps = (net_bps_accum as f64) / 100.0;
     let (sum_col, sum_icon) = if net_total_bps >= 0.20 {
         ("\x1b[1;32m", "🟢")
@@ -463,17 +488,10 @@ fn replay_captured_live_parquet_segments() {
     };
     println!(
         "  {}{} -> Live Walk-Forward PnL      : Net={:+.2} bps | MakerExit={}.{:02}% | PF={}.{:02} | FeesPaid={:.4} USDT\x1b[0m",
-        sum_col,
-        sum_icon,
-        net_total_bps,
-        maker_ratio_bps / 100,
-        maker_ratio_bps % 100,
-        pf_x100 / 100,
-        pf_x100 % 100,
-        (ledger.cumulative_fees_1e8 as f64) / 100_000_000.0
+        sum_col, sum_icon, net_total_bps, maker_ratio_bps / 100, maker_ratio_bps % 100,
+        pf_x100 / 100, pf_x100 % 100, (ledger.cumulative_fees_1e8 as f64) / 100_000_000.0
     );
 }
-
 fn main() -> ExitCode {
     println!("================================================================================");
     println!("[VORTEX-REPLAY V1.0] DETERMINISTIC L1 FIFO QUEUE & LATENCY SIMULATOR (STAGE 4)");

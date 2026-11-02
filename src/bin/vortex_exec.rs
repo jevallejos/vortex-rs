@@ -93,14 +93,17 @@ fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static str
 }
 
 #[inline]
-const fn compute_optimal_50usdt_wallet_qty_str(symbol_id: SymbolId) -> &'static str {
+const fn compute_optimal_50usdt_wallet_qty_str(
+    symbol_id: SymbolId,
+    in_scar_debt: bool,
+) -> &'static str {
     match symbol_id.0 {
         1 => "0.001",
         2 => "0.01",
-        3 => "0.2",
-        4 => "2.6",
-        5 => "0.1",
-        6 => "25",
+        3 => if in_scar_debt { "0.1" } else { "0.2" },
+        4 => if in_scar_debt { "1.4" } else { "2.6" },
+        5 => if in_scar_debt { "0.05" } else { "0.1" },
+        6 => if in_scar_debt { "14" } else { "25" },
         _ => "1",
     }
 }
@@ -357,12 +360,13 @@ impl BybitV5LiveClient {
     fn place_post_only_entry(
         &self,
         spec: &PairSpec,
-        symbol: &str,
         side: Side,
         entry_price: PriceTicks,
         sl_price: PriceTicks,
+        in_scar_debt: bool,
+        gov_diag: (i64, u32, u32),
     ) -> bool {
-        // GLOBAL ACCOUNT SINGLE-POSITION LOCK: never send a new entry if ANY position is open across the entire USDT account!
+        let symbol = spec.symbol_id.name();
         if let Some((open_sym, existing_qty, open_side, _)) = self.get_any_account_open_position() {
             println!(
                 "{}🟠 [BYBIT V5 GLOBAL ACCOUNT LOCK] Account already holds open position on {} ({} size={}) — blocking new entry on {}{}",
@@ -370,19 +374,17 @@ impl BybitV5LiveClient {
             );
             return false;
         }
-
         let (ew, ef) = spec.format_price_usdt_parts(entry_price);
         let (sw, sf) = spec.format_price_usdt_parts(sl_price);
         let bybit_side = match side {
             Side::Bid => "Buy",
             Side::Ask => "Sell",
         };
-        let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id);
+        let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, in_scar_debt);
         let body = format!(
             "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",\"price\":\"{}.{:04}\",\"stopLoss\":\"{}.{:04}\",\"slTriggerBy\":\"MarkPrice\",\"positionIdx\":0}}",
             symbol, bybit_side, qty_str, ew, ef, sw, sf
         );
-
         match self.post_v5("/v5/order/create", &body) {
             Some(resp) => {
                 let ret_code = resp.get("retCode").and_then(serde_json::Value::as_i64).unwrap_or(-1);
@@ -392,8 +394,9 @@ impl BybitV5LiveClient {
                     .unwrap_or("unknown");
                 if ret_code == 0 {
                     println!(
-                        "{}🟡 [BYBIT V5 LIVE ORDER SENT] {} {} qty={} @ {}.{:04} USDT (SL: {}.{:04}){}",
-                        ANSI_YELLOW, symbol, bybit_side, qty_str, ew, ef, sw, sf, ANSI_RESET
+                        "{}🟡 [BYBIT V5 LIVE ORDER SENT] {} {} qty={} @ {}.{:04} USDT (SL: {}.{:04} | EWMA: {:+.2} bps | W:{} / SL:{}){}",
+                        ANSI_YELLOW, symbol, bybit_side, qty_str, ew, ef, sw, sf,
+                        (gov_diag.0 as f64) / 100.0, gov_diag.2, gov_diag.1, ANSI_RESET
                     );
                     true
                 } else {
@@ -407,7 +410,6 @@ impl BybitV5LiveClient {
             None => false,
         }
     }
-
     /// Executes a verified close on Bybit WITHOUT abandoning the position:
     /// - Preserves FIFO queue priority by only re-pegging the `Limit PostOnly reduceOnly` order when the BBO price changes.
     /// - Returns `true` ONLY when Bybit confirms `0.00` open position size.
@@ -699,8 +701,7 @@ fn rehydrate_shadow_ledger(
                 .get("maker_exit")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
-            let en_ticks = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            if (is_maker && net_bps < 0.0) || (!is_maker && en_ticks == 8888) {
+            if (is_maker && net_bps < 0.0) || false {
                 purged_count += 1;
                 continue;
             }
@@ -1294,12 +1295,27 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
                                 {
                                     active_slot = s;
-                                    arena.exec_state_code.store(1, Ordering::Release);
+                                    if let OrderLifecycleState::PlacingEntryMaker {
+                                        side: arm_side,
+                                        entry_price: arm_entry,
+                                        sl_trigger_price: arm_sl,
+                                        submitted_ts: arm_ts,
+                                        ..
+                                    } = fsm.state
+                                    {
+                                        arena.exec_side.store(arm_side as u64, Ordering::Release);
+                                        arena.exec_entry_ticks.store(arm_entry.0 as u64, Ordering::Release);
+                                        arena.exec_peak_ticks.store(arm_entry.0 as u64, Ordering::Release);
+                                        arena.exec_tp_ticks.store(0, Ordering::Release);
+                                        arena.exec_sl_ticks.store(arm_sl.0 as u64, Ordering::Release);
+                                        arena.exec_resting_since_ns.store(arm_ts.0 as u64, Ordering::Release);
+                                    }
                                     arena.exec_active_slot.store(s as u64, Ordering::Release);
                                     arena.exec_active_symbol.store(
                                         u64::from(snap.symbol_id.0),
                                         Ordering::Release,
                                     );
+                                    arena.exec_state_code.store(1, Ordering::Release);
                                     break;
                                 }
                             }
@@ -1504,7 +1520,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             );
 
                             if let Some(ref tx) = tg_tx {
-                                let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id);
+                                let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, false);
                                 let alert = format!(
                                     "🟡 [VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?}) | Qty: {}\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT (Dynamic 70% MFE Ratchet)\nServer SL: {}.{:04} USDT (-0.520% | -5.20% @ 10x)",
                                     snap.symbol_id.name(),
@@ -1633,7 +1649,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 * 10_000.0;
                             let cum_pct_1x = cum_bps / 100.0;
                             let cum_pct_10x = cum_bps / 10.0;
-                            let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id);
+                            let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, false);
                             let (c_col, c_icon, c_badge) = classify_pnl_badge(net_bps);
 
                             println!(
@@ -1725,12 +1741,15 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         }
 
                         if let Some(ref client) = live_client {
+                            let in_debt = adaptive_gov.is_in_scar_debt(active_slot, side);
+                            let gov_diag = adaptive_gov.slot_direction_diagnostics(active_slot, side);
                             if !client.place_post_only_entry(
                                 &spec,
-                                snap.symbol_id.name(),
                                 side,
                                 entry_price,
                                 sl_trigger_price,
+                                in_debt,
+                                gov_diag,
                             ) {
                                 fsm.state = OrderLifecycleState::Idle;
                                 slot_cooldown_until_ns[active_slot] =
