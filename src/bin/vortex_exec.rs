@@ -83,35 +83,26 @@ fn now_epoch_ns() -> i64 {
 
 #[inline]
 fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static str) {
-    if net_bps >= 0.20 {
-        (ANSI_GREEN, "🟢", "WIN")
-    } else if net_bps > -0.20 {
-        (ANSI_ORANGE, "🟠", "SCRATCH")
+    if net_bps >= 1.00 {
+        (ANSI_GREEN, "\u{1F7E2}", "WIN")
+    } else if net_bps >= -0.50 {
+        (ANSI_ORANGE, "\u{1F7E0}", "SCRATCH")
     } else {
-        (ANSI_RED, "🔴", "LOSS")
+        (ANSI_RED, "\u{1F534}", "LOSS")
     }
 }
 
-#[inline]
-const fn compute_optimal_50usdt_wallet_qty_str(
+#[inline]const fn compute_optimal_50usdt_wallet_qty_str(
     symbol_id: SymbolId,
     in_scar_debt: bool,
-    is_champion: bool,
+    _is_champion: bool,
 ) -> &'static str {
     match symbol_id.0 {
         1 => "0.001",
-        2 => {
-            if is_champion && !in_scar_debt {
-                "0.02"
-            } else {
-                "0.01"
-            }
-        }
+        2 => "0.01",
         3 => {
             if in_scar_debt {
                 "0.1"
-            } else if is_champion {
-                "0.3"
             } else {
                 "0.2"
             }
@@ -119,8 +110,6 @@ const fn compute_optimal_50usdt_wallet_qty_str(
         4 => {
             if in_scar_debt {
                 "1.4"
-            } else if is_champion {
-                "3.9"
             } else {
                 "2.6"
             }
@@ -128,8 +117,6 @@ const fn compute_optimal_50usdt_wallet_qty_str(
         5 => {
             if in_scar_debt {
                 "0.05"
-            } else if is_champion {
-                "0.15"
             } else {
                 "0.1"
             }
@@ -137,8 +124,6 @@ const fn compute_optimal_50usdt_wallet_qty_str(
         6 => {
             if in_scar_debt {
                 "14"
-            } else if is_champion {
-                "38"
             } else {
                 "25"
             }
@@ -215,7 +200,7 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 33 Global Account Lock + Dual-Speed Elastic Profit Floor active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 35 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -480,8 +465,12 @@ impl BybitV5LiveClient {
                     candidate_exit
                 } else if last_pegged_price.0 > 0 {
                     last_pegged_price
-                } else {
+                } else if summary.gross_scaled_bps.raw() >= 580 {
                     profit_floor_price
+                } else if summary.gross_scaled_bps.raw() >= 440 {
+                    defensive_floor_price
+                } else {
+                    ExecutionFsm::clamp_zombie_evacuation_floor(open_side, entry_price, candidate_exit)
                 };
                 println!(
                     "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed @ {}t (0.00 remaining){}",
@@ -526,14 +515,20 @@ impl BybitV5LiveClient {
                         };
                     }
                 }
-                let peg_price = if summary.gross_scaled_bps.raw() >= 600 && attempt < 5 {
+                let peg_price = if summary.gross_scaled_bps.raw() >= 580 && attempt < 4 {
                     ExecutionFsm::clamp_maker_exit_to_profit_floor(
                         open_side,
                         entry_price,
                         raw_bbo_exit,
                     )
-                } else {
+                } else if summary.gross_scaled_bps.raw() >= 440 && attempt < 6 {
                     ExecutionFsm::clamp_defensive_zero_loss_floor(
+                        open_side,
+                        entry_price,
+                        raw_bbo_exit,
+                    )
+                } else {
+                    ExecutionFsm::clamp_zombie_evacuation_floor(
                         open_side,
                         entry_price,
                         raw_bbo_exit,
@@ -745,9 +740,9 @@ fn print_colorized_shadow_trades() -> ExitCode {
 
             total_net_bps += net_bps;
             let (color, icon, badge) = classify_pnl_badge(net_bps);
-            if net_bps >= 0.20 {
+            if net_bps >= 1.00 {
                 wins += 1;
-            } else if net_bps > -0.20 {
+            } else if net_bps >= -0.50 {
                 scratches += 1;
             } else {
                 losses += 1;
@@ -1186,7 +1181,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 32 Dual-Speed Elastic Floor){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 35 Convex Ratchet & 5-Phase Anti-Zombie){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),
@@ -1522,14 +1517,20 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let spec = APPROVED_SPECS[active_slot];
                             let default_clamped_px = if !summary.is_maker_exit {
                                 summary.exit_price
-                            } else if summary.gross_scaled_bps.raw() >= 600 {
+                            } else if summary.gross_scaled_bps.raw() >= 580 {
                                 ExecutionFsm::clamp_maker_exit_to_profit_floor(
                                     summary.side,
                                     summary.entry_price,
                                     summary.exit_price,
                                 )
-                            } else {
+                            } else if summary.gross_scaled_bps.raw() >= 440 {
                                 ExecutionFsm::clamp_defensive_zero_loss_floor(
+                                    summary.side,
+                                    summary.entry_price,
+                                    summary.exit_price,
+                                )
+                            } else {
+                                ExecutionFsm::clamp_zombie_evacuation_floor(
                                     summary.side,
                                     summary.entry_price,
                                     summary.exit_price,

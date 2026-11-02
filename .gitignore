@@ -4,3 +4,4 @@
 *.mmap
 *.parquet
 .env
+data/*.jsonl

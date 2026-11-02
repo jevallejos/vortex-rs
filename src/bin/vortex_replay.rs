@@ -504,14 +504,20 @@ fn replay_captured_live_parquet_segments() {
                                 let saved_ledger = ledger;
                                 if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
                                     if summary.is_maker_exit {
-                                        let clamped_exit = if summary.gross_scaled_bps.raw() >= 600 {
+                                        let clamped_exit = if summary.gross_scaled_bps.raw() >= 580 {
                                             ExecutionFsm::clamp_maker_exit_to_profit_floor(
                                                 summary.side,
                                                 summary.entry_price,
                                                 summary.exit_price,
                                             )
-                                        } else {
+                                        } else if summary.gross_scaled_bps.raw() >= 440 {
                                             ExecutionFsm::clamp_defensive_zero_loss_floor(
+                                                summary.side,
+                                                summary.entry_price,
+                                                summary.exit_price,
+                                            )
+                                        } else {
+                                            ExecutionFsm::clamp_zombie_evacuation_floor(
                                                 summary.side,
                                                 summary.entry_price,
                                                 summary.exit_price,
@@ -548,9 +554,9 @@ fn replay_captured_live_parquet_segments() {
                                     let (en_w, en_f) = spec.format_price_usdt_parts(summary.entry_price);
                                     let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
                                     let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
-                                    let (col, icon, badge) = if net_bps >= 0.20 {
+                                    let (col, icon, badge) = if net_bps >= 1.00 {
                                         ("\x1b[1;32m", "🟢", "WIN")
-                                    } else if net_bps > -0.20 {
+                                    } else if net_bps >= -0.50 {
                                         ("\x1b[38;5;208m", "🟠", "SCRATCH")
                                     } else {
                                         ("\x1b[1;31m", "🔴", "LOSS")
