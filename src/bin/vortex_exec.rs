@@ -1792,6 +1792,56 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+
+const AI_FORENSIC_VAULT_PATH: &str = "data/vortex_ai_forensic_vault.jsonl";
+
+#[derive(Copy, Clone, Debug)]
+struct EntryForensicContext {
+    armed_ts_ns: i64,
+    fill_ts_ns: i64,
+    queue_ahead_lots: u64,
+    entry_spread_ticks: i64,
+    entry_vol_5m_bps: i64,
+    entry_ofi: f64,
+    entry_tfi: f64,
+    entry_geom: f64,
+    entry_btc_ofi: f64,
+    entry_btc_tfi: f64,
+    entry_btc_geom: f64,
+    worst_adverse_price: PriceTicks,
+}
+
+impl Default for EntryForensicContext {
+    fn default() -> Self {
+        Self {
+            armed_ts_ns: 0,
+            fill_ts_ns: 0,
+            queue_ahead_lots: 0,
+            entry_spread_ticks: 1,
+            entry_vol_5m_bps: 6000,
+            entry_ofi: 0.0,
+            entry_tfi: 0.0,
+            entry_geom: 0.0,
+            entry_btc_ofi: 0.0,
+            entry_btc_tfi: 0.0,
+            entry_btc_geom: 0.0,
+            worst_adverse_price: PriceTicks(0),
+        }
+    }
+}
+
+fn append_ai_forensic_vault_line(json_line: &str) {
+    let _ = std::fs::create_dir_all("data");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(AI_FORENSIC_VAULT_PATH)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{}", json_line);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
