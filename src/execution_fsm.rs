@@ -720,6 +720,56 @@ impl ExecutionFsm {
         }
     }
 
+    /// Computes the exact tick-quantized minimum Maker exit price that strictly covers
+    /// the 4.00 bps (400 ScaledBps) round-trip Maker-Maker fee plus +1 structural tick of net profit.
+    #[inline]
+    #[must_use]
+    pub const fn min_profitable_maker_exit_price(
+        side: Side,
+        entry_price: PriceTicks,
+    ) -> PriceTicks {
+        let fee_breakeven_ticks = (entry_price.0.saturating_mul(400) + 999_999) / 1_000_000;
+        let min_profit_delta_ticks = if fee_breakeven_ticks + 1 > 2 {
+            fee_breakeven_ticks + 1
+        } else {
+            2
+        };
+        match side {
+            Side::Bid => PriceTicks(entry_price.0 + min_profit_delta_ticks),
+            Side::Ask => {
+                let p = entry_price.0 - min_profit_delta_ticks;
+                PriceTicks(if p > 1 { p } else { 1 })
+            }
+        }
+    }
+
+    /// Clamps any candidate passive exit price so it NEVER crosses below the tick-quantized net profit floor.
+    #[inline]
+    #[must_use]
+    pub const fn clamp_maker_exit_to_profit_floor(
+        side: Side,
+        entry_price: PriceTicks,
+        candidate_exit: PriceTicks,
+    ) -> PriceTicks {
+        let floor_price = Self::min_profitable_maker_exit_price(side, entry_price);
+        match side {
+            Side::Bid => {
+                if candidate_exit.0 > floor_price.0 {
+                    candidate_exit
+                } else {
+                    floor_price
+                }
+            }
+            Side::Ask => {
+                if candidate_exit.0 > 0 && candidate_exit.0 < floor_price.0 {
+                    candidate_exit
+                } else {
+                    floor_price
+                }
+            }
+        }
+    }
+
     #[inline]
     const fn compute_gross_scaled_bps(
         side: Side,
@@ -820,6 +870,130 @@ impl ExecutionFsm {
             return 0;
         }
         (self.maker_exits_count * 10_000) / total
+    }
+}
+
+/// Online self-learning Bayesian & Replicator governor across all 6 slots and 2 directions (Bid/Ask).
+/// Continuously adapts entry composite thresholds, macro leader beta-coupling, and directional cooldowns
+/// directly from realized trade outcomes (zero static magic rules).
+#[derive(Copy, Clone, Debug)]
+pub struct OnlineAdaptiveGovernor {
+    ewma_net_bps_x100: [[i64; 2]; 6],
+    sl_streak: [[u32; 2]; 6],
+    win_streak: [[u32; 2]; 6],
+    directional_cooldown_until_ns: [[i64; 2]; 6],
+}
+
+impl Default for OnlineAdaptiveGovernor {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OnlineAdaptiveGovernor {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ewma_net_bps_x100: [[100; 2]; 6],
+            sl_streak: [[0; 2]; 6],
+            win_streak: [[0; 2]; 6],
+            directional_cooldown_until_ns: [[0; 2]; 6],
+        }
+    }
+
+    #[inline]
+    const fn dir_idx(side: Side) -> usize {
+        match side {
+            Side::Bid => 0,
+            Side::Ask => 1,
+        }
+    }
+
+    /// Feeds a closed trade outcome into the online learner to update the slot-direction health state.
+    #[inline]
+    pub fn observe_closed_trade(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        net_scaled_bps: ScaledBps,
+        is_maker_exit: bool,
+        ts_ns: TimestampNs,
+    ) {
+        if slot_idx >= 6 {
+            return;
+        }
+        let d = Self::dir_idx(side);
+        let prev = self.ewma_net_bps_x100[slot_idx][d];
+        self.ewma_net_bps_x100[slot_idx][d] = (prev * 75 + net_scaled_bps.raw() * 25) / 100;
+
+        if !is_maker_exit || net_scaled_bps.raw() <= -1_000 {
+            let s = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
+            self.sl_streak[slot_idx][d] = s;
+            self.win_streak[slot_idx][d] = 0;
+            let backoff_ns = 60_000_000_000_i64.saturating_mul(1_i64 << s.min(3));
+            self.directional_cooldown_until_ns[slot_idx][d] = ts_ns.0.saturating_add(backoff_ns);
+        } else if net_scaled_bps.raw() > 0 {
+            let w = self.win_streak[slot_idx][d].saturating_add(1);
+            self.win_streak[slot_idx][d] = w;
+            if self.sl_streak[slot_idx][d] > 0 && w >= 2 {
+                self.sl_streak[slot_idx][d] -= 1;
+            }
+        }
+    }
+
+    /// Evaluates whether `(slot_idx, side)` is authorized under the current self-learned regime
+    /// and continuous Slot-0 (`BTCUSDT`) macro composite pressure.
+    #[inline]
+    #[must_use]
+    pub fn authorizes_adaptive_entry(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        candidate_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+    ) -> bool {
+        if slot_idx >= 6 {
+            return false;
+        }
+        let d = Self::dir_idx(side);
+        if candidate_snap.ts_local_ns.0 < self.directional_cooldown_until_ns[slot_idx][d] {
+            return false;
+        }
+
+        let cand_comp = (0.45 * candidate_snap.factor_ofi.get()
+            + 0.35 * candidate_snap.factor_tfi.get()
+            + 0.20 * candidate_snap.factor_geom.get())
+        .abs();
+
+        let btc_comp = 0.45 * btc_leader_snap.factor_ofi.get()
+            + 0.35 * btc_leader_snap.factor_tfi.get()
+            + 0.20 * btc_leader_snap.factor_geom.get();
+
+        let sl_s = self.sl_streak[slot_idx][d] as f64;
+        let ewma = self.ewma_net_bps_x100[slot_idx][d] as f64;
+        let ewma_penalty = if ewma < 0.0 {
+            ((-ewma) / 4_000.0).min(0.18)
+        } else {
+            0.0
+        };
+
+        if slot_idx > 0 {
+            let signed_btc_alignment = match side {
+                Side::Bid => btc_comp,
+                Side::Ask => -btc_comp,
+            };
+            // Elastic macro coherence: altcoins cannot open against adverse BTC composite flow,
+            // and if the slot-direction has prior SL scars, BTC must actively confirm the trend.
+            let min_required_btc_alignment = -0.02 + 0.08 * sl_s;
+            if signed_btc_alignment < min_required_btc_alignment {
+                return false;
+            }
+        }
+
+        let adaptive_threshold = (0.42 + 0.09 * sl_s + ewma_penalty).min(0.78);
+        cand_comp >= adaptive_threshold
     }
 }
 

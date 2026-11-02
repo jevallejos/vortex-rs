@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use vortex_rs::execution_fsm::{
-    sign_bybit_v5_hmac_sha256, ClosedTradeKind, ClosedTradeSummary, ExecutionFsm,
+    sign_bybit_v5_hmac_sha256, ClosedTradeKind, ClosedTradeSummary, ExecutionFsm, OnlineAdaptiveGovernor,
     OrderLifecycleState,
 };
 use vortex_rs::forensic_parquet::ParitySyncLedger;
@@ -418,15 +418,17 @@ impl BybitV5LiveClient {
         active_slot: usize,
         spec: &PairSpec,
         open_side: Side,
-        initial_exit_price: PriceTicks,
+        entry_price: PriceTicks,
         force_market_if_unfilled: bool,
-    ) -> bool {
+    ) -> Option<PriceTicks> {
         let symbol = spec.symbol_id.name();
         let close_side = match open_side {
             Side::Bid => "Sell",
             Side::Ask => "Buy",
         };
 
+        let profit_floor_price =
+            ExecutionFsm::min_profitable_maker_exit_price(open_side, entry_price);
         let mut last_pegged_price = PriceTicks(0);
         let mut attempt = 0_usize;
 
@@ -434,11 +436,16 @@ impl BybitV5LiveClient {
             let (is_open, pos_qty) = self.get_open_position_size(symbol);
             if !is_open {
                 self.cancel_all_symbol_orders(symbol);
+                let realized_px = if last_pegged_price.0 > 0 {
+                    last_pegged_price
+                } else {
+                    profit_floor_price
+                };
                 println!(
-                    "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed (0.00 remaining){}",
-                    ANSI_GREEN, symbol, ANSI_RESET
+                    "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed @ {}t (0.00 remaining){}",
+                    ANSI_GREEN, symbol, realized_px.0, ANSI_RESET
                 );
-                return true;
+                return Some(realized_px);
             }
 
             if force_market_if_unfilled {
@@ -451,23 +458,36 @@ impl BybitV5LiveClient {
                 thread::sleep(Duration::from_millis(350));
                 let (still_open, _) = self.get_open_position_size(symbol);
                 if !still_open {
-                    return true;
+                    let sl_px = if let Ok(slot) = arena.slot(active_slot) {
+                        if let Ok(s) = slot.read_snapshot(4) {
+                            s.mark_price
+                        } else {
+                            entry_price
+                        }
+                    } else {
+                        entry_price
+                    };
+                    return Some(sl_px);
                 }
             } else {
-                let mut peg_price = initial_exit_price;
+                let mut raw_bbo_exit = profit_floor_price;
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(latest_snap) = slot.read_snapshot(4) {
-                        // PostOnly Maker Exit Law: closing a Long (Bid) via Sell must rest on BestAsk (asks[0]);
-                        // closing a Short (Ask) via Buy must rest on BestBid (bids[0]) so Bybit never rejects for crossing!
-                        peg_price = match open_side {
+                        raw_bbo_exit = match open_side {
                             Side::Bid if latest_snap.asks[0].price.0 > 0 => latest_snap.asks[0].price,
                             Side::Ask if latest_snap.bids[0].price.0 > 0 => latest_snap.bids[0].price,
-                            _ => initial_exit_price,
+                            _ => profit_floor_price,
                         };
                     }
                 }
 
-                // Only cancel and re-peg if the BBO price moved (preserving FIFO queue priority!)
+                // Elastic Tick-Quantized Profit Floor Law: NEVER chase price below the net-of-fee profit floor!
+                let peg_price = ExecutionFsm::clamp_maker_exit_to_profit_floor(
+                    open_side,
+                    entry_price,
+                    raw_bbo_exit,
+                );
+
                 if peg_price.0 != last_pegged_price.0 {
                     self.cancel_all_symbol_orders(symbol);
                     let (xw, xf) = spec.format_price_usdt_parts(peg_price);
@@ -492,18 +512,23 @@ impl BybitV5LiveClient {
         let (still_open_end, _) = self.get_open_position_size(symbol);
         if !still_open_end {
             self.cancel_all_symbol_orders(symbol);
+            let realized_px = if last_pegged_price.0 > 0 {
+                last_pegged_price
+            } else {
+                profit_floor_price
+            };
             println!(
-                "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed (0.00 remaining){}",
-                ANSI_GREEN, symbol, ANSI_RESET
+                "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed @ {}t (0.00 remaining){}",
+                ANSI_GREEN, symbol, realized_px.0, ANSI_RESET
             );
-            return true;
+            return Some(realized_px);
         }
 
         println!(
             "{}🟡 [BYBIT V5 EXIT STILL RESTING] {} position still open after peg cycle — retaining FSM custody (no abandonment!){}",
             ANSI_YELLOW, symbol, ANSI_RESET
         );
-        false
+        None
     }
 }
 
@@ -1025,6 +1050,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let live_client = BybitV5LiveClient::from_env_if_enabled(live_capital_enabled);
 
     let evaluator = OrthogonalFactorState::new();
+    let mut adaptive_gov = OnlineAdaptiveGovernor::new();
     let mut fsm = ExecutionFsm::new(OPTIMAL_LIVE_NOTIONAL_1E8, OPTIMAL_LIVE_NOTIONAL_1E8);
     let mut ledger = ParitySyncLedger::new(5_096_000_000);
 
@@ -1134,15 +1160,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 arena.exec_state_code.store(0, Ordering::Release);
                 arena.exec_queue_ahead_lots.store(0, Ordering::Release);
 
-                // Read Slot 0 (BTCUSDT) macro flow for cross-asset coherence
-                let mut btc_ofi = 0.0_f64;
-                let mut btc_tfi = 0.0_f64;
-                if let Ok(slot0) = arena.slot(0) {
-                    if let Ok(btc_snap) = slot0.read_snapshot(4) {
-                        btc_ofi = btc_snap.factor_ofi.get();
-                        btc_tfi = btc_snap.factor_tfi.get();
-                    }
-                }
+                let btc_leader_snap = arena
+                    .slot(0)
+                    .and_then(|s0| s0.read_snapshot(4))
+                    .unwrap_or_default();
 
                 let mut s = 0;
                 while s < APPROVED_SPECS.len() {
@@ -1161,17 +1182,15 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             }
 
                             if let Ok(verdict) = evaluator.evaluate_entry_signal(&spec, &snap) {
-                                // Slot-0 BTCUSDT Macro Leader Coherence Filter for Altcoins (Slots 1..5)
-                                if s > 0 {
-                                    if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
-                                        let macro_contradiction = match side {
-                                            Side::Bid => btc_ofi < -0.25 && btc_tfi < -0.25,
-                                            Side::Ask => btc_ofi > 0.25 && btc_tfi > 0.25,
-                                        };
-                                        if macro_contradiction {
-                                            s += 1;
-                                            continue;
-                                        }
+                                if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
+                                    if !adaptive_gov.authorizes_adaptive_entry(
+                                        s,
+                                        side,
+                                        &snap,
+                                        &btc_leader_snap,
+                                    ) {
+                                        s += 1;
+                                        continue;
                                     }
                                 }
 
@@ -1429,41 +1448,67 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         let saved_fsm = fsm;
                         let saved_ledger = ledger;
 
-                        if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
+                        if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
                             let spec = APPROVED_SPECS[active_slot];
-                            let mut exchange_confirmed_closed = true;
+                            let mut confirmed_exit_px: Option<PriceTicks> = Some(
+                                ExecutionFsm::clamp_maker_exit_to_profit_floor(
+                                    summary.side,
+                                    summary.entry_price,
+                                    summary.exit_price,
+                                ),
+                            );
 
                             if let Some(ref client) = live_client {
                                 let force_mkt = matches!(
                                     summary.kind,
                                     ClosedTradeKind::ServerMarkPriceStopLoss
                                 );
-                                exchange_confirmed_closed = client.execute_verified_close_step(
+                                confirmed_exit_px = client.execute_verified_close_step(
                                     arena,
                                     active_slot,
                                     &spec,
                                     summary.side,
-                                    summary.exit_price,
+                                    summary.entry_price,
                                     force_mkt,
                                 );
                             }
 
-                            if !exchange_confirmed_closed {
-                                // CRITICAL STAGE 27 INVARIANT: Never transition to Idle or log a closed trade
-                                // while the position is still open on Bybit! Restore FSM & Ledger and keep managing!
-                                fsm = saved_fsm;
-                                ledger = saved_ledger;
-                                fsm.state = OrderLifecycleState::PositionOpenMakerExit {
-                                    side: open_side,
-                                    entry_price: open_entry_price,
-                                    peak_favorable_price: open_peak_price,
-                                    qty: open_qty,
-                                    tp_maker_price: open_tp_price,
-                                    sl_trigger_price: open_sl_price,
-                                    opened_ts: open_since_ts,
-                                };
-                                continue;
-                            }
+                            let realized_exit_price = match confirmed_exit_px {
+                                Some(px) => px,
+                                None => {
+                                    fsm = saved_fsm;
+                                    ledger = saved_ledger;
+                                    fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+                                        side: open_side,
+                                        entry_price: open_entry_price,
+                                        peak_favorable_price: open_peak_price,
+                                        qty: open_qty,
+                                        tp_maker_price: open_tp_price,
+                                        sl_trigger_price: open_sl_price,
+                                        opened_ts: open_since_ts,
+                                    };
+                                    continue;
+                                }
+                            };
+
+                            // Recompute exact accounting with the actual realized exit price on Bybit (1:1 CSV parity!)
+                            fsm = saved_fsm;
+                            ledger = saved_ledger;
+                            summary = fsm.finalize_close(
+                                summary.kind,
+                                summary.side,
+                                summary.entry_price,
+                                realized_exit_price,
+                                snap.ts_local_ns,
+                                &mut ledger,
+                            );
+                            adaptive_gov.observe_closed_trade(
+                                active_slot,
+                                summary.side,
+                                summary.net_scaled_bps,
+                                summary.is_maker_exit,
+                                snap.ts_local_ns,
+                            );
 
                             slot_cooldown_until_ns[active_slot] =
                                 snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
