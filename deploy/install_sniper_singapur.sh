@@ -8,7 +8,9 @@ echo "==========================================================================
 VORTEX_DIR="/home/ubuntu/vortex-rs"
 BIN_DIR="${VORTEX_DIR}/bin"
 DATA_DIR="${VORTEX_DIR}/data"
-RELEASE_URL="https://github.com/jevallejos/vortex-rs/releases/download/latest-mainnet"
+RELEASE_BASE="https://github.com/jevallejos/vortex-rs/releases/download/latest-linux-x86_64"
+RELEASE_URL="${RELEASE_BASE}/vortex-linux-x86_64.tar.gz"
+SHA_URL="${RELEASE_BASE}/COMMIT_SHA"
 
 mkdir -p "${BIN_DIR}" "${DATA_DIR}"
 cd "${VORTEX_DIR}"
@@ -19,7 +21,7 @@ echo "[SHA LOCK] Target Git HEAD: ${TARGET_SHA}"
 
 VERIFIED=0
 for attempt in $(seq 1 18); do
-    REMOTE_SHA=$(curl -sSL --max-time 5 "${RELEASE_URL}/COMMIT_SHA" 2>/dev/null | tr -d '[:space:]' || true)
+    REMOTE_SHA=$(curl -fsSL --max-time 5 "${SHA_URL}" 2>/dev/null | tr -d '[:space:]' || true)
     if [ "${REMOTE_SHA}" = "${TARGET_SHA}" ]; then
         echo "[OK] Verified exact binary SHA match (${TARGET_SHA}) on attempt #${attempt} (0% CPU jitter)."
         VERIFIED=1
@@ -34,11 +36,11 @@ if [ "${VERIFIED}" -ne 1 ]; then
     echo "[WARN] Proceeding with latest available release artifacts after wait window."
 fi
 
-for bin_name in vortex_tap vortex_exec vortex_replay; do
-    curl -fL --retry 3 --retry-delay 2 -sS "${RELEASE_URL}/${bin_name}" -o "${BIN_DIR}/${bin_name}.tmp"
-    chmod +x "${BIN_DIR}/${bin_name}.tmp"
-    mv -f "${BIN_DIR}/${bin_name}.tmp" "${BIN_DIR}/${bin_name}"
-done
+curl -fsSL --retry 3 --retry-delay 2 "${RELEASE_URL}" -o "/tmp/vortex-linux-x86_64.tar.gz"
+sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
+tar -xzf "/tmp/vortex-linux-x86_64.tar.gz" -C "${BIN_DIR}"
+rm -f "/tmp/vortex-linux-x86_64.tar.gz"
+chmod +x "${BIN_DIR}/vortex_tap" "${BIN_DIR}/vortex_replay" "${BIN_DIR}/vortex_exec"
 
 sudo tee /etc/systemd/system/vortex-tap.service > /dev/null <<EOF
 [Unit]
@@ -50,10 +52,13 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 WorkingDirectory=${VORTEX_DIR}
+EnvironmentFile=-${VORTEX_DIR}/.env
 ExecStart=${BIN_DIR}/vortex_tap --daemon
 Restart=always
 RestartSec=2
 Nice=-10
+OOMScoreAdjust=-800
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -61,7 +66,7 @@ EOF
 
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Stage 26 Live Capital)
+Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Stage 26/27 Live Capital)
 After=vortex-tap.service
 Requires=vortex-tap.service
 
@@ -69,10 +74,13 @@ Requires=vortex-tap.service
 Type=simple
 User=ubuntu
 WorkingDirectory=${VORTEX_DIR}
+EnvironmentFile=-${VORTEX_DIR}/.env
 ExecStart=${BIN_DIR}/vortex_exec --daemon --live-capital
 Restart=always
 RestartSec=2
 Nice=-15
+OOMScoreAdjust=-800
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -148,7 +156,7 @@ sudo chmod +x /usr/local/bin/vortex
 sudo systemctl daemon-reload
 sudo systemctl enable vortex-tap.service vortex-exec.service >/dev/null 2>&1 || true
 sudo systemctl restart vortex-tap.service
-sleep 1
+sleep 2
 sudo systemctl restart vortex-exec.service
 sleep 1
-echo "[OK] VORTEX-L2 Stage 26 Daemons active (Commit SHA Verified)."
+echo "[OK] VORTEX-L2 Daemons active (Commit SHA Verified)."
