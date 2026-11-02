@@ -611,34 +611,6 @@ impl ExecutionFsm {
             let peak_gross_bps =
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
-            // Stage 30 Law 1: Elastic Wald SPRT Early Adverse Unwind (Thesis Invalidation Bailout).
-            // Never wait passively to lose -52.00 bps (-60.00 bps net) if after >= 12s the trade is in
-            // drawdown beyond the volatility-elastic boundary (-12.50 to -16.50 bps) AND both L2 OFI and Trade TFI
-            // have flipped strongly against the position!
-            let sprt_elapsed_ns = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
-            let elastic_sprt_bailout_bps = -((snap.realized_vol_5m.raw() / 4).clamp(1_250, 1_650));
-            let severe_flow_inversion = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.32 && snap.factor_tfi.get() < -0.32,
-                Side::Ask => snap.factor_ofi.get() > 0.32 && snap.factor_tfi.get() > 0.32,
-            };
-            if sprt_elapsed_ns >= 12_000_000_000
-                && current_gross_bps.raw() <= elastic_sprt_bailout_bps
-                && severe_flow_inversion
-            {
-                let bailout_px = if snap.mark_price.0 > 0 {
-                    snap.mark_price
-                } else {
-                    snap.last_trade_price
-                };
-                return Some(self.finalize_close(
-                    ClosedTradeKind::ServerMarkPriceStopLoss,
-                    side,
-                    entry_price,
-                    bailout_px,
-                    snap.ts_local_ns,
-                    ledger,
-                ));
-            }
 
             // Elastic volatility-coupled harvest floor: at least 600 ScaledBps (+2.00 bps net) or 10% of 5m realized vol
             let elastic_vol_floor_bps = (snap.realized_vol_5m.raw() / 10).clamp(600, 750);
