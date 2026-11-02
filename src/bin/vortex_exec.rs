@@ -457,9 +457,11 @@ impl BybitV5LiveClient {
                 let mut peg_price = initial_exit_price;
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(latest_snap) = slot.read_snapshot(4) {
+                        // PostOnly Maker Exit Law: closing a Long (Bid) via Sell must rest on BestAsk (asks[0]);
+                        // closing a Short (Ask) via Buy must rest on BestBid (bids[0]) so Bybit never rejects for crossing!
                         peg_price = match open_side {
-                            Side::Bid if latest_snap.bids[0].price.0 > 0 => latest_snap.bids[0].price,
-                            Side::Ask if latest_snap.asks[0].price.0 > 0 => latest_snap.asks[0].price,
+                            Side::Bid if latest_snap.asks[0].price.0 > 0 => latest_snap.asks[0].price,
+                            Side::Ask if latest_snap.bids[0].price.0 > 0 => latest_snap.bids[0].price,
                             _ => initial_exit_price,
                         };
                     }
