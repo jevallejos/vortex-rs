@@ -20,7 +20,7 @@ SHORT_TARGET=$(echo "${TARGET_SHA}" | cut -c1-7)
 echo "[SHA LOCK] Target Git HEAD: ${TARGET_SHA}"
 
 VERIFIED=0
-for attempt in $(seq 1 24); do
+for attempt in $(seq 1 36); do
     REMOTE_SHA=$(curl -fsSL --max-time 5 "${SHA_URL}" 2>/dev/null | tr -d '[:space:]' || true)
     if [ "${REMOTE_SHA}" = "${TARGET_SHA}" ]; then
         echo "[OK] Verified exact binary SHA match (${TARGET_SHA}) on attempt #${attempt} (0% CPU jitter)."
@@ -28,7 +28,7 @@ for attempt in $(seq 1 24); do
         break
     fi
     SHORT_REMOTE=$(echo "${REMOTE_SHA}" | cut -c1-7)
-    echo "  [WAIT ${attempt}/24] Release binary SHA (${SHORT_REMOTE:-none}) != HEAD (${SHORT_TARGET}). GitHub Actions building... waiting 5s"
+    echo "  [WAIT ${attempt}/36] Release binary SHA (${SHORT_REMOTE:-none}) != HEAD (${SHORT_TARGET}). GitHub Actions building... waiting 5s"
     sleep 5
 done
 

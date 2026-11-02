@@ -289,6 +289,37 @@ fn replay_captured_live_parquet_segments() {
 
     let evaluator = OrthogonalFactorState::new();
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
+    if let Ok(shadow_file) = std::fs::File::open("data/vortex_shadow_trades.jsonl") {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(shadow_file);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
+                let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+                let slot_opt = match sym_str {
+                    "BTCUSDT" => Some(0),
+                    "ETHUSDT" => Some(1),
+                    "SOLUSDT" => Some(2),
+                    "AVAXUSDT" => Some(3),
+                    "TAOUSDT" => Some(4),
+                    "SUIUSDT" => Some(5),
+                    _ => None,
+                };
+                if let Some(s_idx) = slot_opt {
+                    let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                    adaptive_gov.observe_closed_trade(
+                        s_idx,
+                        s_side,
+                        ScaledBps((net_bps * 100.0).round() as i64),
+                        is_maker,
+                        TimestampNs(0),
+                    );
+                }
+            }
+        }
+    }
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
     let mut ledger = ParitySyncLedger::new(10_000_000_000);
     let mut fifo_sim = FifoQueueSimulator::new();
@@ -340,6 +371,7 @@ fn replay_captured_live_parquet_segments() {
                             price: row.best_ask_ticks,
                             qty: row.best_ask_qty,
                         };
+                        adaptive_gov.observe_market_price(slot_idx, &snap);
                         if slot_idx == 0 {
                             btc_leader_snap = snap;
                         }
@@ -469,19 +501,12 @@ fn replay_captured_live_parquet_segments() {
                                 let saved_ledger = ledger;
                                 if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
                                     if summary.is_maker_exit {
-                                        let clamped_exit = if summary.gross_scaled_bps.raw() < 440 {
-                                            ExecutionFsm::clamp_scratch_breakeven_floor(
-                                                summary.side,
-                                                summary.entry_price,
-                                                summary.exit_price,
-                                            )
-                                        } else {
+                                        let clamped_exit =
                                             ExecutionFsm::clamp_defensive_zero_loss_floor(
                                                 summary.side,
                                                 summary.entry_price,
                                                 summary.exit_price,
-                                            )
-                                        };
+                                            );
                                         fsm = saved_fsm;
                                         ledger = saved_ledger;
                                         summary = fsm.finalize_close(

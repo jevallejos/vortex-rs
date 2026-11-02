@@ -419,7 +419,6 @@ impl BybitV5LiveClient {
         let open_side = summary.side;
         let entry_price = summary.entry_price;
         let candidate_exit = summary.exit_price;
-        let trigger_gross_bps = summary.gross_scaled_bps;
         let force_market_if_unfilled = matches!(
             summary.kind,
             ClosedTradeKind::ServerMarkPriceStopLoss
@@ -430,6 +429,8 @@ impl BybitV5LiveClient {
         };
         let profit_floor_price =
             ExecutionFsm::min_profitable_maker_exit_price(open_side, entry_price);
+        let defensive_floor_price =
+            ExecutionFsm::defensive_zero_loss_maker_exit_price(open_side, entry_price);
         let mut last_pegged_price = PriceTicks(0);
         let mut attempt = 0_usize;
 
@@ -441,8 +442,6 @@ impl BybitV5LiveClient {
                     candidate_exit
                 } else if last_pegged_price.0 > 0 {
                     last_pegged_price
-                } else if trigger_gross_bps.raw() < 440 {
-                    ExecutionFsm::clamp_scratch_breakeven_floor(open_side, entry_price, candidate_exit)
                 } else {
                     profit_floor_price
                 };
@@ -489,13 +488,7 @@ impl BybitV5LiveClient {
                         };
                     }
                 }
-                let peg_price = if trigger_gross_bps.raw() < 440 || attempt >= 5 {
-                    ExecutionFsm::clamp_scratch_breakeven_floor(
-                        open_side,
-                        entry_price,
-                        raw_bbo_exit,
-                    )
-                } else if attempt < 3 {
+                let peg_price = if attempt < 3 {
                     ExecutionFsm::clamp_maker_exit_to_profit_floor(
                         open_side,
                         entry_price,
@@ -533,8 +526,10 @@ impl BybitV5LiveClient {
             self.cancel_all_symbol_orders(symbol);
             let realized_px = if last_pegged_price.0 > 0 {
                 last_pegged_price
-            } else {
+            } else if force_market_if_unfilled {
                 candidate_exit
+            } else {
+                defensive_floor_price
             };
             println!(
                 "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed @ {}t (0.00 remaining){}",
@@ -1181,6 +1176,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 continue;
                             }
                             last_seen_seq[s] = snap.sequence_id;
+                            adaptive_gov.observe_market_price(s, &snap);
 
                             if snap.ts_local_ns.0 < slot_cooldown_until_ns[s] {
                                 s += 1;
@@ -1473,12 +1469,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let spec = APPROVED_SPECS[active_slot];
                             let default_clamped_px = if !summary.is_maker_exit {
                                 summary.exit_price
-                            } else if summary.gross_scaled_bps.raw() < 440 {
-                                ExecutionFsm::clamp_scratch_breakeven_floor(
-                                    summary.side,
-                                    summary.entry_price,
-                                    summary.exit_price,
-                                )
                             } else {
                                 ExecutionFsm::clamp_defensive_zero_loss_floor(
                                     summary.side,

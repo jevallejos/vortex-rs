@@ -612,12 +612,10 @@ impl ExecutionFsm {
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
 
-            // Three-Speed Elastic Harvest, Zero-Loss & Breakeven Survival Physics (Stage 32):
+            // Dual-Speed Elastic Harvest & Zero-Loss Rescue Physics (Stage 32.1):
             // 1) Speed 1 (Offensive Harvest): >= 600..750 ScaledBps (+2.00..+3.50 bps net), suppressed under strong trend flow so winners reach Zone 2 (> 800).
-            // 2) Speed 2 (Defensive Zero-Loss Floor): >= 440 ScaledBps (+0.40..+1.64 bps net) after 15s of adverse flow or 45s stagnant.
-            // 3) Speed 3 (Wounded Trade Breakeven Rescue): if a trade has never reached 440 ScaledBps (`peak_gross_bps < 440`)
-            //    after >= 25s with joint adverse flow (or >= 60s stagnant), unlock passive Maker exit at >= 80 ScaledBps (+1 tick)
-            //    so trapped positions evacuate on the first bounce to entry (-1.5 to -3.2 bps net) instead of dying at -60 bps!
+            // 2) Speed 2 (Immutable Zero-Loss Floor): >= 440 ScaledBps (+0.40..+1.64 bps net) after 15s of joint adverse flow or 45s stagnant.
+            //    NEVER exit below 440 ScaledBps so 100% of Maker exits are net positive after the 400 ScaledBps round-trip fee!
             let elastic_vol_floor_bps = (snap.realized_vol_5m.raw() / 10).clamp(600, 750);
             let in_trend_free_ride_zone = peak_gross_bps.raw() > 800;
             let ofi_reversed = match side {
@@ -640,24 +638,14 @@ impl ExecutionFsm {
                 Side::Bid => snap.factor_ofi.get() < -0.15 && snap.factor_tfi.get() < -0.15,
                 Side::Ask => snap.factor_ofi.get() > 0.15 && snap.factor_tfi.get() > 0.15,
             };
-            let wounded_adverse_rescue = !in_trend_free_ride_zone
-                && hold_elapsed >= 25_000_000_000
-                && peak_gross_bps.raw() < 440
-                && current_gross_bps.raw() >= 80
-                && joint_adverse;
-            let scratch_escape = (!in_trend_free_ride_zone
+            let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= 15_000_000_000
                 && current_gross_bps.raw() >= 440
-                && joint_adverse)
-                || wounded_adverse_rescue;
-            let struggling_rescue = (!in_trend_free_ride_zone
+                && joint_adverse;
+            let struggling_rescue = !in_trend_free_ride_zone
                 && hold_elapsed >= 45_000_000_000
                 && peak_gross_bps.raw() < 600
-                && current_gross_bps.raw() >= 440)
-                || (!in_trend_free_ride_zone
-                    && hold_elapsed >= 60_000_000_000
-                    && peak_gross_bps.raw() < 440
-                    && current_gross_bps.raw() >= 80);
+                && current_gross_bps.raw() >= 440;
             let stagnant_unwind = struggling_rescue
                 || (hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 440);
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
@@ -844,49 +832,6 @@ impl ExecutionFsm {
         }
     }
 
-    /// Computes the Speed-3 wounded-position Maker rescue price (`entry_price +/- 1 structural tick`)
-    /// so trapped positions that never reached 440 ScaledBps can evacuate passively on the first bounce to entry.
-    #[inline]
-    #[must_use]
-    pub const fn scratch_breakeven_maker_exit_price(
-        side: Side,
-        entry_price: PriceTicks,
-    ) -> PriceTicks {
-        match side {
-            Side::Bid => PriceTicks(entry_price.0 + 1),
-            Side::Ask => {
-                let p = entry_price.0 - 1;
-                PriceTicks(if p > 1 { p } else { 1 })
-            }
-        }
-    }
-
-    /// Clamps a Speed-3 wounded rescue exit price to `entry_price +/- 1 tick`.
-    #[inline]
-    #[must_use]
-    pub const fn clamp_scratch_breakeven_floor(
-        side: Side,
-        entry_price: PriceTicks,
-        candidate_exit: PriceTicks,
-    ) -> PriceTicks {
-        let floor_price = Self::scratch_breakeven_maker_exit_price(side, entry_price);
-        match side {
-            Side::Bid => {
-                if candidate_exit.0 > floor_price.0 {
-                    candidate_exit
-                } else {
-                    floor_price
-                }
-            }
-            Side::Ask => {
-                if candidate_exit.0 > 0 && candidate_exit.0 < floor_price.0 {
-                    candidate_exit
-                } else {
-                    floor_price
-                }
-            }
-        }
-    }
     #[inline]
     const fn compute_gross_scaled_bps(
         side: Side,
@@ -991,7 +936,7 @@ impl ExecutionFsm {
 }
 
 /// Online self-learning Bayesian & Replicator governor across all 6 slots and 2 directions (Bid/Ask),
-/// coupled with Cross-Slot Global Directional Regime Memory (`global_dir_debt_bps_x100`).
+/// coupled with Cross-Slot Global Directional Regime Memory and Dual-Horizon Price Drift EWMA.
 #[derive(Copy, Clone, Debug)]
 pub struct OnlineAdaptiveGovernor {
     ewma_net_bps_x100: [[i64; 2]; 6],
@@ -1002,6 +947,8 @@ pub struct OnlineAdaptiveGovernor {
     global_dir_debt_bps_x100: [i64; 2],
     global_dir_sl_streak: [u32; 2],
     global_dir_cooldown_until_ns: [i64; 2],
+    ewma_fast_px_1e4: [i64; 6],
+    ewma_slow_px_1e4: [i64; 6],
 }
 
 impl Default for OnlineAdaptiveGovernor {
@@ -1024,6 +971,8 @@ impl OnlineAdaptiveGovernor {
             global_dir_debt_bps_x100: [0; 2],
             global_dir_sl_streak: [0; 2],
             global_dir_cooldown_until_ns: [0; 2],
+            ewma_fast_px_1e4: [0; 6],
+            ewma_slow_px_1e4: [0; 6],
         }
     }
 
@@ -1033,6 +982,57 @@ impl OnlineAdaptiveGovernor {
             Side::Bid => 0,
             Side::Ask => 1,
         }
+    }
+
+    /// Updates continuous fast (`alpha=1/32`) and slow macro (`alpha=1/512`) price EWMAs in `1e4` fixed-point scale.
+    #[inline]
+    pub fn observe_market_price(&mut self, slot_idx: usize, snap: &SymbolLobSnapshot) {
+        if slot_idx >= 6 {
+            return;
+        }
+        let mid_ticks = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+            (snap.bids[0].price.0 + snap.asks[0].price.0) / 2
+        } else {
+            snap.mark_price.0
+        };
+        if mid_ticks <= 0 {
+            return;
+        }
+        let px_1e4 = mid_ticks.saturating_mul(10_000);
+        let fast_prev = self.ewma_fast_px_1e4[slot_idx];
+        let slow_prev = self.ewma_slow_px_1e4[slot_idx];
+        if fast_prev <= 0 || slow_prev <= 0 {
+            self.ewma_fast_px_1e4[slot_idx] = px_1e4;
+            self.ewma_slow_px_1e4[slot_idx] = px_1e4;
+        } else {
+            self.ewma_fast_px_1e4[slot_idx] = (fast_prev * 31 + px_1e4) / 32;
+            self.ewma_slow_px_1e4[slot_idx] = (slow_prev * 511 + px_1e4) / 512;
+        }
+    }
+
+    #[inline]
+    const fn price_drift_and_extension_scaled_bps(&self, slot_idx: usize, snap: &SymbolLobSnapshot) -> (i64, i64) {
+        if slot_idx >= 6 {
+            return (0, 0);
+        }
+        let fast = self.ewma_fast_px_1e4[slot_idx];
+        let slow = self.ewma_slow_px_1e4[slot_idx];
+        if fast <= 0 || slow <= 0 {
+            return (0, 0);
+        }
+        let drift_bps = ((fast - slow).saturating_mul(1_000_000)) / slow;
+        let cur_ticks = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+            (snap.bids[0].price.0 + snap.asks[0].price.0) / 2
+        } else {
+            snap.mark_price.0
+        };
+        let cur_1e4 = cur_ticks.saturating_mul(10_000);
+        let ext_bps = if cur_1e4 > 0 {
+            ((cur_1e4 - slow).saturating_mul(1_000_000)) / slow
+        } else {
+            0
+        };
+        (drift_bps, ext_bps)
     }
 
     /// Returns `(ewma_net_bps_x100, sl_streak, win_streak)` for forensic telemetry.
@@ -1097,7 +1097,13 @@ impl OnlineAdaptiveGovernor {
             self.global_dir_sl_streak[d] = gs;
             let global_pause_ns = 90_000_000_000_i64.saturating_mul(i64::from(gs));
             self.global_dir_cooldown_until_ns[d] = ts_ns.0.saturating_add(global_pause_ns);
-        } else if net_scaled_bps.raw() > 0 {
+        } else if net_scaled_bps.raw() <= 0 {
+            self.win_streak[slot_idx][d] = 0;
+            let scratch_cooldown_ns = ts_ns.0.saturating_add(120_000_000_000);
+            if scratch_cooldown_ns > self.directional_cooldown_until_ns[slot_idx][d] {
+                self.directional_cooldown_until_ns[slot_idx][d] = scratch_cooldown_ns;
+            }
+        } else {
             let w = self.win_streak[slot_idx][d].saturating_add(1);
             self.win_streak[slot_idx][d] = w;
             let win_breather_ns = ts_ns.0.saturating_add(60_000_000_000);
@@ -1118,7 +1124,7 @@ impl OnlineAdaptiveGovernor {
     }
 
     /// Evaluates whether `(slot_idx, side)` is authorized under per-slot Scar-Debt,
-    /// Cross-Slot Global Directional Regime memory, and strict Slot-0 (`BTCUSDT`) macro conviction.
+    /// Dual-Horizon Macro Price Drift, Over-Extension bounds, and Slot-0 (`BTCUSDT`) conviction.
     #[inline]
     #[must_use]
     pub fn authorizes_adaptive_entry(
@@ -1136,6 +1142,30 @@ impl OnlineAdaptiveGovernor {
             || candidate_snap.ts_local_ns.0 < self.global_dir_cooldown_until_ns[d]
         {
             return false;
+        }
+
+        let (self_drift_bps, self_ext_bps) =
+            self.price_drift_and_extension_scaled_bps(slot_idx, candidate_snap);
+        let (btc_drift_bps, _) =
+            self.price_drift_and_extension_scaled_bps(0, btc_leader_snap);
+
+        match side {
+            Side::Bid => {
+                if self_drift_bps < -350 || self_ext_bps > 2_200 {
+                    return false;
+                }
+                if slot_idx > 0 && btc_drift_bps < -300 {
+                    return false;
+                }
+            }
+            Side::Ask => {
+                if self_drift_bps > 350 || self_ext_bps < -2_200 {
+                    return false;
+                }
+                if slot_idx > 0 && btc_drift_bps > 300 {
+                    return false;
+                }
+            }
         }
 
         let cand_comp = (0.45 * candidate_snap.factor_ofi.get()
