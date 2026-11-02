@@ -507,12 +507,23 @@ impl BybitV5LiveClient {
                     }
                 }
 
-                // Elastic Tick-Quantized Profit Floor Law: NEVER chase price below the net-of-fee profit floor!
-                let peg_price = ExecutionFsm::clamp_maker_exit_to_profit_floor(
-                    open_side,
-                    entry_price,
-                    raw_bbo_exit,
-                );
+                // Dual-Speed Elastic Profit Floor Law (Stage 31.1):
+                // Attempts 0..2 enforce the Offensive Floor (>= 600 ScaledBps = +2.00 bps net);
+                // Attempts >= 3 unlock the Defensive Zero-Loss Escape Floor (440 ScaledBps = +0.40..+1.64 bps net)
+                // so trapped positions escape in profit on a 4-tick bounce instead of dying at -60 bps!
+                let peg_price = if attempt < 3 {
+                    ExecutionFsm::clamp_maker_exit_to_profit_floor(
+                        open_side,
+                        entry_price,
+                        raw_bbo_exit,
+                    )
+                } else {
+                    ExecutionFsm::clamp_defensive_zero_loss_floor(
+                        open_side,
+                        entry_price,
+                        raw_bbo_exit,
+                    )
+                };
 
                 if peg_price.0 != last_pegged_price.0 {
                     self.cancel_all_symbol_orders(symbol);
@@ -1536,7 +1547,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
                             let spec = APPROVED_SPECS[active_slot];
                             let mut confirmed_exit_px: Option<PriceTicks> = Some(
-                                ExecutionFsm::clamp_maker_exit_to_profit_floor(
+                                ExecutionFsm::clamp_defensive_zero_loss_floor(
                                     summary.side,
                                     summary.entry_price,
                                     summary.exit_price,

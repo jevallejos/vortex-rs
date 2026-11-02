@@ -612,66 +612,47 @@ impl ExecutionFsm {
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
 
-            // Stage 31 Law 1: Compressed Structural Stop-Loss (-28.00 bps gross = ~-35.50 bps net)
-            // after >= 20s when BOTH L2 OFI and Trade TFI are strongly adverse (cuts -60 bps tail losses
-            // nearly in half while staying safely outside -15 bps normal breathing noise!).
-            let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
-            let confirmed_adverse_crash = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.22 && snap.factor_tfi.get() < -0.22,
-                Side::Ask => snap.factor_ofi.get() > 0.22 && snap.factor_tfi.get() > 0.22,
-            };
-            if hold_elapsed >= 20_000_000_000
-                && current_gross_bps.raw() <= -2_800
-                && confirmed_adverse_crash
-            {
-                let compressed_sl_px = if snap.mark_price.0 > 0 {
-                    snap.mark_price
-                } else {
-                    snap.last_trade_price
-                };
-                return Some(self.finalize_close(
-                    ClosedTradeKind::ServerMarkPriceStopLoss,
-                    side,
-                    entry_price,
-                    compressed_sl_px,
-                    snap.ts_local_ns,
-                    ledger,
-                ));
-            }
+            // Dual-Speed Elastic Harvest & Rescue Physics (Stage 31.1):
+            // 1) Offensive Harvest (`flow_unwind` & `early_harvest`) demands >= 600..750 ScaledBps (+2.00..+3.50 bps net),
+            //    and suppresses `early_harvest` while order flow strongly supports the trend so winners reach Zone 2 (> 800)!
+            // 2) Defensive Rescue (`scratch_escape` after >= 15s of joint adverse flow, or `stagnant_rescue` after >= 45s
+            //    when peak < 600) unlocks at >= 440 ScaledBps (+0.40..+1.64 bps net = 4-5 ticks) so trapped entries
+            //    escape in net profit on the first 4-tick bounce instead of dying at -60.00 bps!
+            let elastic_vol_floor_bps = (snap.realized_vol_5m.raw() / 10).clamp(600, 750);
+            let in_trend_free_ride_zone = peak_gross_bps.raw() > 800;
 
-            // Stage 31 Law 2: Winner Expansion! Never cut a winning trade at +2.00 bps while L2/Tape
-            // order flow is still pushing in our favor. Zone 2 engages at > 760 ScaledBps (+3.60 bps net),
-            // and Zone 1 harvest is ONLY permitted when BOTH OFI and TFI confirm momentum exhaustion!
-            let elastic_vol_floor_bps = (snap.realized_vol_5m.raw() / 8).clamp(640, 820);
-            let in_trend_free_ride_zone = peak_gross_bps.raw() > 760;
-
-            let confirmed_momentum_exhausted = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.18 && snap.factor_tfi.get() < -0.05,
-                Side::Ask => snap.factor_ofi.get() > 0.18 && snap.factor_tfi.get() > 0.05,
+            let ofi_reversed = match side {
+                Side::Bid => snap.factor_ofi.get() < -0.10,
+                Side::Ask => snap.factor_ofi.get() > 0.10,
             };
             let flow_unwind = !in_trend_free_ride_zone
                 && current_gross_bps.raw() >= elastic_vol_floor_bps
-                && confirmed_momentum_exhausted;
+                && ofi_reversed;
 
-            let trend_stalled = match side {
-                Side::Bid => snap.factor_ofi.get() <= 0.05 && snap.factor_tfi.get() <= 0.10,
-                Side::Ask => snap.factor_ofi.get() >= -0.05 && snap.factor_tfi.get() >= -0.10,
+            let strong_trend_continuation = match side {
+                Side::Bid => snap.factor_ofi.get() > 0.25 && snap.factor_tfi.get() > 0.35,
+                Side::Ask => snap.factor_ofi.get() < -0.25 && snap.factor_tfi.get() < -0.35,
             };
+            let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
             let early_harvest = !in_trend_free_ride_zone
-                && hold_elapsed >= 75_000_000_000
-                && current_gross_bps.raw() >= elastic_vol_floor_bps
-                && trend_stalled;
+                && !strong_trend_continuation
+                && hold_elapsed >= 30_000_000_000
+                && current_gross_bps.raw() >= elastic_vol_floor_bps;
 
             let joint_adverse = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.28 && snap.factor_tfi.get() < -0.28,
-                Side::Ask => snap.factor_ofi.get() > 0.28 && snap.factor_tfi.get() > 0.28,
+                Side::Bid => snap.factor_ofi.get() < -0.15 && snap.factor_tfi.get() < -0.15,
+                Side::Ask => snap.factor_ofi.get() > 0.15 && snap.factor_tfi.get() > 0.15,
             };
             let scratch_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= 35_000_000_000
-                && current_gross_bps.raw() >= 600
+                && hold_elapsed >= 15_000_000_000
+                && current_gross_bps.raw() >= 440
                 && joint_adverse;
-            let stagnant_unwind =
-                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 560;
+            let struggling_rescue = !in_trend_free_ride_zone
+                && hold_elapsed >= 45_000_000_000
+                && peak_gross_bps.raw() < 600
+                && current_gross_bps.raw() >= 440;
+            let stagnant_unwind = struggling_rescue
+                || (hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 440);
 
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
                 let dynamic_70pct_floor = 400 + ((peak_gross_bps.raw() - 400) * 70) / 100;
@@ -775,6 +756,57 @@ impl ExecutionFsm {
             Side::Ask => {
                 let p = entry_price.0 - min_profit_delta_ticks;
                 PriceTicks(if p > 1 { p } else { 1 })
+            }
+        }
+    }
+
+    /// Computes the defensive zero-loss Maker rescue floor (440 ScaledBps = +4.40 bps gross -> +0.40..+1.64 bps net
+    /// after the 4.00 bps Maker-Maker fee, minimum 4 structural ticks on altcoins / 2 ticks general) so trapped positions
+    /// can escape alive on the first 4-tick bounce instead of waiting for 6 ticks and dying at -60 bps!
+    #[inline]
+    #[must_use]
+    pub const fn defensive_zero_loss_maker_exit_price(
+        side: Side,
+        entry_price: PriceTicks,
+    ) -> PriceTicks {
+        let target_440bps_ticks = (entry_price.0.saturating_mul(440) + 999_999) / 1_000_000;
+        let min_profit_delta_ticks = if target_440bps_ticks > 2 {
+            target_440bps_ticks
+        } else {
+            2
+        };
+        match side {
+            Side::Bid => PriceTicks(entry_price.0 + min_profit_delta_ticks),
+            Side::Ask => {
+                let p = entry_price.0 - min_profit_delta_ticks;
+                PriceTicks(if p > 1 { p } else { 1 })
+            }
+        }
+    }
+
+    /// Clamps a defensive rescue exit price to the 440 ScaledBps zero-loss floor (+0.40..+1.64 bps net).
+    #[inline]
+    #[must_use]
+    pub const fn clamp_defensive_zero_loss_floor(
+        side: Side,
+        entry_price: PriceTicks,
+        candidate_exit: PriceTicks,
+    ) -> PriceTicks {
+        let floor_price = Self::defensive_zero_loss_maker_exit_price(side, entry_price);
+        match side {
+            Side::Bid => {
+                if candidate_exit.0 > floor_price.0 {
+                    candidate_exit
+                } else {
+                    floor_price
+                }
+            }
+            Side::Ask => {
+                if candidate_exit.0 > 0 && candidate_exit.0 < floor_price.0 {
+                    candidate_exit
+                } else {
+                    floor_price
+                }
             }
         }
     }
@@ -1006,8 +1038,8 @@ impl OnlineAdaptiveGovernor {
         } else if net_scaled_bps.raw() > 0 {
             let w = self.win_streak[slot_idx][d].saturating_add(1);
             self.win_streak[slot_idx][d] = w;
-            // Stage 31 Law 3: 60s Anti-Wave-Exhaustion breather after every win on the same (slot, side)
-            // so the bot never re-buys the same wave 4 times into the exhausted top (as in ETH #63)!
+            // 60s Anti-Wave-Exhaustion breather after every win on the same (slot, side)
+            // so the bot never re-enters 1s later into the exhausted top/bottom (as in #63 and #75)!
             let win_breather_ns = ts_ns.0.saturating_add(60_000_000_000);
             if win_breather_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = win_breather_ns;
@@ -1063,21 +1095,20 @@ impl OnlineAdaptiveGovernor {
                 Side::Bid => btc_comp,
                 Side::Ask => -btc_comp,
             };
-            // Strict BTC Leader Veto: Never open an altcoin position when BTC order book or trade tape opposes it!
             let btc_directional_support = match side {
-                Side::Bid => btc_leader_snap.factor_ofi.get() >= 0.05 && btc_leader_snap.factor_tfi.get() >= 0.10,
-                Side::Ask => btc_leader_snap.factor_ofi.get() <= -0.05 && btc_leader_snap.factor_tfi.get() <= -0.10,
+                Side::Bid => btc_leader_snap.factor_ofi.get() >= -0.05 && btc_leader_snap.factor_tfi.get() >= 0.0,
+                Side::Ask => btc_leader_snap.factor_ofi.get() <= 0.05 && btc_leader_snap.factor_tfi.get() <= 0.0,
             };
             if !btc_directional_support {
                 return false;
             }
-            let min_required_btc_alignment = 0.12 + 0.10 * sl_s + (debt_penalty * 0.6);
+            let min_required_btc_alignment = 0.06 + 0.10 * sl_s + (debt_penalty * 0.5);
             if signed_btc_alignment < min_required_btc_alignment {
                 return false;
             }
         }
 
-        let adaptive_threshold = (0.44 + 0.09 * sl_s + debt_penalty).min(0.80);
+        let adaptive_threshold = (0.42 + 0.08 * sl_s + debt_penalty).min(0.78);
         cand_comp >= adaptive_threshold
     }
 }
