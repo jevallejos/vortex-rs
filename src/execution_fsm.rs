@@ -924,8 +924,13 @@ mod tests {
         };
 
         // 1. Price surges to 10_024 (+24.00 bps gross / +20.00 bps net). Dynamic 70% floor = 400 + 0.70*(2000) = 1800 (+18.00 bps gross).
-        let mut snap_peak = SymbolLobSnapshot::default();
-        snap_peak.ts_local_ns = TimestampNs(70_000_000_000);
+        let mut snap_peak = SymbolLobSnapshot {
+            ts_local_ns: TimestampNs(70_000_000_000),
+            last_trade_price: PriceTicks(10_024),
+            mark_price: PriceTicks(10_024),
+            factor_ofi: BoundedScore::new_clamped(-0.40),
+            ..SymbolLobSnapshot::default()
+        };
         snap_peak.bids[0] = BookLevel {
             price: PriceTicks(10_024),
             qty: LotQty(100),
@@ -934,9 +939,6 @@ mod tests {
             price: PriceTicks(10_025),
             qty: LotQty(100),
         };
-        snap_peak.last_trade_price = PriceTicks(10_024);
-        snap_peak.mark_price = PriceTicks(10_024);
-        snap_peak.factor_ofi = BoundedScore::new_clamped(-0.40);
         assert!(fsm.step_open_position(&snap_peak, &mut ledger).is_none());
 
         // 2. Price pulls back slightly to 10_019 (+19.00 bps gross > +18.00 bps floor) with negative OFI: must KEEP RIDING!

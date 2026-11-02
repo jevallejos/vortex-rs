@@ -417,11 +417,11 @@ impl BybitV5LiveClient {
         arena: &VortexShmArena,
         active_slot: usize,
         spec: &PairSpec,
-        symbol: &str,
         open_side: Side,
         initial_exit_price: PriceTicks,
         force_market_if_unfilled: bool,
     ) -> bool {
+        let symbol = spec.symbol_id.name();
         let close_side = match open_side {
             Side::Bid => "Sell",
             Side::Ask => "Buy",
@@ -1440,7 +1440,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     arena,
                                     active_slot,
                                     &spec,
-                                    snap.symbol_id.name(),
                                     summary.side,
                                     summary.exit_price,
                                     force_mkt,
