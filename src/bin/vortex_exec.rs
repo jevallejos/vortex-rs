@@ -108,6 +108,39 @@ const fn compute_optimal_50usdt_wallet_qty_str(
     }
 }
 
+const ENV_FILE_CANDIDATES: [&str; 3] = [".env", "/home/ubuntu/vortex-rs/.env", "/home/ubuntu/.env"];
+
+fn load_env_var_with_fallback(keys: &[&str]) -> Option<String> {
+    for &k in keys {
+        if let Ok(val) = std::env::var(k) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    for p in ENV_FILE_CANDIDATES {
+        if let Ok(file) = File::open(p) {
+            let reader = BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let clean = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+                if let Some((k, v)) = clean.split_once('=') {
+                    let key = k.trim();
+                    let val = v.trim().trim_matches('"').trim_matches('\'');
+                    if !val.is_empty() && keys.contains(&key) {
+                        return Some(val.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone, Debug)]
 struct BybitV5LiveClient {
     api_key: String,
@@ -119,43 +152,8 @@ impl BybitV5LiveClient {
         if !live_capital_enabled {
             return None;
         }
-        let mut api_key = std::env::var("BYBIT_API_KEY").ok();
-        let mut api_secret = std::env::var("BYBIT_API_SECRET").ok();
-
-        if api_key.is_none() || api_secret.is_none() {
-            let env_paths = [
-                ".env",
-                "/home/ubuntu/vortex-rs/.env",
-                "/home/ubuntu/Denk-sekka/.env",
-            ];
-            for p in env_paths {
-                if let Ok(file) = File::open(p) {
-                    let reader = BufReader::new(file);
-                    for line in reader.lines().map_while(Result::ok) {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() || trimmed.starts_with('#') {
-                            continue;
-                        }
-                        let clean = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-                        if let Some((k, v)) = clean.split_once('=') {
-                            let key = k.trim();
-                            let val = v.trim().trim_matches('"').trim_matches('\'').to_owned();
-                            if !val.is_empty() {
-                                match key {
-                                    "BYBIT_API_KEY" | "API_KEY" => api_key = Some(val),
-                                    "BYBIT_API_SECRET" | "API_SECRET" => api_secret = Some(val),
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-                if api_key.is_some() && api_secret.is_some() {
-                    break;
-                }
-            }
-        }
-
+        let api_key = load_env_var_with_fallback(&["BYBIT_API_KEY", "API_KEY"]);
+        let api_secret = load_env_var_with_fallback(&["BYBIT_API_SECRET", "API_SECRET"]);
         let (key, secret) = match (api_key, api_secret) {
             (Some(k), Some(s)) => (k, s),
             _ => {
@@ -166,12 +164,10 @@ impl BybitV5LiveClient {
                 return None;
             }
         };
-
         let client = Self {
             api_key: key,
             api_secret: secret,
         };
-
         for spec in APPROVED_SPECS {
             let sym = spec.symbol_id.name();
             let lev_body = format!(
@@ -180,14 +176,12 @@ impl BybitV5LiveClient {
             );
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
-
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 27 Global Account Lock + Non-Abandoning Exit + 70% Dynamic Ratchet active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 31.1 Global Account Lock + Dual-Speed Elastic Profit Floor active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
     }
-
     fn post_v5(&self, path: &str, json_body: &str) -> Option<serde_json::Value> {
         let ts_ms = (now_epoch_ns() / 1_000_000).to_string();
         let recv_win = "5000";
@@ -572,89 +566,40 @@ impl BybitV5LiveClient {
 }
 
 fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSender<String>> {
-    let mut token = std::env::var("TELEGRAM_BOT_TOKEN")
-        .or_else(|_| std::env::var("TELEGRAM_TOKEN"))
-        .or_else(|_| std::env::var("BOT_TOKEN"))
-        .or_else(|_| std::env::var("TG_BOT_TOKEN"))
-        .or_else(|_| std::env::var("TG_TOKEN"))
-        .ok();
-
-    let mut chat_id = std::env::var("TELEGRAM_CHAT_ID")
-        .or_else(|_| std::env::var("TELEGRAM_CHAT"))
-        .or_else(|_| std::env::var("CHAT_ID"))
-        .or_else(|_| std::env::var("TG_CHAT_ID"))
-        .ok();
-
-    let mut discovered_keys: Vec<String> = Vec::new();
-
-    if token.is_none() || chat_id.is_none() {
-        let env_paths = [
-            ".env",
-            "/home/ubuntu/vortex-rs/.env",
-            "/home/ubuntu/Denk-sekka/.env",
-            "/home/ubuntu/.env",
-        ];
-        for p in env_paths {
-            if let Ok(file) = File::open(p) {
-                let reader = BufReader::new(file);
-                for line in reader.lines().map_while(Result::ok) {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with('#') {
-                        continue;
-                    }
-                    let clean_line = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-                    if let Some((k, v)) = clean_line.split_once('=') {
-                        let key = k.trim();
-                        let val = v.trim().trim_matches('"').trim_matches('\'').to_owned();
-                        if !key.is_empty() && !discovered_keys.iter().any(|x| x == key) {
-                            discovered_keys.push(key.to_owned());
-                        }
-                        if val.is_empty() {
-                            continue;
-                        }
-                        match key {
-                            "TELEGRAM_BOT_TOKEN" | "TELEGRAM_TOKEN" | "BOT_TOKEN"
-                            | "TG_BOT_TOKEN" | "TG_TOKEN" => {
-                                token = Some(val);
-                            }
-                            "TELEGRAM_CHAT_ID" | "TELEGRAM_CHAT" | "CHAT_ID" | "TG_CHAT_ID" => {
-                                chat_id = Some(val);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            if token.is_some() && chat_id.is_some() {
-                break;
-            }
-        }
-    }
-
+    let token = load_env_var_with_fallback(&[
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_TOKEN",
+        "BOT_TOKEN",
+        "TG_BOT_TOKEN",
+        "TG_TOKEN",
+    ]);
+    let chat_id = load_env_var_with_fallback(&[
+        "TELEGRAM_CHAT_ID",
+        "TELEGRAM_CHAT",
+        "CHAT_ID",
+        "TG_CHAT_ID",
+    ]);
     let (bot_token, target_chat) = match (token, chat_id) {
         (Some(t), Some(c)) => (t, c),
         _ => {
             println!(
-                "{}🟠 [TELEGRAM] Missing bot token or chat_id. Keys detected in .env: {:?} (running silent).{}",
-                ANSI_ORANGE, discovered_keys, ANSI_RESET
+                "{}🟠 [TELEGRAM] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in .env (running silent).{}",
+                ANSI_ORANGE, ANSI_RESET
             );
             return None;
         }
     };
-
     let (tx, rx) = sync_channel::<String>(64);
     println!(
         "{}🟢 [TELEGRAM] Asynchronous 1:1 transactional notifier thread active.{}",
         ANSI_GREEN, ANSI_RESET
     );
-
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 STAGE 27 — GLOBAL SINGLE-POSITION LOCK & 70% RATCHET]\nBybit UTA V5 Non-Abandoning Exit + Macro BTC Filter + Signed % Telemetry active."
+        "🟢 [VORTEX-L2 STAGE 31.1 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
     } else {
-        "🟡 [VORTEX-L2 STAGE 27 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟢 [VORTEX-L2 STAGE 31.1 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
-
     thread::spawn(move || {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
         while let Ok(msg) = rx.recv() {
@@ -674,7 +619,6 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
                 .output();
         }
     });
-
     Some(tx)
 }
 
@@ -691,8 +635,6 @@ fn rehydrate_shadow_ledger(
     };
     let reader = BufReader::new(file);
     let mut restored_count: u64 = 0;
-    let mut clean_lines: Vec<String> = Vec::new();
-    let mut purged_count: u64 = 0;
 
     for line in reader.lines().map_while(Result::ok) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -701,12 +643,6 @@ fn rehydrate_shadow_ledger(
                 .get("maker_exit")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
-            if (is_maker && net_bps < 0.0) || false {
-                purged_count += 1;
-                continue;
-            }
-            clean_lines.push(line);
-
             let net_scaled_bps = (net_bps * 100.0).round() as i64;
             let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
             let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
@@ -732,7 +668,6 @@ fn rehydrate_shadow_ledger(
             }
             let fee_scaled_bps: i64 = if is_maker { 400 } else { 750 };
             let gross_scaled_bps = net_scaled_bps + fee_scaled_bps;
-
             let gross_1e8 = (fsm.notional_per_trade_1e8 * gross_scaled_bps) / 1_000_000;
             let fee_1e8 = (fsm.notional_per_trade_1e8 * fee_scaled_bps) / 1_000_000;
             let net_1e8 = gross_1e8 - fee_1e8;
@@ -751,15 +686,6 @@ fn rehydrate_shadow_ledger(
             restored_count += 1;
         }
     }
-
-    if purged_count > 0 {
-        if let Ok(mut f) = File::create(file_path) {
-            for l in &clean_lines {
-                let _ = writeln!(f, "{}", l);
-            }
-        }
-    }
-
     arena
         .exec_closed_count
         .store(restored_count, Ordering::Release);
@@ -772,7 +698,6 @@ fn rehydrate_shadow_ledger(
         ANSI_RESET
     );
 }
-
 fn print_colorized_shadow_trades() -> ExitCode {
     let file_path = Path::new("data/vortex_shadow_trades.jsonl");
     let file = match File::open(file_path) {
@@ -1241,7 +1166,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 27 Global Lock + 70% Ratchet){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 31.1 Dual-Speed Elastic Floor){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),
@@ -1520,7 +1445,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             );
 
                             if let Some(ref tx) = tg_tx {
-                                let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, false);
+                                let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, side));
                                 let alert = format!(
                                     "🟡 [VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?}) | Qty: {}\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT (Dynamic 70% MFE Ratchet)\nServer SL: {}.{:04} USDT (-0.520% | -5.20% @ 10x)",
                                     snap.symbol_id.name(),
@@ -1649,7 +1574,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 * 10_000.0;
                             let cum_pct_1x = cum_bps / 100.0;
                             let cum_pct_10x = cum_bps / 10.0;
-                            let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, false);
+                            let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, summary.side));
                             let (c_col, c_icon, c_badge) = classify_pnl_badge(net_bps);
 
                             println!(

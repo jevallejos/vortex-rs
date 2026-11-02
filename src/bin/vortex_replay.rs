@@ -359,38 +359,93 @@ fn replay_captured_live_parquet_segments() {
                                             side,
                                             &snap,
                                             &btc_leader_snap,
-                                        ) {
-                                            if let Ok(true) =
-                                                fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
-                                            {
-                                                if let OrderLifecycleState::PlacingEntryMaker {
-                                                    side: s_arm,
-                                                    entry_price,
-                                                    qty,
-                                                    ..
-                                                } = fsm.state
-                                                {
-                                                    active_sym = row.symbol_id;
-                                                    active_slot = slot_idx;
-                                                    signals_armed += 1;
-                                                    fifo_sim.submit_post_only(
-                                                        s_arm,
-                                                        entry_price,
-                                                        qty,
-                                                        row.ts_local_ns,
-                                                    );
-                                                    let _ = fsm.on_entry_order_resting(row.ts_local_ns);
-                                                }
-                                            }
+                                        ) && fsm
+                                            .try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
+                                            == Ok(true)
+                                        {
+                                            active_sym = row.symbol_id;
+                                            active_slot = slot_idx;
                                         }
                                     }
                                 }
                             }
-                            OrderLifecycleState::RestingEntryQueue { .. }
-                                if row.symbol_id == active_sym =>
-                            {
-                                if fsm.check_resting_queue_abort(&snap) {
+                            OrderLifecycleState::PlacingEntryMaker {
+                                side,
+                                entry_price,
+                                qty,
+                                submitted_ts,
+                                ..
+                            } if row.symbol_id == active_sym => {
+                                if snap.ts_local_ns.0.saturating_sub(submitted_ts.0)
+                                    >= SIMULATED_ONE_WAY_LATENCY_NS
+                                {
+                                    let post_only_crossed = match side {
+                                        Side::Bid => {
+                                            snap.asks[0].price.0 > 0
+                                                && entry_price.0 >= snap.asks[0].price.0
+                                        }
+                                        Side::Ask => {
+                                            snap.bids[0].price.0 > 0
+                                                && entry_price.0 <= snap.bids[0].price.0
+                                        }
+                                    };
+                                    let signal_still_valid = matches!(
+                                        evaluator.evaluate_entry_signal(&spec, &snap),
+                                        Ok(SignalVerdict::AuthorizeMakerEntry { side: s_now, .. }) if s_now == side
+                                    );
+                                    if post_only_crossed || !signal_still_valid {
+                                        fsm.state = OrderLifecycleState::Idle;
+                                    } else {
+                                        signals_armed += 1;
+                                        let init_q = match side {
+                                            Side::Bid if entry_price.0 == row.best_bid_ticks.0 => {
+                                                row.best_bid_qty
+                                            }
+                                            Side::Ask if entry_price.0 == row.best_ask_ticks.0 => {
+                                                row.best_ask_qty
+                                            }
+                                            _ => LotQty(0),
+                                        };
+                                        fifo_sim.state = SimulatedOrderState::RestingInFifoQueue {
+                                            side,
+                                            limit_price: entry_price,
+                                            order_qty: qty,
+                                            queue_ahead_qty: init_q,
+                                            last_observed_l1_qty: init_q,
+                                        };
+                                        let _ = fsm.on_entry_order_resting(row.ts_local_ns);
+                                    }
+                                }
+                            }
+                            OrderLifecycleState::RestingEntryQueue {
+                                side, entry_price, ..
+                            } if row.symbol_id == active_sym => {
+                                let level_swept = match side {
+                                    Side::Bid => {
+                                        snap.asks[0].price.0 > 0
+                                            && snap.asks[0].price.0 < entry_price.0
+                                    }
+                                    Side::Ask => {
+                                        snap.bids[0].price.0 > 0
+                                            && snap.bids[0].price.0 > entry_price.0
+                                    }
+                                };
+                                let q_ahead_lots = match fifo_sim.state {
+                                    SimulatedOrderState::RestingInFifoQueue {
+                                        queue_ahead_qty,
+                                        ..
+                                    } => queue_ahead_qty.0,
+                                    _ => 0,
+                                };
+                                let toxic_sweep = level_swept
+                                    && q_ahead_lots > 0
+                                    && match side {
+                                        Side::Bid => snap.factor_ofi.get() <= -0.10,
+                                        Side::Ask => snap.factor_ofi.get() >= 0.10,
+                                    };
+                                if toxic_sweep || fsm.check_resting_queue_abort(&snap) {
                                     queue_aborts += 1;
+                                    fsm.state = OrderLifecycleState::Idle;
                                     slot_cooldown_until_ns[active_slot] =
                                         snap.ts_local_ns.0 + 15_000_000_000;
                                     fifo_sim.state = SimulatedOrderState::Inactive;
