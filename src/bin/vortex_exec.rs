@@ -449,7 +449,33 @@ impl BybitV5LiveClient {
             }
 
             if force_market_if_unfilled {
+                // Stage 30 Smart Bailout: on attempt 0, try a 300ms passive BBO PostOnly unwind to save Taker fees;
+                // from attempt >= 1 onwards, fire immediate Market reduceOnly to guarantee hard loss truncation!
                 self.cancel_all_symbol_orders(symbol);
+                if attempt == 0 {
+                    if let Ok(slot) = arena.slot(active_slot) {
+                        if let Ok(latest_snap) = slot.read_snapshot(4) {
+                            let bbo_bailout_px = match open_side {
+                                Side::Bid if latest_snap.asks[0].price.0 > 0 => latest_snap.asks[0].price,
+                                Side::Ask if latest_snap.bids[0].price.0 > 0 => latest_snap.bids[0].price,
+                                _ => entry_price,
+                            };
+                            let (bw, bf) = spec.format_price_usdt_parts(bbo_bailout_px);
+                            let bailout_post_only = format!(
+                                "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",\"price\":\"{}.{:04}\",\"reduceOnly\":true,\"positionIdx\":0}}",
+                                symbol, close_side, pos_qty, bw, bf
+                            );
+                            let _ = self.post_v5("/v5/order/create", &bailout_post_only);
+                            thread::sleep(Duration::from_millis(300));
+                            let (still_open_after_passive, _) = self.get_open_position_size(symbol);
+                            if !still_open_after_passive {
+                                self.cancel_all_symbol_orders(symbol);
+                                return Some(bbo_bailout_px);
+                            }
+                            self.cancel_all_symbol_orders(symbol);
+                        }
+                    }
+                }
                 let mkt_body = format!(
                     "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Market\",\"qty\":\"{}\",\"reduceOnly\":true,\"positionIdx\":0}}",
                     symbol, close_side, pos_qty

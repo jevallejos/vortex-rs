@@ -611,6 +611,35 @@ impl ExecutionFsm {
             let peak_gross_bps =
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
+            // Stage 30 Law 1: Elastic Wald SPRT Early Adverse Unwind (Thesis Invalidation Bailout).
+            // Never wait passively to lose -52.00 bps (-60.00 bps net) if after >= 12s the trade is in
+            // drawdown beyond the volatility-elastic boundary (-12.50 to -16.50 bps) AND both L2 OFI and Trade TFI
+            // have flipped strongly against the position!
+            let sprt_elapsed_ns = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
+            let elastic_sprt_bailout_bps = -((snap.realized_vol_5m.raw() / 4).clamp(1_250, 1_650));
+            let severe_flow_inversion = match side {
+                Side::Bid => snap.factor_ofi.get() < -0.32 && snap.factor_tfi.get() < -0.32,
+                Side::Ask => snap.factor_ofi.get() > 0.32 && snap.factor_tfi.get() > 0.32,
+            };
+            if sprt_elapsed_ns >= 12_000_000_000
+                && current_gross_bps.raw() <= elastic_sprt_bailout_bps
+                && severe_flow_inversion
+            {
+                let bailout_px = if snap.mark_price.0 > 0 {
+                    snap.mark_price
+                } else {
+                    snap.last_trade_price
+                };
+                return Some(self.finalize_close(
+                    ClosedTradeKind::ServerMarkPriceStopLoss,
+                    side,
+                    entry_price,
+                    bailout_px,
+                    snap.ts_local_ns,
+                    ledger,
+                ));
+            }
+
             // Elastic volatility-coupled harvest floor: at least 600 ScaledBps (+2.00 bps net) or 10% of 5m realized vol
             let elastic_vol_floor_bps = (snap.realized_vol_5m.raw() / 10).clamp(600, 750);
             let in_trend_free_ride_zone = peak_gross_bps.raw() > 900;
@@ -881,6 +910,7 @@ impl ExecutionFsm {
 #[derive(Copy, Clone, Debug)]
 pub struct OnlineAdaptiveGovernor {
     ewma_net_bps_x100: [[i64; 2]; 6],
+    cum_net_bps_x100: [[i64; 2]; 6],
     sl_streak: [[u32; 2]; 6],
     win_streak: [[u32; 2]; 6],
     directional_cooldown_until_ns: [[i64; 2]; 6],
@@ -898,7 +928,8 @@ impl OnlineAdaptiveGovernor {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            ewma_net_bps_x100: [[100; 2]; 6],
+            ewma_net_bps_x100: [[200; 2]; 6],
+            cum_net_bps_x100: [[0; 2]; 6],
             sl_streak: [[0; 2]; 6],
             win_streak: [[0; 2]; 6],
             directional_cooldown_until_ns: [[0; 2]; 6],
@@ -913,7 +944,7 @@ impl OnlineAdaptiveGovernor {
         }
     }
 
-    /// Returns `(ewma_net_bps_x100, sl_streak, win_streak)` for forensic AI vault telemetry.
+    /// Returns `(ewma_net_bps_x100, sl_streak, win_streak)` for forensic telemetry.
     #[inline]
     #[must_use]
     pub const fn slot_direction_diagnostics(&self, slot_idx: usize, side: Side) -> (i64, u32, u32) {
@@ -928,7 +959,19 @@ impl OnlineAdaptiveGovernor {
         )
     }
 
-    /// Feeds a closed trade outcome into the online learner to update the slot-direction health state.
+    /// Returns `true` when `(slot_idx, side)` carries an unrecovered cumulative net loss debt (`< -15.00 bps`),
+    /// signaling the execution engine to scale down notional size to probationary half-size until the debt is paid!
+    #[inline]
+    #[must_use]
+    pub const fn is_in_scar_debt(&self, slot_idx: usize, side: Side) -> bool {
+        if slot_idx >= 6 {
+            return false;
+        }
+        let d = Self::dir_idx(side);
+        self.cum_net_bps_x100[slot_idx][d] < -1_500 || self.sl_streak[slot_idx][d] > 0
+    }
+
+    /// Feeds a closed trade outcome into the online learner to update the slot-direction health & scar-debt state.
     #[inline]
     pub fn observe_closed_trade(
         &mut self,
@@ -944,24 +987,34 @@ impl OnlineAdaptiveGovernor {
         let d = Self::dir_idx(side);
         let prev = self.ewma_net_bps_x100[slot_idx][d];
         self.ewma_net_bps_x100[slot_idx][d] = (prev * 75 + net_scaled_bps.raw() * 25) / 100;
+        self.cum_net_bps_x100[slot_idx][d] = self.cum_net_bps_x100[slot_idx][d]
+            .saturating_add(net_scaled_bps.raw())
+            .clamp(-18_000, 18_000);
 
-        if !is_maker_exit || net_scaled_bps.raw() <= -1_000 {
+        if !is_maker_exit || net_scaled_bps.raw() <= -800 {
             let s = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
             self.sl_streak[slot_idx][d] = s;
             self.win_streak[slot_idx][d] = 0;
-            let backoff_ns = 60_000_000_000_i64.saturating_mul(1_i64 << s.min(3));
+            // Exponential directional quarantine: 180s -> 360s -> 720s -> 1440s
+            let backoff_ns = 90_000_000_000_i64.saturating_mul(1_i64 << s.min(4));
             self.directional_cooldown_until_ns[slot_idx][d] = ts_ns.0.saturating_add(backoff_ns);
         } else if net_scaled_bps.raw() > 0 {
             let w = self.win_streak[slot_idx][d].saturating_add(1);
             self.win_streak[slot_idx][d] = w;
-            if self.sl_streak[slot_idx][d] > 0 && w >= 2 {
+            // Anti-Premature-Forgiveness Law: A Stop-Loss scar CANNOT be forgiven by 2 small wins
+            // while cumulative net debt is still deeply negative (< -15.00 bps)!
+            if self.sl_streak[slot_idx][d] > 0
+                && w >= 4
+                && self.cum_net_bps_x100[slot_idx][d] >= -1_500
+            {
                 self.sl_streak[slot_idx][d] -= 1;
+                self.win_streak[slot_idx][d] = 0;
             }
         }
     }
 
-    /// Evaluates whether `(slot_idx, side)` is authorized under the current self-learned regime
-    /// and continuous Slot-0 (`BTCUSDT`) macro composite pressure.
+    /// Evaluates whether `(slot_idx, side)` is authorized under the current self-learned Scar-Debt Ledger
+    /// and continuous Slot-0 (`BTCUSDT`) macro composite & directional flow alignment.
     #[inline]
     #[must_use]
     pub fn authorizes_adaptive_entry(
@@ -989,9 +1042,9 @@ impl OnlineAdaptiveGovernor {
             + 0.20 * btc_leader_snap.factor_geom.get();
 
         let sl_s = self.sl_streak[slot_idx][d] as f64;
-        let ewma = self.ewma_net_bps_x100[slot_idx][d] as f64;
-        let ewma_penalty = if ewma < 0.0 {
-            ((-ewma) / 4_000.0).min(0.18)
+        let debt_bps = self.cum_net_bps_x100[slot_idx][d] as f64;
+        let debt_penalty = if debt_bps < 0.0 {
+            ((-debt_bps) / 25_000.0).min(0.24)
         } else {
             0.0
         };
@@ -1001,19 +1054,23 @@ impl OnlineAdaptiveGovernor {
                 Side::Bid => btc_comp,
                 Side::Ask => -btc_comp,
             };
-            // Elastic macro coherence: altcoins cannot open against adverse BTC composite flow,
-            // and if the slot-direction has prior SL scars, BTC must actively confirm the trend.
-            let min_required_btc_alignment = -0.02 + 0.08 * sl_s;
+            let btc_directional_support = match side {
+                Side::Bid => btc_leader_snap.factor_ofi.get() >= -0.05 && btc_leader_snap.factor_tfi.get() >= 0.0,
+                Side::Ask => btc_leader_snap.factor_ofi.get() <= 0.05 && btc_leader_snap.factor_tfi.get() <= 0.0,
+            };
+            if !btc_directional_support {
+                return false;
+            }
+            let min_required_btc_alignment = 0.04 + 0.10 * sl_s + (debt_penalty * 0.5);
             if signed_btc_alignment < min_required_btc_alignment {
                 return false;
             }
         }
 
-        let adaptive_threshold = (0.42 + 0.09 * sl_s + ewma_penalty).min(0.78);
+        let adaptive_threshold = (0.42 + 0.08 * sl_s + debt_penalty).min(0.78);
         cand_comp >= adaptive_threshold
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
