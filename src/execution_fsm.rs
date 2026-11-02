@@ -913,6 +913,21 @@ impl OnlineAdaptiveGovernor {
         }
     }
 
+    /// Returns `(ewma_net_bps_x100, sl_streak, win_streak)` for forensic AI vault telemetry.
+    #[inline]
+    #[must_use]
+    pub const fn slot_direction_diagnostics(&self, slot_idx: usize, side: Side) -> (i64, u32, u32) {
+        if slot_idx >= 6 {
+            return (0, 0, 0);
+        }
+        let d = Self::dir_idx(side);
+        (
+            self.ewma_net_bps_x100[slot_idx][d],
+            self.sl_streak[slot_idx][d],
+            self.win_streak[slot_idx][d],
+        )
+    }
+
     /// Feeds a closed trade outcome into the online learner to update the slot-direction health state.
     #[inline]
     pub fn observe_closed_trade(

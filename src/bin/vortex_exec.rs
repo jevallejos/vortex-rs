@@ -1074,6 +1074,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
 
     let evaluator = OrthogonalFactorState::new();
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
+    let mut entry_ctx = EntryForensicContext::default();
     let mut fsm = ExecutionFsm::new(OPTIMAL_LIVE_NOTIONAL_1E8, OPTIMAL_LIVE_NOTIONAL_1E8);
     let mut ledger = ParitySyncLedger::new(5_096_000_000);
 
@@ -1468,6 +1469,30 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         last_seen_seq[active_slot] = snap.sequence_id;
 
                         // Save state snapshot before step_open_position in case Bybit close is not yet filled
+                        let cur_mark = if snap.mark_price.0 > 0 {
+                            snap.mark_price
+                        } else {
+                            snap.last_trade_price
+                        };
+                        if cur_mark.0 > 0 {
+                            match open_side {
+                                Side::Bid => {
+                                    if entry_ctx.worst_adverse_price.0 == 0
+                                        || cur_mark.0 < entry_ctx.worst_adverse_price.0
+                                    {
+                                        entry_ctx.worst_adverse_price = cur_mark;
+                                    }
+                                }
+                                Side::Ask => {
+                                    if entry_ctx.worst_adverse_price.0 == 0
+                                        || cur_mark.0 > entry_ctx.worst_adverse_price.0
+                                    {
+                                        entry_ctx.worst_adverse_price = cur_mark;
+                                    }
+                                }
+                            }
+                        }
+
                         let saved_fsm = fsm;
                         let saved_ledger = ledger;
 
