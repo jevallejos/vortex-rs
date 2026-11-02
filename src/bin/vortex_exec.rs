@@ -437,6 +437,7 @@ impl BybitV5LiveClient {
         active_slot: usize,
         spec: &PairSpec,
         summary: &ClosedTradeSummary,
+        last_pegged_price: &mut PriceTicks,
     ) -> Option<PriceTicks> {
         let symbol = spec.symbol_id.name();
         let open_side = summary.side;
@@ -454,7 +455,7 @@ impl BybitV5LiveClient {
             ExecutionFsm::min_profitable_maker_exit_price(open_side, entry_price);
         let defensive_floor_price =
             ExecutionFsm::defensive_zero_loss_maker_exit_price(open_side, entry_price);
-        let mut last_pegged_price = PriceTicks(0);
+        // last_pegged_price persists across peg cycles
         let mut attempt = 0_usize;
 
         while attempt < 8 {
@@ -464,7 +465,7 @@ impl BybitV5LiveClient {
                 let realized_px = if force_market_if_unfilled {
                     candidate_exit
                 } else if last_pegged_price.0 > 0 {
-                    last_pegged_price
+                    *last_pegged_price
                 } else if summary.gross_scaled_bps.raw() >= 580 {
                     profit_floor_price
                 } else if summary.gross_scaled_bps.raw() >= 440 {
@@ -543,9 +544,9 @@ impl BybitV5LiveClient {
                     );
                     if let Some(resp) = self.post_v5("/v5/order/create", &post_only_exit) {
                         if resp.get("retCode").and_then(serde_json::Value::as_i64) == Some(0) {
-                            last_pegged_price = peg_price;
+                            *last_pegged_price = peg_price;
                         } else {
-                            last_pegged_price = PriceTicks(0);
+                            *last_pegged_price = PriceTicks(0);
                         }
                     }
                 }
@@ -558,7 +559,7 @@ impl BybitV5LiveClient {
         if !still_open_end {
             self.cancel_all_symbol_orders(symbol);
             let realized_px = if last_pegged_price.0 > 0 {
-                last_pegged_price
+                *last_pegged_price
             } else if force_market_if_unfilled {
                 candidate_exit
             } else {
@@ -1096,6 +1097,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut prev_l1_qty: LotQty = LotQty(0);
     let mut prev_cum_trade_lots: LotQty = LotQty(0);
     let mut last_seen_seq = [0_u64; 6];
+    let mut last_pegged_exit_price = PriceTicks(0);
     let mut slot_cooldown_until_ns = [0_i64; 6];
 
     rehydrate_shadow_ledger(&mut ledger, &mut fsm, &mut adaptive_gov, arena);
@@ -1543,6 +1545,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     active_slot,
                                     &spec,
                                     &summary,
+                                    &mut last_pegged_exit_price,
                                 );
                             }
                             let realized_exit_price = match confirmed_exit_px {
@@ -1590,6 +1593,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
 
                             slot_cooldown_until_ns[active_slot] =
                                 snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
+                            last_pegged_exit_price = PriceTicks(0);
                             arena.exec_closed_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(0, Ordering::Release);
                             arena.exec_peak_ticks.store(0, Ordering::Release);
