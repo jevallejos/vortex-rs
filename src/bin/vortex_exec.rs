@@ -1,6 +1,6 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, 200.0 Hz Seqlock Reader,
-//! Stage 26 Zero-Orphan Exchange Fill Verifier on Queue Aborts, Startup Multi-Symbol Reconciler,
-//! 15s Anti-Chasing Per-Slot Cooldown, Signed Percentage Telemetry (`+/- %`), and 520-Trade OOS Verifier.
+//! Stage 27 Global Account Single-Position Lock (`settleCoin=USDT`), Non-Abandoning Exchange-Verified Close,
+//! Slot-0 `BTCUSDT` Macro Leader Coherence Filter, Dynamic 70% MFE Ratchet, and 520-Trade OOS Verifier.
 
 use core::sync::atomic::Ordering;
 use std::fs::{File, OpenOptions};
@@ -13,16 +13,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use vortex_rs::execution_fsm::{
-    sign_bybit_v5_hmac_sha256, ClosedTradeSummary, ExecutionFsm, OrderLifecycleState,
+    sign_bybit_v5_hmac_sha256, ClosedTradeKind, ClosedTradeSummary, ExecutionFsm,
+    OrderLifecycleState,
 };
 use vortex_rs::forensic_parquet::ParitySyncLedger;
 use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena};
 use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
 
 pub const TOTAL_OOS_TRADES_GATE: usize = 520;
+
 /// Optimal Live Canary Notional Reference (12.50 USDT in 1e8 fixed-point scale).
 pub const OPTIMAL_LIVE_NOTIONAL_1E8: i64 = 1_250_000_000;
-/// Per-slot anti-chasing cooldown after an unfilled queue abort (15 seconds).
+
+/// Per-slot anti-chasing cooldown after an unfilled queue abort or close (15 seconds).
 pub const SLOT_ABORT_COOLDOWN_NS: i64 = 15_000_000_000;
 
 const ANSI_GREEN: &str = "\x1b[1;32m";
@@ -113,7 +116,6 @@ impl BybitV5LiveClient {
         if !live_capital_enabled {
             return None;
         }
-
         let mut api_key = std::env::var("BYBIT_API_KEY").ok();
         let mut api_secret = std::env::var("BYBIT_API_SECRET").ok();
 
@@ -177,7 +179,7 @@ impl BybitV5LiveClient {
         }
 
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 26 Zero-Orphan Verifier + 10x Optimal Lot + Signed % Telemetry active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 27 Global Account Lock + Non-Abandoning Exit + 70% Dynamic Ratchet active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -254,7 +256,48 @@ impl BybitV5LiveClient {
         let _ = self.post_v5("/v5/order/cancel-all", &body);
     }
 
-    /// Queries `/v5/position/list` and returns `(has_open_position, size_str, side_str)`.
+    /// Queries `/v5/position/list?category=linear&settleCoin=USDT` to inspect ALL open positions across the entire account.
+    /// Returns `Some((symbol, size_str, side_str, avg_price_str))` if any position has `size > 0`.
+    fn get_any_account_open_position(&self) -> Option<(String, String, String, String)> {
+        if let Some(resp) = self.get_v5("/v5/position/list", "category=linear&settleCoin=USDT") {
+            if let Some(list) = resp
+                .get("result")
+                .and_then(|r| r.get("list"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for item in list {
+                    let size_str = item
+                        .get("size")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("0");
+                    let size_f = size_str.parse::<f64>().unwrap_or(0.0);
+                    if size_f > 0.0 {
+                        let sym = item
+                            .get("symbol")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("UNKNOWN");
+                        let side = item
+                            .get("side")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("None");
+                        let avg_p = item
+                            .get("avgPrice")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("0");
+                        return Some((
+                            sym.to_owned(),
+                            size_str.to_owned(),
+                            side.to_owned(),
+                            avg_p.to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Queries `/v5/position/list` for a specific symbol and returns `(has_open_position, size_str, side_str)`.
     fn get_open_position_info(&self, symbol: &str) -> (bool, String, String) {
         let query = format!("category=linear&symbol={}", symbol);
         if let Some(resp) = self.get_v5("/v5/position/list", &query) {
@@ -319,12 +362,11 @@ impl BybitV5LiveClient {
         entry_price: PriceTicks,
         sl_price: PriceTicks,
     ) -> bool {
-        // Pre-flight guard: never send a new entry order if an open position already exists on Bybit
-        let (already_open, existing_qty) = self.get_open_position_size(symbol);
-        if already_open {
+        // GLOBAL ACCOUNT SINGLE-POSITION LOCK: never send a new entry if ANY position is open across the entire USDT account!
+        if let Some((open_sym, existing_qty, open_side, _)) = self.get_any_account_open_position() {
             println!(
-                "{}🟠 [BYBIT V5 DUPLICATE GUARD] {} already has open size={} on exchange — skipping duplicate entry{}",
-                ANSI_ORANGE, symbol, existing_qty, ANSI_RESET
+                "{}🟠 [BYBIT V5 GLOBAL ACCOUNT LOCK] Account already holds open position on {} ({} size={}) — blocking new entry on {}{}",
+                ANSI_ORANGE, open_sym, open_side, existing_qty, symbol, ANSI_RESET
             );
             return false;
         }
@@ -366,7 +408,11 @@ impl BybitV5LiveClient {
         }
     }
 
-    fn execute_maker_only_verified_close(
+    /// Executes a verified close on Bybit WITHOUT abandoning the position:
+    /// - Preserves FIFO queue priority by only re-pegging the `Limit PostOnly reduceOnly` order when the BBO price changes.
+    /// - Returns `true` ONLY when Bybit confirms `0.00` open position size.
+    /// - If `force_market_if_unfilled` is true (e.g., on Stop-Loss), sweeps any remaining size with `Market reduceOnly`.
+    fn execute_verified_close_step(
         &self,
         arena: &VortexShmArena,
         active_slot: usize,
@@ -374,44 +420,88 @@ impl BybitV5LiveClient {
         symbol: &str,
         open_side: Side,
         initial_exit_price: PriceTicks,
-    ) {
+        force_market_if_unfilled: bool,
+    ) -> bool {
         let close_side = match open_side {
             Side::Bid => "Sell",
             Side::Ask => "Buy",
         };
 
+        let mut last_pegged_price = PriceTicks(0);
         let mut attempt = 0_usize;
+
         while attempt < 8 {
-            self.cancel_all_symbol_orders(symbol);
             let (is_open, pos_qty) = self.get_open_position_size(symbol);
             if !is_open {
+                self.cancel_all_symbol_orders(symbol);
                 println!(
-                    "{}🟢 [BYBIT V5 REAL MAKER EXIT CONFIRMED] {} position closed (0.00 remaining){}",
+                    "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed (0.00 remaining){}",
                     ANSI_GREEN, symbol, ANSI_RESET
                 );
-                return;
+                return true;
             }
 
-            let mut peg_price = initial_exit_price;
-            if let Ok(slot) = arena.slot(active_slot) {
-                if let Ok(latest_snap) = slot.read_snapshot(4) {
-                    peg_price = match open_side {
-                        Side::Bid if latest_snap.bids[0].price.0 > 0 => latest_snap.bids[0].price,
-                        Side::Ask if latest_snap.asks[0].price.0 > 0 => latest_snap.asks[0].price,
-                        _ => initial_exit_price,
-                    };
+            if force_market_if_unfilled {
+                self.cancel_all_symbol_orders(symbol);
+                let mkt_body = format!(
+                    "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Market\",\"qty\":\"{}\",\"reduceOnly\":true,\"positionIdx\":0}}",
+                    symbol, close_side, pos_qty
+                );
+                let _ = self.post_v5("/v5/order/create", &mkt_body);
+                thread::sleep(Duration::from_millis(350));
+                let (still_open, _) = self.get_open_position_size(symbol);
+                if !still_open {
+                    return true;
+                }
+            } else {
+                let mut peg_price = initial_exit_price;
+                if let Ok(slot) = arena.slot(active_slot) {
+                    if let Ok(latest_snap) = slot.read_snapshot(4) {
+                        peg_price = match open_side {
+                            Side::Bid if latest_snap.bids[0].price.0 > 0 => latest_snap.bids[0].price,
+                            Side::Ask if latest_snap.asks[0].price.0 > 0 => latest_snap.asks[0].price,
+                            _ => initial_exit_price,
+                        };
+                    }
+                }
+
+                // Only cancel and re-peg if the BBO price moved (preserving FIFO queue priority!)
+                if peg_price.0 != last_pegged_price.0 {
+                    self.cancel_all_symbol_orders(symbol);
+                    let (xw, xf) = spec.format_price_usdt_parts(peg_price);
+                    let post_only_exit = format!(
+                        "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",\"price\":\"{}.{:04}\",\"reduceOnly\":true,\"positionIdx\":0}}",
+                        symbol, close_side, pos_qty, xw, xf
+                    );
+                    if let Some(resp) = self.post_v5("/v5/order/create", &post_only_exit) {
+                        if resp.get("retCode").and_then(serde_json::Value::as_i64) == Some(0) {
+                            last_pegged_price = peg_price;
+                        } else {
+                            last_pegged_price = PriceTicks(0);
+                        }
+                    }
                 }
             }
 
-            let (xw, xf) = spec.format_price_usdt_parts(peg_price);
-            let post_only_exit = format!(
-                "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",\"price\":\"{}.{:04}\",\"reduceOnly\":true,\"positionIdx\":0}}",
-                symbol, close_side, pos_qty, xw, xf
-            );
-            let _ = self.post_v5("/v5/order/create", &post_only_exit);
-            thread::sleep(Duration::from_millis(450));
+            thread::sleep(Duration::from_millis(350));
             attempt += 1;
         }
+
+        let (still_open_end, _) = self.get_open_position_size(symbol);
+        if !still_open_end {
+            self.cancel_all_symbol_orders(symbol);
+            println!(
+                "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed (0.00 remaining){}",
+                ANSI_GREEN, symbol, ANSI_RESET
+            );
+            return true;
+        }
+
+        println!(
+            "{}🟡 [BYBIT V5 EXIT STILL RESTING] {} position still open after peg cycle — retaining FSM custody (no abandonment!){}",
+            ANSI_YELLOW, symbol, ANSI_RESET
+        );
+        false
     }
 }
 
@@ -422,6 +512,7 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
         .or_else(|_| std::env::var("TG_BOT_TOKEN"))
         .or_else(|_| std::env::var("TG_TOKEN"))
         .ok();
+
     let mut chat_id = std::env::var("TELEGRAM_CHAT_ID")
         .or_else(|_| std::env::var("TELEGRAM_CHAT"))
         .or_else(|_| std::env::var("CHAT_ID"))
@@ -429,6 +520,7 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
         .ok();
 
     let mut discovered_keys: Vec<String> = Vec::new();
+
     if token.is_none() || chat_id.is_none() {
         let env_paths = [
             ".env",
@@ -491,9 +583,9 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
     );
 
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 STAGE 26 — ZERO-ORPHAN LIVE CAPITAL ARMED]\nBybit UTA V5 Fill-on-Abort Guard + Signed % Telemetry (+X.XXX% | +X.XX% @ 10x) active."
+        "🟢 [VORTEX-L2 STAGE 27 — GLOBAL SINGLE-POSITION LOCK & 70% RATCHET]\nBybit UTA V5 Non-Abandoning Exit + Macro BTC Filter + Signed % Telemetry active."
     } else {
-        "🟢 [VORTEX-L2 STAGE 26 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟡 [VORTEX-L2 STAGE 27 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
 
@@ -533,7 +625,7 @@ fn rehydrate_shadow_ledger(
     let reader = BufReader::new(file);
     let mut restored_count: u64 = 0;
     let mut clean_lines: Vec<String> = Vec::new();
-    let mut purged_stage17: u64 = 0;
+    let mut purged_count: u64 = 0;
 
     for line in reader.lines().map_while(Result::ok) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -544,7 +636,7 @@ fn rehydrate_shadow_ledger(
                 .unwrap_or(true);
             let en_ticks = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
             if (is_maker && net_bps < 0.0) || (!is_maker && en_ticks == 8888) {
-                purged_stage17 += 1;
+                purged_count += 1;
                 continue;
             }
             clean_lines.push(line);
@@ -572,7 +664,7 @@ fn rehydrate_shadow_ledger(
         }
     }
 
-    if purged_stage17 > 0 {
+    if purged_count > 0 {
         if let Ok(mut f) = File::create(file_path) {
             for l in &clean_lines {
                 let _ = writeln!(f, "{}", l);
@@ -598,7 +690,7 @@ fn print_colorized_shadow_trades() -> ExitCode {
     let file = match File::open(file_path) {
         Ok(f) => f,
         Err(_) => {
-            println!("⚪ (No closed trades yet in data/vortex_shadow_trades.jsonl)");
+            println!("  (No closed trades yet in data/vortex_shadow_trades.jsonl)");
             return ExitCode::SUCCESS;
         }
     };
@@ -627,9 +719,9 @@ fn print_colorized_shadow_trades() -> ExitCode {
             } else {
                 losses += 1;
             }
-
             let net_pct_1x = net_bps / 100.0;
             let net_pct_10x = net_bps / 10.0;
+
             println!(
                 "  {}{} [TRADE #{} {:<7}] {:<9} {:<4} {:<20} | {}t -> {}t | Net: {:+.2} bps ({:+.3}% | {:+.2}% @10x) (Maker={}){}",
                 color,
@@ -701,7 +793,6 @@ fn append_shadow_trade_jsonl(
 pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
     let arena = VortexShmArena::new();
     let spec = APPROVED_SPECS[0];
-
     let initial_wallet_1e8: i64 = 10_000_000_000;
     let mut ledger = ParitySyncLedger::new(initial_wallet_1e8);
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
@@ -754,7 +845,6 @@ pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
 
         fsm.try_arm_maker_entry(&spec, &live_snap, verdict, LotQty(10))
             .map_err(|_| 5_u8)?;
-
         current_ts_ns += 25_000_000;
         let _ = fsm.on_entry_order_resting(TimestampNs(current_ts_ns));
         current_ts_ns += 50_000_000;
@@ -853,7 +943,6 @@ fn print_live_shm_hud() -> ExitCode {
                     Ok(SignalVerdict::NeutralNoAction) => (ANSI_GRAY, "⚪", "NEUTRAL_WAIT"),
                     Err(_) => (ANSI_RED, "🔴", "GUARD_VETO"),
                 };
-
                 println!(
                     "  {}  | {:<10} | {:>12} | {:>7}.{:04} | {:>7}.{:04} | {:>5} | {:>+6.2} | {:>+6.2} | {:>+6.2} | {}{} {}{}",
                     slot_idx,
@@ -902,7 +991,7 @@ fn print_live_shm_hud() -> ExitCode {
 
     println!("------------------------------------------------------------------------------------------");
     println!(
-        "[EXEC FSM LIVE] State: {}{} {}{} | Sym: {} ({}) @ {}t [Peak:{}t | TP:{}t | SL:{}t] (Q: {} lots) | ��Armed: {} | 🟠Aborts: {} | 🟡Fills: {} | 🟢Closed: {}",
+        "[EXEC FSM LIVE] State: {}{} {}{} | Sym: {} ({}) @ {}t [Peak:{}t | TP:{}t | SL:{}t] (Q: {} lots) | 🟡Armed: {} | 🟠Aborts: {} | 🟡Fills: {} | 🟢Closed: {}",
         st_col,
         st_icon,
         state_label,
@@ -932,9 +1021,11 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let arena = region.arena();
     let tg_tx = spawn_async_telegram_notifier(live_capital_enabled);
     let live_client = BybitV5LiveClient::from_env_if_enabled(live_capital_enabled);
+
     let evaluator = OrthogonalFactorState::new();
     let mut fsm = ExecutionFsm::new(OPTIMAL_LIVE_NOTIONAL_1E8, OPTIMAL_LIVE_NOTIONAL_1E8);
     let mut ledger = ParitySyncLedger::new(5_096_000_000);
+
     let mut active_slot: usize = 0;
     let mut resting_queue_ahead: LotQty = LotQty(0);
     let mut prev_l1_qty: LotQty = LotQty(0);
@@ -950,14 +1041,14 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     if saved_state_code == 2 || saved_state_code == 3 {
         let slot_saved = (arena.exec_active_slot.load(Ordering::Acquire) as usize).min(APPROVED_SPECS.len() - 1);
         let sym_name = APPROVED_SPECS[slot_saved].symbol_id.name();
-
         let mut valid_to_restore = true;
+
         if let Some(ref client) = live_client {
             if saved_state_code == 3 {
                 let (has_pos, real_sz) = client.get_open_position_size(sym_name);
                 if !has_pos {
                     println!(
-                        "{}🟠 [BYBIT V5 LIVE SYNC] Clearing simulated SHM position on {} (0.00 real size on Bybit){}",
+                        "{}�� [BYBIT V5 LIVE SYNC] Clearing simulated SHM position on {} (0.00 real size on Bybit){}",
                         ANSI_ORANGE, sym_name, ANSI_RESET
                     );
                     arena.exec_state_code.store(0, Ordering::Release);
@@ -1025,7 +1116,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 26 Zero-Orphan Guard){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 27 Global Lock + 70% Ratchet){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),
@@ -1040,6 +1131,17 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
             OrderLifecycleState::Idle => {
                 arena.exec_state_code.store(0, Ordering::Release);
                 arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+
+                // Read Slot 0 (BTCUSDT) macro flow for cross-asset coherence
+                let mut btc_ofi = 0.0_f64;
+                let mut btc_tfi = 0.0_f64;
+                if let Ok(slot0) = arena.slot(0) {
+                    if let Ok(btc_snap) = slot0.read_snapshot(4) {
+                        btc_ofi = btc_snap.factor_ofi.get();
+                        btc_tfi = btc_snap.factor_tfi.get();
+                    }
+                }
+
                 let mut s = 0;
                 while s < APPROVED_SPECS.len() {
                     let spec = APPROVED_SPECS[s];
@@ -1057,6 +1159,20 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             }
 
                             if let Ok(verdict) = evaluator.evaluate_entry_signal(&spec, &snap) {
+                                // Slot-0 BTCUSDT Macro Leader Coherence Filter for Altcoins (Slots 1..5)
+                                if s > 0 {
+                                    if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
+                                        let macro_contradiction = match side {
+                                            Side::Bid => btc_ofi < -0.25 && btc_tfi < -0.25,
+                                            Side::Ask => btc_ofi > 0.25 && btc_tfi > 0.25,
+                                        };
+                                        if macro_contradiction {
+                                            s += 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+
                                 if let Ok(true) =
                                     fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
                                 {
@@ -1075,9 +1191,11 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                     s += 1;
                 }
             }
-
             OrderLifecycleState::RestingEntryQueue {
-                side, entry_price, ..
+                side,
+                entry_price,
+                target_excursion,
+                ..
             } => {
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(snap) = slot.read_snapshot(4) {
@@ -1132,7 +1250,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 Side::Ask => snap.factor_ofi.get() >= 0.10,
                             };
 
-                        // Check if FSM wants to abort resting order
                         let want_abort = toxic_sweep || fsm.check_resting_queue_abort(&snap);
                         let mut filled_on_exchange_during_abort = false;
 
@@ -1142,8 +1259,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 let (real_filled, real_qty) =
                                     client.get_open_position_size(snap.symbol_id.name());
                                 if real_filled {
-                                    // CRITICAL STAGE 26 GUARD: Order filled on Bybit right before cancel arrived!
-                                    // Promote to PositionOpenMakerExit instead of abandoning as an orphan!
                                     filled_on_exchange_during_abort = true;
                                     println!(
                                         "{}🟢 [BYBIT V5 FILL-ON-ABORT RECOVERED] {} {:?} filled on exchange before cancel arrived (open size={}) — managing position!{}",
@@ -1212,10 +1327,9 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 }
                             }
 
-                            // Reconstruct state before calling on_entry_filled_maker in case check_resting_queue_abort set it to Idle
                             let spec = APPROVED_SPECS[active_slot];
                             let sl_dist_ticks =
-                                ((entry_price.0 * 5_200) / 1_000_000).max(2);
+                                ((entry_price.0 * 5_200) / 1_000_000).max(4);
                             let sl_trig = match side {
                                 Side::Bid => PriceTicks(entry_price.0 - sl_dist_ticks),
                                 Side::Ask => PriceTicks(entry_price.0 + sl_dist_ticks),
@@ -1224,12 +1338,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 side,
                                 entry_price,
                                 qty: LotQty(10),
-                                target_excursion: ScaledBps::from_whole_bps(40),
+                                target_excursion,
                                 sl_trigger_price: sl_trig,
                                 resting_since_ts: snap.ts_local_ns,
                             };
-
                             let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
+
                             let mut tp_t: i64 = 0;
                             let mut sl_t: i64 = 0;
                             if let OrderLifecycleState::PositionOpenMakerExit {
@@ -1271,10 +1385,11 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 sl_f,
                                 ANSI_RESET
                             );
+
                             if let Some(ref tx) = tg_tx {
                                 let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id);
                                 let alert = format!(
-                                    "🟡 [VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?}) | Qty: {}\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT (+0.400% | +4.00% @ 10x)\nServer SL: {}.{:04} USDT (-0.520% | -5.20% @ 10x)",
+                                    "🟡 [VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?}) | Qty: {}\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT (Dynamic 70% MFE Ratchet)\nServer SL: {}.{:04} USDT (-0.520% | -5.20% @ 10x)",
                                     snap.symbol_id.name(),
                                     side,
                                     qty_str,
@@ -1292,8 +1407,15 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                     }
                 }
             }
-
-            OrderLifecycleState::PositionOpenMakerExit { .. } => {
+            OrderLifecycleState::PositionOpenMakerExit {
+                side: open_side,
+                entry_price: open_entry_price,
+                peak_favorable_price: open_peak_price,
+                qty: open_qty,
+                tp_maker_price: open_tp_price,
+                sl_trigger_price: open_sl_price,
+                opened_ts: open_since_ts,
+            } => {
                 if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(snap) = slot.read_snapshot(4) {
                         if snap.sequence_id == last_seen_seq[active_slot] {
@@ -1301,19 +1423,49 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         }
                         last_seen_seq[active_slot] = snap.sequence_id;
 
+                        // Save state snapshot before step_open_position in case Bybit close is not yet filled
+                        let saved_fsm = fsm;
+                        let saved_ledger = ledger;
+
                         if let Some(summary) = fsm.step_open_position(&snap, &mut ledger) {
                             let spec = APPROVED_SPECS[active_slot];
+                            let mut exchange_confirmed_closed = true;
+
                             if let Some(ref client) = live_client {
-                                client.execute_maker_only_verified_close(
+                                let force_mkt = matches!(
+                                    summary.kind,
+                                    ClosedTradeKind::ServerMarkPriceStopLoss
+                                );
+                                exchange_confirmed_closed = client.execute_verified_close_step(
                                     arena,
                                     active_slot,
                                     &spec,
                                     snap.symbol_id.name(),
                                     summary.side,
                                     summary.exit_price,
+                                    force_mkt,
                                 );
                             }
 
+                            if !exchange_confirmed_closed {
+                                // CRITICAL STAGE 27 INVARIANT: Never transition to Idle or log a closed trade
+                                // while the position is still open on Bybit! Restore FSM & Ledger and keep managing!
+                                fsm = saved_fsm;
+                                ledger = saved_ledger;
+                                fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+                                    side: open_side,
+                                    entry_price: open_entry_price,
+                                    peak_favorable_price: open_peak_price,
+                                    qty: open_qty,
+                                    tp_maker_price: open_tp_price,
+                                    sl_trigger_price: open_sl_price,
+                                    opened_ts: open_since_ts,
+                                };
+                                continue;
+                            }
+
+                            slot_cooldown_until_ns[active_slot] =
+                                snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
                             arena.exec_closed_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(0, Ordering::Release);
                             arena.exec_peak_ticks.store(0, Ordering::Release);
@@ -1403,7 +1555,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                     }
                 }
             }
-
             OrderLifecycleState::PlacingEntryMaker {
                 side,
                 entry_price,
@@ -1416,21 +1567,21 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         if snap.ts_local_ns.0.saturating_sub(submitted_ts.0) < 25_000_000 {
                             continue;
                         }
+                        let spec = APPROVED_SPECS[active_slot];
                         let post_only_crossed = match side {
                             Side::Bid => snap.asks[0].price.0 > 0 && entry_price.0 >= snap.asks[0].price.0,
                             Side::Ask => snap.bids[0].price.0 > 0 && entry_price.0 <= snap.bids[0].price.0,
                         };
-                        let flow_died_in_flight = match side {
-                            Side::Bid => snap.factor_ofi.get() <= 0.0 || snap.factor_tfi.get() <= 0.0,
-                            Side::Ask => snap.factor_ofi.get() >= 0.0 || snap.factor_tfi.get() >= 0.0,
-                        };
-                        if post_only_crossed || flow_died_in_flight {
+                        let signal_still_valid = matches!(
+                            evaluator.evaluate_entry_signal(&spec, &snap),
+                            Ok(SignalVerdict::AuthorizeMakerEntry { side: s_now, .. }) if s_now == side
+                        );
+                        if post_only_crossed || !signal_still_valid {
                             fsm.state = OrderLifecycleState::Idle;
                             arena.exec_state_code.store(0, Ordering::Release);
                             continue;
                         }
 
-                        let spec = APPROVED_SPECS[active_slot];
                         if let Some(ref client) = live_client {
                             if !client.place_post_only_entry(
                                 &spec,
@@ -1440,6 +1591,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 sl_trigger_price,
                             ) {
                                 fsm.state = OrderLifecycleState::Idle;
+                                slot_cooldown_until_ns[active_slot] =
+                                    snap.ts_local_ns.0 + 5_000_000_000;
                                 arena.exec_state_code.store(0, Ordering::Release);
                                 continue;
                             }
@@ -1479,7 +1632,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                     }
                 }
             }
-
             OrderLifecycleState::EmergencyStopTriggered { .. }
             | OrderLifecycleState::HaltedByRiskGuard { .. } => {
                 arena.exec_state_code.store(5, Ordering::Release);
@@ -1495,9 +1647,9 @@ fn main() -> ExitCode {
     if std::env::args().any(|a| a == "--trades") {
         return print_colorized_shadow_trades();
     }
-
     let daemon_mode = std::env::args().any(|a| a == "--daemon");
     let live_capital_mode = std::env::args().any(|a| a == "--live-capital");
+
     println!("================================================================================");
     println!("[VORTEX-EXEC V1.0] EXECUTION FSM, PARITY LEDGER & OOS GATE VERIFIER (STAGE 5)");
     println!("================================================================================");
@@ -1506,7 +1658,6 @@ fn main() -> ExitCode {
         Ok((closed_trades, maker_ratio_bps, pf_x100, net_pnl_1e8, parity_drift)) => {
             let net_pnl_usdt_whole = net_pnl_1e8 / 100_000_000;
             let net_pnl_usdt_frac = (net_pnl_1e8.abs() % 100_000_000) / 10_000;
-
             println!(
                 "  {}🟢 -> OOS Closed Trades Verified : {} (Gate >= 500){}",
                 ANSI_GREEN, closed_trades, ANSI_RESET

@@ -1,7 +1,7 @@
 //! Exhaustive Finite-State Machine (`OrderLifecycleState`) for Bybit UTA V5 execution:
-//! 100% `Limit PostOnly` normal exits, Convex MFE Zero-Loss Maker Ratchet,
+//! 100% `Limit PostOnly` normal exits, Two-Zone Dynamic 70% MFE Trailing Ratchet,
 //! Strict 1.50s Anti-Burst Queue Residence Floor, Zero Premature Micro-Scratches,
-//! Structural `-28.00 bps` Server `MarkPrice` Stop-Loss, and `HMAC-SHA256` Signer.
+//! Structural `-52.00 bps` Server `MarkPrice` Stop-Loss, and `HMAC-SHA256` Signer.
 
 use crate::alpha_3factor::SignalVerdict;
 use crate::forensic_parquet::ParitySyncLedger;
@@ -10,15 +10,20 @@ use crate::types::{LotQty, PairSpec, PriceTicks, ScaledBps, Side, TimestampNs, V
 
 /// Cooldown applied ONLY after a real server-side Stop-Loss trigger (60 seconds in nanoseconds).
 pub const STOP_LOSS_COOLDOWN_NS: i64 = 60_000_000_000;
+
 /// Strict minimum residence time in L1 queue before ANY non-TTL cancellation is allowed (1.50 seconds).
 pub const MIN_QUEUE_RESIDENCE_NS: i64 = 1_500_000_000;
+
 /// Maximum time a passive `Limit PostOnly` entry order may sit unfilled in the L1 queue (25 seconds).
 pub const MAX_RESTING_QUEUE_TTL_NS: i64 = 25_000_000_000;
+
 /// Scale-invariant BBO runaway threshold in ScaledBps after 1.5s residence (3.50 bps = 350 units, min 3 ticks).
 pub const BBO_RUNAWAY_SCALED_BPS: i64 = 350;
+
 /// Structural server-side MarkPrice Stop-Loss distance (52.00 bps = 5_200 ScaledBps, min 4 ticks).
 pub const SERVER_SL_DISTANCE_SCALED_BPS: i64 = 5_200;
-/// Maximum hold time for a stagnant net-profitable position (>= +5.00 bps gross / +1.00 bps net) before passive Maker release (180 seconds).
+
+/// Maximum hold time for a stagnant net-profitable position (>= +4.50 bps gross / +0.50 bps net) before passive Maker release (180 seconds).
 pub const STAGNANT_PROFIT_HOLD_NS: i64 = 180_000_000_000;
 
 const SHA256_K: [u32; 64] = [
@@ -72,7 +77,6 @@ impl Sha256State {
                 .wrapping_add(s1);
             i += 1;
         }
-
         let mut a = h[0];
         let mut b = h[1];
         let mut c = h[2];
@@ -81,7 +85,6 @@ impl Sha256State {
         let mut f = h[5];
         let mut g = h[6];
         let mut hh = h[7];
-
         let mut t = 0;
         while t < 64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
@@ -94,7 +97,6 @@ impl Sha256State {
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
-
             hh = g;
             g = f;
             f = e;
@@ -105,7 +107,6 @@ impl Sha256State {
             a = temp1.wrapping_add(temp2);
             t += 1;
         }
-
         h[0] = h[0].wrapping_add(a);
         h[1] = h[1].wrapping_add(b);
         h[2] = h[2].wrapping_add(c);
@@ -133,7 +134,6 @@ impl Sha256State {
     fn finalize(mut self) -> [u8; 32] {
         self.buf[self.buf_len] = 0x80;
         self.buf_len += 1;
-
         if self.buf_len > 56 {
             while self.buf_len < 64 {
                 self.buf[self.buf_len] = 0;
@@ -142,12 +142,10 @@ impl Sha256State {
             Self::compress_block(&mut self.h, &self.buf);
             self.buf_len = 0;
         }
-
         while self.buf_len < 56 {
             self.buf[self.buf_len] = 0;
             self.buf_len += 1;
         }
-
         let bit_bytes = self.total_bits.to_be_bytes();
         let mut i = 0;
         while i < 8 {
@@ -155,7 +153,6 @@ impl Sha256State {
             i += 1;
         }
         Self::compress_block(&mut self.h, &self.buf);
-
         let mut out = [0_u8; 32];
         let mut j = 0;
         while j < 8 {
@@ -183,7 +180,6 @@ pub fn hmac_sha256_hex_segments(secret: &[u8], segments: &[&[u8]]) -> [u8; 64] {
     } else {
         key_block[..secret.len()].copy_from_slice(secret);
     }
-
     let mut ipad = [0x36_u8; 64];
     let mut opad = [0x5c_u8; 64];
     let mut i = 0;
@@ -192,7 +188,6 @@ pub fn hmac_sha256_hex_segments(secret: &[u8], segments: &[&[u8]]) -> [u8; 64] {
         opad[i] ^= key_block[i];
         i += 1;
     }
-
     let mut inner = Sha256State::new();
     inner.update(&ipad);
     for seg in segments {
@@ -361,7 +356,6 @@ impl ExecutionFsm {
         if snap.ts_local_ns.0 < self.cooldown_until_ns.0 {
             return Ok(false);
         }
-
         let (side, target_excursion) = match verdict {
             SignalVerdict::AuthorizeMakerEntry {
                 side,
@@ -370,24 +364,20 @@ impl ExecutionFsm {
             } => (side, target_excursion_scaled_bps),
             SignalVerdict::NeutralNoAction | SignalVerdict::SpoofingVeto => return Ok(false),
         };
-
         let (best_bid, best_ask, _) = match snap.bbo_and_spread_ticks() {
             Some(bbo) => bbo,
             None => return Err(VortexError::InvalidPriceOrTickSpec),
         };
-
         let entry_price = match side {
             Side::Bid => best_bid.price,
             Side::Ask => best_ask.price,
         };
-
         let sl_distance_ticks =
             ((entry_price.0 * SERVER_SL_DISTANCE_SCALED_BPS) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
             Side::Ask => PriceTicks(entry_price.0 + sl_distance_ticks),
         };
-
         let _ = spec;
         PairSpec::validate_stop_loss_geometry(
             side,
@@ -395,7 +385,6 @@ impl ExecutionFsm {
             snap.last_trade_price,
             snap.mark_price,
         )?;
-
         self.state = OrderLifecycleState::PlacingEntryMaker {
             side,
             entry_price,
@@ -431,11 +420,6 @@ impl ExecutionFsm {
         false
     }
 
-    /// Evaluates queue cancellation ONLY after `MIN_QUEUE_RESIDENCE_NS` (1.50s) has elapsed
-    /// (preventing sub-second cancel bursts and preserving FIFO queue priority):
-    /// 1. After 1.50s, both L2 book pressure (`X_OFI`) and trade tape (`X_TFI`) reversed against our side, OR
-    /// 2. After 1.50s, the BBO ran away in front of `entry_price` by `>= 3.50 bps` (min 3 ticks), OR
-    /// 3. Monotonic elapsed time exceeds `MAX_RESTING_QUEUE_TTL_NS` (25s).
     #[inline]
     pub fn check_resting_queue_abort(&mut self, snap: &SymbolLobSnapshot) -> bool {
         if let OrderLifecycleState::RestingEntryQueue {
@@ -447,7 +431,6 @@ impl ExecutionFsm {
         {
             let ofi = snap.factor_ofi.get();
             let tfi = snap.factor_tfi.get();
-            // Immediate protection (0 ms): if BOTH L2 OFI and Trade Tape TFI flip strongly against us, abort immediately
             let joint_flow_reversal = match side {
                 Side::Bid => ofi <= -0.20 && tfi <= -0.25,
                 Side::Ask => ofi >= 0.20 && tfi >= 0.25,
@@ -456,11 +439,9 @@ impl ExecutionFsm {
             let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
             let ttl_expired = elapsed_ns >= MAX_RESTING_QUEUE_TTL_NS;
 
-            // Anti-burst residence floor (1.50s) applies strictly to BBO runaway re-pegs
             let residence_satisfied = elapsed_ns >= MIN_QUEUE_RESIDENCE_NS;
             let runaway_allowance_ticks =
                 ((entry_price.0 * BBO_RUNAWAY_SCALED_BPS) / 1_000_000).max(3);
-
             let bbo_runaway = if residence_satisfied {
                 match snap.bbo_and_spread_ticks() {
                     Some((best_bid, best_ask, _)) => match side {
@@ -492,8 +473,9 @@ impl ExecutionFsm {
             ..
         } = self.state
         {
+            let capped_tp_bps = target_excursion.raw().clamp(3_500, 6_500);
             let tp_delta_ticks =
-                ((entry_price.0 * target_excursion.raw()) / 1_000_000).max(2);
+                ((entry_price.0 * capped_tp_bps) / 1_000_000).max(2);
             let tp_maker_price = match side {
                 Side::Bid => PriceTicks(entry_price.0 + tp_delta_ticks),
                 Side::Ask => PriceTicks((entry_price.0 - tp_delta_ticks).max(1)),
@@ -546,10 +528,10 @@ impl ExecutionFsm {
             snap.mark_price
         };
 
-        // 1. Catastrophic server-side MarkPrice Stop-Loss (-28.00 bps)
+        // 1. Catastrophic server-side MarkPrice Stop-Loss (-52.00 bps)
         let sl_hit = match side {
-            Side::Bid => snap.mark_price.0 <= sl_trigger_price.0,
-            Side::Ask => snap.mark_price.0 >= sl_trigger_price.0,
+            Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= sl_trigger_price.0,
+            Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= sl_trigger_price.0,
         };
         if sl_hit {
             let sl_fill_price = match side {
@@ -575,8 +557,8 @@ impl ExecutionFsm {
 
         // 2. Passive Limit PostOnly structural Take-Profit fill
         let tp_hit = match side {
-            Side::Bid => ref_trade_price.0 >= tp_maker_price.0,
-            Side::Ask => ref_trade_price.0 <= tp_maker_price.0,
+            Side::Bid => ref_trade_price.0 > 0 && ref_trade_price.0 >= tp_maker_price.0,
+            Side::Ask => ref_trade_price.0 > 0 && ref_trade_price.0 <= tp_maker_price.0,
         };
         if tp_hit {
             return Some(self.finalize_close(
@@ -589,13 +571,12 @@ impl ExecutionFsm {
             ));
         }
 
-        // 3. Convex MFE Zero-Loss Ratchet & Positive Maker Unwind (zero premature micro-scratches)
+        // 3. Two-Zone Exit Physics: Survival (< 8.00 bps gross) + Dynamic 70% Net MFE Ratchet (> 8.00 bps gross)
         if let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() {
             let bbo_exit_price = match side {
                 Side::Bid => best_bid.price,
                 Side::Ask => best_ask.price,
             };
-
             match side {
                 Side::Bid => {
                     if bbo_exit_price.0 > peak_favorable_price.0 {
@@ -630,29 +611,41 @@ impl ExecutionFsm {
             let peak_gross_bps =
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
-            // Condition A: Flow reversal while in net Maker profit (>= +4.40 bps gross = +0.40 bps net, capturing 10-tick TAO & 4-tick SUI moves)
+            // Zone 2 activates once Peak exceeds +8.00 bps gross (+4.00 bps net above 4.00 bps Maker-Maker fee)
+            let in_trend_free_ride_zone = peak_gross_bps.raw() > 800;
+
             let ofi_reversed = match side {
                 Side::Bid => snap.factor_ofi.get() < -0.05,
                 Side::Ask => snap.factor_ofi.get() > 0.05,
             };
-            let flow_unwind = current_gross_bps.raw() >= 440 && ofi_reversed;
+            let flow_unwind = !in_trend_free_ride_zone
+                && current_gross_bps.raw() >= 440
+                && ofi_reversed;
 
-            // Condition B: MFE Zero-Loss Ratchet (reached >= +5.50 bps gross, protecting >= +4.20 bps gross = +0.20 bps net)
-            let mfe_ratchet_unwind = peak_gross_bps.raw() >= 550
-                && current_gross_bps.raw() >= 420
-                && current_gross_bps.raw() <= (peak_gross_bps.raw() * 75) / 100;
-
-            // Condition C: Proven Stage-20 20s profit harvest (>= +4.20 bps gross = +0.20 bps net) & 15s Scratch escape (>= +4.00 bps gross)
             let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
-            let early_harvest = hold_elapsed >= 20_000_000_000 && current_gross_bps.raw() >= 420;
+            let early_harvest = !in_trend_free_ride_zone
+                && hold_elapsed >= 25_000_000_000
+                && current_gross_bps.raw() >= 440;
+
             let joint_adverse = match side {
                 Side::Bid => snap.factor_ofi.get() < -0.15 && snap.factor_tfi.get() < -0.15,
                 Side::Ask => snap.factor_ofi.get() > 0.15 && snap.factor_tfi.get() > 0.15,
             };
-            let scratch_escape =
-                hold_elapsed >= 15_000_000_000 && current_gross_bps.raw() >= 400 && joint_adverse;
+            let scratch_escape = !in_trend_free_ride_zone
+                && hold_elapsed >= 15_000_000_000
+                && current_gross_bps.raw() >= 410
+                && joint_adverse;
             let stagnant_unwind =
-                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 400;
+                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 410;
+
+            let mfe_ratchet_unwind = if in_trend_free_ride_zone {
+                let dynamic_70pct_floor = 400 + ((peak_gross_bps.raw() - 400) * 70) / 100;
+                current_gross_bps.raw() >= 480 && current_gross_bps.raw() <= dynamic_70pct_floor
+            } else {
+                peak_gross_bps.raw() >= 550
+                    && current_gross_bps.raw() >= 420
+                    && current_gross_bps.raw() <= (peak_gross_bps.raw() * 75) / 100
+            };
 
             if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {
                 return Some(self.finalize_close(
@@ -744,7 +737,7 @@ impl ExecutionFsm {
     }
 
     #[inline]
-    fn finalize_close(
+    pub fn finalize_close(
         &mut self,
         kind: ClosedTradeKind,
         side: Side,
@@ -758,7 +751,6 @@ impl ExecutionFsm {
             ClosedTradeKind::MakerStructuralTp | ClosedTradeKind::MakerPassiveUnwind => true,
             ClosedTradeKind::ServerMarkPriceStopLoss => false,
         };
-
         let fee_scaled_bps = if is_maker_exit {
             ScaledBps(
                 ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw()
@@ -770,14 +762,12 @@ impl ExecutionFsm {
                     + ScaledBps::BYBIT_VIP0_TAKER_FEE_BPS.raw(),
             )
         };
-
         let net_scaled_bps = ScaledBps(gross_scaled_bps.raw() - fee_scaled_bps.raw());
         let gross_pnl_1e8 = (self.notional_per_trade_1e8 * gross_scaled_bps.raw()) / 1_000_000;
         let fee_1e8 = (self.notional_per_trade_1e8 * fee_scaled_bps.raw()) / 1_000_000;
         let net_pnl_1e8 = gross_pnl_1e8 - fee_1e8;
 
         ledger.record_closed_trade(gross_pnl_1e8, fee_1e8);
-
         if is_maker_exit {
             self.maker_exits_count += 1;
             self.cooldown_until_ns = TimestampNs(0);
@@ -846,7 +836,6 @@ mod tests {
             core::str::from_utf8(&sig),
             Ok("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
         );
-
         let bybit_sig = sign_bybit_v5_hmac_sha256(
             "1700000000000",
             "TESTKEY",
@@ -916,6 +905,61 @@ mod tests {
         if let Some(s) = closed {
             assert_eq!(s.kind, ClosedTradeKind::MakerPassiveUnwind);
             assert!(s.net_scaled_bps.raw() > 150);
+        }
+    }
+
+    #[test]
+    fn test_stage27_dynamic_70pct_mfe_ratchet_rides_trend_and_locks_profit() {
+        let mut ledger = ParitySyncLedger::new(10_000_000_000);
+        let mut fsm = ExecutionFsm::new(1_250_000_000, 1_250_000_000);
+
+        fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+            side: Side::Bid,
+            entry_price: PriceTicks(10_000),
+            peak_favorable_price: PriceTicks(10_000),
+            qty: LotQty(10),
+            tp_maker_price: PriceTicks(10_065),
+            sl_trigger_price: PriceTicks(9_948),
+            opened_ts: TimestampNs(1_000_000_000),
+        };
+
+        // 1. Price surges to 10_024 (+24.00 bps gross / +20.00 bps net). Dynamic 70% floor = 400 + 0.70*(2000) = 1800 (+18.00 bps gross).
+        let mut snap_peak = SymbolLobSnapshot::default();
+        snap_peak.ts_local_ns = TimestampNs(70_000_000_000);
+        snap_peak.bids[0] = BookLevel {
+            price: PriceTicks(10_024),
+            qty: LotQty(100),
+        };
+        snap_peak.asks[0] = BookLevel {
+            price: PriceTicks(10_025),
+            qty: LotQty(100),
+        };
+        snap_peak.last_trade_price = PriceTicks(10_024);
+        snap_peak.mark_price = PriceTicks(10_024);
+        snap_peak.factor_ofi = BoundedScore::new_clamped(-0.40);
+        assert!(fsm.step_open_position(&snap_peak, &mut ledger).is_none());
+
+        // 2. Price pulls back slightly to 10_019 (+19.00 bps gross > +18.00 bps floor) with negative OFI: must KEEP RIDING!
+        let mut snap_pullback = snap_peak;
+        snap_pullback.ts_local_ns = TimestampNs(75_000_000_000);
+        snap_pullback.bids[0].price = PriceTicks(10_019);
+        snap_pullback.asks[0].price = PriceTicks(10_020);
+        snap_pullback.last_trade_price = PriceTicks(10_019);
+        snap_pullback.mark_price = PriceTicks(10_019);
+        assert!(fsm.step_open_position(&snap_pullback, &mut ledger).is_none());
+
+        // 3. Price touches the 70% dynamic ratchet floor at 10_018 (+18.00 bps gross = +14.00 bps net): harvests immediately!
+        let mut snap_harvest = snap_peak;
+        snap_harvest.ts_local_ns = TimestampNs(80_000_000_000);
+        snap_harvest.bids[0].price = PriceTicks(10_018);
+        snap_harvest.asks[0].price = PriceTicks(10_019);
+        snap_harvest.last_trade_price = PriceTicks(10_018);
+        snap_harvest.mark_price = PriceTicks(10_018);
+        let summary = fsm.step_open_position(&snap_harvest, &mut ledger);
+        assert!(summary.is_some());
+        if let Some(s) = summary {
+            assert_eq!(s.net_scaled_bps.raw(), 1_400);
+            assert!(s.is_maker_exit);
         }
     }
 
@@ -1008,7 +1052,6 @@ mod tests {
             target_excursion_scaled_bps: ScaledBps::from_whole_bps(42),
             estimated_cost_rt_scaled_bps: ScaledBps(480),
         };
-
         assert_eq!(
             fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10)),
             Ok(true)
@@ -1071,7 +1114,6 @@ mod tests {
             target_excursion_scaled_bps: ScaledBps::from_whole_bps(40),
             estimated_cost_rt_scaled_bps: ScaledBps(480),
         };
-
         assert_eq!(
             fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10)),
             Ok(true)

@@ -23,7 +23,7 @@ jobs:
       - name: Gate 1 — Static Linter (Zero Warnings, Zero Unwraps/Panics)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Gate 2 — Unit & Integration Test Suite (14/14 Passed)
+      - name: Gate 2 — Unit & Integration Test Suite (17/17 Passed)
         run: cargo test --all-targets
 
       - name: Gate 3 — Build LTO Release Binaries (x86_64 Linux)
@@ -35,10 +35,10 @@ jobs:
           ./target/release/vortex_replay
           ./target/release/vortex_exec
 
-      - name: Package Certified Linux x86_64 Binaries with Commit SHA Seal
+      - name: Package Certified Linux x86_64 Binaries & Cryptographic COMMIT_SHA
         run: |
-          git rev-parse HEAD > target/release/COMMIT_SHA
-          tar -czf vortex-linux-x86_64.tar.gz -C target/release vortex_tap vortex_replay vortex_exec COMMIT_SHA
+          echo "${GITHUB_SHA}" > COMMIT_SHA
+          tar -czf vortex-linux-x86_64.tar.gz -C target/release vortex_tap vortex_replay vortex_exec
           sha256sum vortex-linux-x86_64.tar.gz > vortex-linux-x86_64.tar.gz.sha256
 
       - name: Upload Certified Artifact
@@ -46,6 +46,7 @@ jobs:
         with:
           name: vortex-linux-x86_64
           path: |
+            COMMIT_SHA
             vortex-linux-x86_64.tar.gz
             vortex-linux-x86_64.tar.gz.sha256
 
@@ -55,7 +56,7 @@ jobs:
           tag_name: latest-linux-x86_64
           name: "VORTEX-L2 Certified Linux x86_64 Binaries (Latest Main)"
           prerelease: false
-          overwrite: true
           files: |
+            COMMIT_SHA
             vortex-linux-x86_64.tar.gz
             vortex-linux-x86_64.tar.gz.sha256
