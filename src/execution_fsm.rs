@@ -641,11 +641,11 @@ impl ExecutionFsm {
 
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
                 let dynamic_70pct_floor = 400 + ((peak_gross_bps.raw() - 400) * 70) / 100;
-                current_gross_bps.raw() >= 600 && current_gross_bps.raw() <= dynamic_70pct_floor
+                current_gross_bps.raw() >= 480 && current_gross_bps.raw() <= dynamic_70pct_floor
             } else {
-                peak_gross_bps.raw() >= 750
-                    && current_gross_bps.raw() >= 580
-                    && current_gross_bps.raw() <= (peak_gross_bps.raw() * 78) / 100
+                peak_gross_bps.raw() >= 550
+                    && current_gross_bps.raw() >= 480
+                    && current_gross_bps.raw() <= (peak_gross_bps.raw() * 75) / 100
             };
 
             if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {
