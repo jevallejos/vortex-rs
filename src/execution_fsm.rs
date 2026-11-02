@@ -611,40 +611,41 @@ impl ExecutionFsm {
             let peak_gross_bps =
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
-            // Zone 2 activates once Peak exceeds +8.00 bps gross (+4.00 bps net above 4.00 bps Maker-Maker fee)
-            let in_trend_free_ride_zone = peak_gross_bps.raw() > 800;
+            // Elastic volatility-coupled harvest floor: at least 600 ScaledBps (+2.00 bps net) or 10% of 5m realized vol
+            let elastic_vol_floor_bps = (snap.realized_vol_5m.raw() / 10).clamp(600, 750);
+            let in_trend_free_ride_zone = peak_gross_bps.raw() > 900;
 
             let ofi_reversed = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.05,
-                Side::Ask => snap.factor_ofi.get() > 0.05,
+                Side::Bid => snap.factor_ofi.get() < -0.08,
+                Side::Ask => snap.factor_ofi.get() > 0.08,
             };
             let flow_unwind = !in_trend_free_ride_zone
-                && current_gross_bps.raw() >= 440
+                && current_gross_bps.raw() >= elastic_vol_floor_bps
                 && ofi_reversed;
 
             let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
             let early_harvest = !in_trend_free_ride_zone
-                && hold_elapsed >= 25_000_000_000
-                && current_gross_bps.raw() >= 440;
+                && hold_elapsed >= 30_000_000_000
+                && current_gross_bps.raw() >= elastic_vol_floor_bps;
 
             let joint_adverse = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.15 && snap.factor_tfi.get() < -0.15,
-                Side::Ask => snap.factor_ofi.get() > 0.15 && snap.factor_tfi.get() > 0.15,
+                Side::Bid => snap.factor_ofi.get() < -0.20 && snap.factor_tfi.get() < -0.20,
+                Side::Ask => snap.factor_ofi.get() > 0.20 && snap.factor_tfi.get() > 0.20,
             };
             let scratch_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= 15_000_000_000
-                && current_gross_bps.raw() >= 410
+                && hold_elapsed >= 20_000_000_000
+                && current_gross_bps.raw() >= 560
                 && joint_adverse;
             let stagnant_unwind =
-                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 410;
+                hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 560;
 
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
                 let dynamic_70pct_floor = 400 + ((peak_gross_bps.raw() - 400) * 70) / 100;
-                current_gross_bps.raw() >= 480 && current_gross_bps.raw() <= dynamic_70pct_floor
+                current_gross_bps.raw() >= 600 && current_gross_bps.raw() <= dynamic_70pct_floor
             } else {
-                peak_gross_bps.raw() >= 550
-                    && current_gross_bps.raw() >= 420
-                    && current_gross_bps.raw() <= (peak_gross_bps.raw() * 75) / 100
+                peak_gross_bps.raw() >= 750
+                    && current_gross_bps.raw() >= 580
+                    && current_gross_bps.raw() <= (peak_gross_bps.raw() * 78) / 100
             };
 
             if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {
@@ -728,9 +729,10 @@ impl ExecutionFsm {
         side: Side,
         entry_price: PriceTicks,
     ) -> PriceTicks {
-        let fee_breakeven_ticks = (entry_price.0.saturating_mul(400) + 999_999) / 1_000_000;
-        let min_profit_delta_ticks = if fee_breakeven_ticks + 1 > 2 {
-            fee_breakeven_ticks + 1
+        // Elastic 1.5x Fee-Share Law: requires at least 600 ScaledBps (6.00 bps gross -> >= +2.00 bps net after 4.00 bps fee)
+        let target_600bps_ticks = (entry_price.0.saturating_mul(600) + 999_999) / 1_000_000;
+        let min_profit_delta_ticks = if target_600bps_ticks > 2 {
+            target_600bps_ticks
         } else {
             2
         };

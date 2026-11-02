@@ -98,9 +98,9 @@ const fn compute_optimal_50usdt_wallet_qty_str(symbol_id: SymbolId) -> &'static 
         1 => "0.001",
         2 => "0.01",
         3 => "0.2",
-        4 => "1.4",
-        5 => "0.05",
-        6 => "14",
+        4 => "2.6",
+        5 => "0.1",
+        6 => "25",
         _ => "1",
     }
 }
@@ -642,6 +642,7 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
 fn rehydrate_shadow_ledger(
     ledger: &mut ParitySyncLedger,
     fsm: &mut ExecutionFsm,
+    adaptive_gov: &mut OnlineAdaptiveGovernor,
     arena: &VortexShmArena,
 ) {
     let file_path = Path::new("data/vortex_shadow_trades.jsonl");
@@ -669,6 +670,28 @@ fn rehydrate_shadow_ledger(
             clean_lines.push(line);
 
             let net_scaled_bps = (net_bps * 100.0).round() as i64;
+            let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
+            let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+            let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let slot_opt = match sym_str {
+                "BTCUSDT" => Some(0),
+                "ETHUSDT" => Some(1),
+                "SOLUSDT" => Some(2),
+                "AVAXUSDT" => Some(3),
+                "TAOUSDT" => Some(4),
+                "SUIUSDT" => Some(5),
+                _ => None,
+            };
+            if let Some(s_idx) = slot_opt {
+                let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                adaptive_gov.observe_closed_trade(
+                    s_idx,
+                    s_side,
+                    ScaledBps(net_scaled_bps),
+                    is_maker,
+                    TimestampNs(ts_saved),
+                );
+            }
             let fee_scaled_bps: i64 = if is_maker { 400 } else { 750 };
             let gross_scaled_bps = net_scaled_bps + fee_scaled_bps;
 
@@ -1061,7 +1084,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut last_seen_seq = [0_u64; 6];
     let mut slot_cooldown_until_ns = [0_i64; 6];
 
-    rehydrate_shadow_ledger(&mut ledger, &mut fsm, arena);
+    rehydrate_shadow_ledger(&mut ledger, &mut fsm, &mut adaptive_gov, arena);
 
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
     let mut tracked_sym_on_startup: Option<&'static str> = None;
