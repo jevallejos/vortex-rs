@@ -820,23 +820,59 @@ fn append_shadow_trade_jsonl(
 ) {
     let data_dir = Path::new("data");
     let _ = std::fs::create_dir_all(data_dir);
-    let file_path = data_dir.join("vortex_shadow_trades.jsonl");
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(file_path) {
+    let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
+    let gross_bps = (summary.gross_scaled_bps.raw() as f64) / 100.0;
+    let fee_bps = if summary.is_maker_exit { 4.00 } else { 7.50 };
+    let fee_drag_pct = if gross_bps > 0.01 {
+        (fee_bps / gross_bps) * 100.0
+    } else {
+        100.0
+    };
+    let floor_ticks =
+        ExecutionFsm::min_profitable_maker_exit_price(summary.side, summary.entry_price).0;
+    let ts_ns = now_epoch_ns();
+    let pf_x100 = fsm.net_profit_factor_x100();
+
+    let shadow_path = data_dir.join("vortex_shadow_trades.jsonl");
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(shadow_path) {
         let line = format!(
             "{{\"ts_ns\":{},\"symbol\":\"{}\",\"kind\":\"{:?}\",\"side\":\"{:?}\",\"entry_ticks\":{},\"exit_ticks\":{},\"net_bps\":{:.2},\"maker_exit\":{},\"total_trades\":{},\"pf_x100\":{},\"cum_net_pnl_1e8\":{}}}\n",
-            now_epoch_ns(),
+            ts_ns,
             symbol,
             summary.kind,
             summary.side,
             summary.entry_price.0,
             summary.exit_price.0,
-            (summary.net_scaled_bps.raw() as f64) / 100.0,
+            net_bps,
             summary.is_maker_exit,
             ledger.closed_trades_count,
-            fsm.net_profit_factor_x100(),
+            pf_x100,
             ledger.cumulative_net_pnl_1e8
         );
         let _ = f.write_all(line.as_bytes());
+    }
+
+    let vault_path = data_dir.join("vortex_ai_forensic_vault.jsonl");
+    if let Ok(mut vf) = OpenOptions::new().create(true).append(true).open(vault_path) {
+        let vline = format!(
+            "{{\"event\":\"TRADE_CLOSE\",\"trade_id\":{},\"ts_ns\":{},\"symbol\":\"{}\",\"side\":\"{:?}\",\"kind\":\"{:?}\",\"maker_exit\":{},\"entry_ticks\":{},\"exit_ticks\":{},\"floor_ticks\":{},\"gross_bps\":{:.2},\"fee_bps\":{:.2},\"net_bps\":{:.2},\"fee_drag_pct\":{:.1},\"pf_x100\":{},\"cum_net_pnl_1e8\":{}}}\n",
+            ledger.closed_trades_count,
+            ts_ns,
+            symbol,
+            summary.side,
+            summary.kind,
+            summary.is_maker_exit,
+            summary.entry_price.0,
+            summary.exit_price.0,
+            floor_ticks,
+            gross_bps,
+            fee_bps,
+            net_bps,
+            fee_drag_pct,
+            pf_x100,
+            ledger.cumulative_net_pnl_1e8
+        );
+        let _ = vf.write_all(vline.as_bytes());
     }
 }
 
@@ -1074,7 +1110,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
 
     let evaluator = OrthogonalFactorState::new();
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
-    let mut entry_ctx = EntryForensicContext::default();
     let mut fsm = ExecutionFsm::new(OPTIMAL_LIVE_NOTIONAL_1E8, OPTIMAL_LIVE_NOTIONAL_1E8);
     let mut ledger = ParitySyncLedger::new(5_096_000_000);
 
@@ -1469,30 +1504,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         last_seen_seq[active_slot] = snap.sequence_id;
 
                         // Save state snapshot before step_open_position in case Bybit close is not yet filled
-                        let cur_mark = if snap.mark_price.0 > 0 {
-                            snap.mark_price
-                        } else {
-                            snap.last_trade_price
-                        };
-                        if cur_mark.0 > 0 {
-                            match open_side {
-                                Side::Bid => {
-                                    if entry_ctx.worst_adverse_price.0 == 0
-                                        || cur_mark.0 < entry_ctx.worst_adverse_price.0
-                                    {
-                                        entry_ctx.worst_adverse_price = cur_mark;
-                                    }
-                                }
-                                Side::Ask => {
-                                    if entry_ctx.worst_adverse_price.0 == 0
-                                        || cur_mark.0 > entry_ctx.worst_adverse_price.0
-                                    {
-                                        entry_ctx.worst_adverse_price = cur_mark;
-                                    }
-                                }
-                            }
-                        }
-
                         let saved_fsm = fsm;
                         let saved_ledger = ledger;
 
@@ -1790,56 +1801,6 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
-}
-
-
-const AI_FORENSIC_VAULT_PATH: &str = "data/vortex_ai_forensic_vault.jsonl";
-
-#[derive(Copy, Clone, Debug)]
-struct EntryForensicContext {
-    armed_ts_ns: i64,
-    fill_ts_ns: i64,
-    queue_ahead_lots: u64,
-    entry_spread_ticks: i64,
-    entry_vol_5m_bps: i64,
-    entry_ofi: f64,
-    entry_tfi: f64,
-    entry_geom: f64,
-    entry_btc_ofi: f64,
-    entry_btc_tfi: f64,
-    entry_btc_geom: f64,
-    worst_adverse_price: PriceTicks,
-}
-
-impl Default for EntryForensicContext {
-    fn default() -> Self {
-        Self {
-            armed_ts_ns: 0,
-            fill_ts_ns: 0,
-            queue_ahead_lots: 0,
-            entry_spread_ticks: 1,
-            entry_vol_5m_bps: 6000,
-            entry_ofi: 0.0,
-            entry_tfi: 0.0,
-            entry_geom: 0.0,
-            entry_btc_ofi: 0.0,
-            entry_btc_tfi: 0.0,
-            entry_btc_geom: 0.0,
-            worst_adverse_price: PriceTicks(0),
-        }
-    }
-}
-
-fn append_ai_forensic_vault_line(json_line: &str) {
-    let _ = std::fs::create_dir_all("data");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(AI_FORENSIC_VAULT_PATH)
-    {
-        use std::io::Write;
-        let _ = writeln!(file, "{}", json_line);
-    }
 }
 
 #[cfg(test)]
