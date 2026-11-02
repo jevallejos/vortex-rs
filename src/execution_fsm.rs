@@ -640,10 +640,11 @@ impl ExecutionFsm {
             };
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= 15_000_000_000
-                && current_gross_bps.raw() >= 600
+                && current_gross_bps.raw() >= 440
                 && joint_adverse;
             let struggling_rescue = !in_trend_free_ride_zone
-                && hold_elapsed >= 45_000_000_000
+                && ((hold_elapsed >= 45_000_000_000 && ofi_reversed)
+                    || hold_elapsed >= 90_000_000_000)
                 && peak_gross_bps.raw() < 600
                 && current_gross_bps.raw() >= 440;
             let stagnant_unwind = struggling_rescue
@@ -949,6 +950,8 @@ pub struct OnlineAdaptiveGovernor {
     global_dir_cooldown_until_ns: [i64; 2],
     ewma_fast_px_1e4: [i64; 6],
     ewma_slow_px_1e4: [i64; 6],
+    last_price_sample_ts_ns: [i64; 6],
+    wave_anchor_px_1e4: [[i64; 2]; 6],
 }
 
 impl Default for OnlineAdaptiveGovernor {
@@ -973,6 +976,8 @@ impl OnlineAdaptiveGovernor {
             global_dir_cooldown_until_ns: [0; 2],
             ewma_fast_px_1e4: [0; 6],
             ewma_slow_px_1e4: [0; 6],
+            last_price_sample_ts_ns: [0; 6],
+            wave_anchor_px_1e4: [[0; 2]; 6],
         }
     }
 
@@ -984,7 +989,35 @@ impl OnlineAdaptiveGovernor {
         }
     }
 
-    /// Updates continuous fast (`alpha=1/32`) and slow macro (`alpha=1/512`) price EWMAs in `1e4` fixed-point scale.
+    /// Rehydrates price EWMAs and directional wave anchors from historical `.jsonl` trades on startup.
+    #[inline]
+    pub fn seed_historical_price(
+        &mut self,
+        slot_idx: usize,
+        side: Side,
+        entry_ticks: i64,
+        exit_ticks: i64,
+    ) {
+        if slot_idx >= 6 || entry_ticks <= 0 || exit_ticks <= 0 {
+            return;
+        }
+        let d = Self::dir_idx(side);
+        let en_1e4 = entry_ticks.saturating_mul(10_000);
+        let ex_1e4 = exit_ticks.saturating_mul(10_000);
+        if self.ewma_slow_px_1e4[slot_idx] <= 0 {
+            self.ewma_fast_px_1e4[slot_idx] = ex_1e4;
+            self.ewma_slow_px_1e4[slot_idx] = en_1e4;
+        } else {
+            self.ewma_fast_px_1e4[slot_idx] = (self.ewma_fast_px_1e4[slot_idx] * 3 + ex_1e4) / 4;
+            self.ewma_slow_px_1e4[slot_idx] = (self.ewma_slow_px_1e4[slot_idx] * 7 + ex_1e4) / 8;
+        }
+        if self.wave_anchor_px_1e4[slot_idx][d] <= 0 {
+            self.wave_anchor_px_1e4[slot_idx][d] = en_1e4;
+        }
+        self.wave_anchor_px_1e4[slot_idx][1 - d] = 0;
+    }
+
+    /// Updates 1Hz physical-clock fast (`20s`) and slow macro (`300s`) price EWMAs in `1e4` fixed-point scale.
     #[inline]
     pub fn observe_market_price(&mut self, slot_idx: usize, snap: &SymbolLobSnapshot) {
         if slot_idx >= 6 {
@@ -1004,14 +1037,23 @@ impl OnlineAdaptiveGovernor {
         if fast_prev <= 0 || slow_prev <= 0 {
             self.ewma_fast_px_1e4[slot_idx] = px_1e4;
             self.ewma_slow_px_1e4[slot_idx] = px_1e4;
-        } else {
-            self.ewma_fast_px_1e4[slot_idx] = (fast_prev * 31 + px_1e4) / 32;
-            self.ewma_slow_px_1e4[slot_idx] = (slow_prev * 511 + px_1e4) / 512;
+            self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
+            return;
         }
+        if snap.ts_local_ns.0.saturating_sub(self.last_price_sample_ts_ns[slot_idx]) < 1_000_000_000 {
+            return;
+        }
+        self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
+        self.ewma_fast_px_1e4[slot_idx] = (fast_prev * 19 + px_1e4) / 20;
+        self.ewma_slow_px_1e4[slot_idx] = (slow_prev * 299 + px_1e4) / 300;
     }
 
     #[inline]
-    const fn price_drift_and_extension_scaled_bps(&self, slot_idx: usize, snap: &SymbolLobSnapshot) -> (i64, i64) {
+    const fn price_drift_and_extension_scaled_bps(
+        &self,
+        slot_idx: usize,
+        snap: &SymbolLobSnapshot,
+    ) -> (i64, i64) {
         if slot_idx >= 6 {
             return (0, 0);
         }
@@ -1090,6 +1132,7 @@ impl OnlineAdaptiveGovernor {
             let s = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
             self.sl_streak[slot_idx][d] = s;
             self.win_streak[slot_idx][d] = 0;
+            self.wave_anchor_px_1e4[slot_idx][d] = 0;
             let backoff_ns = 150_000_000_000_i64.saturating_mul(1_i64 << s.min(4));
             self.directional_cooldown_until_ns[slot_idx][d] = ts_ns.0.saturating_add(backoff_ns);
 
@@ -1106,7 +1149,15 @@ impl OnlineAdaptiveGovernor {
         } else {
             let w = self.win_streak[slot_idx][d].saturating_add(1);
             self.win_streak[slot_idx][d] = w;
-            let win_breather_ns = ts_ns.0.saturating_add(60_000_000_000);
+            self.win_streak[slot_idx][1 - d] = 0;
+            let breather_secs = if w >= 3 {
+                360_i64
+            } else if w == 2 {
+                120_i64
+            } else {
+                60_i64
+            };
+            let win_breather_ns = ts_ns.0.saturating_add(breather_secs * 1_000_000_000);
             if win_breather_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = win_breather_ns;
             }
@@ -1123,8 +1174,8 @@ impl OnlineAdaptiveGovernor {
         }
     }
 
-    /// Evaluates whether `(slot_idx, side)` is authorized under per-slot Scar-Debt,
-    /// Dual-Horizon Macro Price Drift, Over-Extension bounds, and Slot-0 (`BTCUSDT`) conviction.
+    /// Evaluates whether `(slot_idx, side)` is authorized under 1Hz Physical Price Drift,
+    /// Wave-Staircase Exhaustion Guard, Scar-Debt Ledger, and Slot-0 (`BTCUSDT`) conviction.
     #[inline]
     #[must_use]
     pub fn authorizes_adaptive_entry(
@@ -1149,24 +1200,39 @@ impl OnlineAdaptiveGovernor {
         let (btc_drift_bps, _) =
             self.price_drift_and_extension_scaled_bps(0, btc_leader_snap);
 
+        let anchor_1e4 = self.wave_anchor_px_1e4[slot_idx][d];
+        let cur_1e4 = candidate_snap.mark_price.0.saturating_mul(10_000);
+        let wave_chased_bps = if anchor_1e4 > 0 && cur_1e4 > 0 {
+            match side {
+                Side::Bid => ((cur_1e4 - anchor_1e4).saturating_mul(1_000_000)) / anchor_1e4,
+                Side::Ask => ((anchor_1e4 - cur_1e4).saturating_mul(1_000_000)) / anchor_1e4,
+            }
+        } else {
+            0
+        };
+        if self.win_streak[slot_idx][d] >= 2 && wave_chased_bps > 4_000 {
+            return false;
+        }
+
         match side {
             Side::Bid => {
-                if self_drift_bps < -120 || self_ext_bps > 1_800 {
+                if self_drift_bps < -35 || self_ext_bps > 1_400 {
                     return false;
                 }
-                if slot_idx > 0 && (self_drift_bps < -45 || btc_drift_bps < -25) {
+                if slot_idx > 0 && btc_drift_bps < -25 {
                     return false;
                 }
             }
             Side::Ask => {
-                if self_drift_bps > 120 || self_ext_bps < -1_800 {
+                if self_drift_bps > 35 || self_ext_bps < -1_400 {
                     return false;
                 }
-                if slot_idx > 0 && (self_drift_bps > 45 || btc_drift_bps > 25) {
+                if slot_idx > 0 && btc_drift_bps > 25 {
                     return false;
                 }
             }
         }
+
         let cand_comp = (0.45 * candidate_snap.factor_ofi.get()
             + 0.35 * candidate_snap.factor_tfi.get()
             + 0.20 * candidate_snap.factor_geom.get())
@@ -1176,6 +1242,7 @@ impl OnlineAdaptiveGovernor {
             + 0.20 * btc_leader_snap.factor_geom.get();
 
         let sl_s = self.sl_streak[slot_idx][d] as f64;
+        let win_s = (self.win_streak[slot_idx][d].min(4)) as f64;
         let debt_bps = self.cum_net_bps_x100[slot_idx][d] as f64;
         let debt_penalty = if debt_bps < 0.0 {
             ((-debt_bps) / 16_000.0).min(0.28)
@@ -1188,6 +1255,7 @@ impl OnlineAdaptiveGovernor {
         } else {
             0.0
         };
+        let staircase_penalty = if win_s >= 2.0 { 0.04 * (win_s - 1.0) } else { 0.0 };
 
         if self.is_in_scar_debt(slot_idx, side) && candidate_snap.factor_tfi.get().abs() < 0.40 {
             return false;
@@ -1218,7 +1286,8 @@ impl OnlineAdaptiveGovernor {
             }
         }
 
-        let adaptive_threshold = (0.42 + 0.08 * sl_s + debt_penalty + global_penalty).min(0.80);
+        let adaptive_threshold =
+            (0.42 + 0.08 * sl_s + debt_penalty + global_penalty + staircase_penalty).min(0.80);
         cand_comp >= adaptive_threshold
     }
 }

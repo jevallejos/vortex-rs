@@ -177,7 +177,7 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 32 Global Account Lock + Dual-Speed Elastic Profit Floor active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 33 Global Account Lock + Dual-Speed Elastic Profit Floor active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -637,6 +637,9 @@ fn rehydrate_shadow_ledger(
             };
             if let Some(s_idx) = slot_opt {
                 let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
                 adaptive_gov.observe_closed_trade(
                     s_idx,
                     s_side,
@@ -1532,6 +1535,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 snap.ts_local_ns,
                                 &mut ledger,
                             );
+                            adaptive_gov.seed_historical_price(
+                                active_slot,
+                                summary.side,
+                                summary.entry_price.0,
+                                realized_exit_price.0,
+                            );
                             adaptive_gov.observe_closed_trade(
                                 active_slot,
                                 summary.side,
@@ -1652,7 +1661,11 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             evaluator.evaluate_entry_signal(&spec, &snap),
                             Ok(SignalVerdict::AuthorizeMakerEntry { side: s_now, .. }) if s_now == side
                         );
-                        if post_only_crossed || !signal_still_valid {
+                        let l1_cushion_lots = match side {
+                            Side::Bid => snap.bids[0].qty.0,
+                            Side::Ask => snap.asks[0].qty.0,
+                        };
+                        if post_only_crossed || !signal_still_valid || l1_cushion_lots < 15 {
                             fsm.state = OrderLifecycleState::Idle;
                             arena.exec_state_code.store(0, Ordering::Release);
                             continue;

@@ -309,6 +309,9 @@ fn replay_captured_live_parquet_segments() {
                 };
                 if let Some(s_idx) = slot_opt {
                     let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                    let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
                     adaptive_gov.observe_closed_trade(
                         s_idx,
                         s_side,
@@ -525,6 +528,12 @@ fn replay_captured_live_parquet_segments() {
                                             &mut ledger,
                                         );
                                     }
+                                    adaptive_gov.seed_historical_price(
+                                        active_slot,
+                                        summary.side,
+                                        summary.entry_price.0,
+                                        summary.exit_price.0,
+                                    );
                                     adaptive_gov.observe_closed_trade(
                                         active_slot,
                                         summary.side,
