@@ -612,15 +612,14 @@ impl ExecutionFsm {
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
 
-            // Dual-Speed Elastic Harvest & Rescue Physics (Stage 31.1):
-            // 1) Offensive Harvest (`flow_unwind` & `early_harvest`) demands >= 600..750 ScaledBps (+2.00..+3.50 bps net),
-            //    and suppresses `early_harvest` while order flow strongly supports the trend so winners reach Zone 2 (> 800)!
-            // 2) Defensive Rescue (`scratch_escape` after >= 15s of joint adverse flow, or `stagnant_rescue` after >= 45s
-            //    when peak < 600) unlocks at >= 440 ScaledBps (+0.40..+1.64 bps net = 4-5 ticks) so trapped entries
-            //    escape in net profit on the first 4-tick bounce instead of dying at -60.00 bps!
+            // Three-Speed Elastic Harvest, Zero-Loss & Breakeven Survival Physics (Stage 32):
+            // 1) Speed 1 (Offensive Harvest): >= 600..750 ScaledBps (+2.00..+3.50 bps net), suppressed under strong trend flow so winners reach Zone 2 (> 800).
+            // 2) Speed 2 (Defensive Zero-Loss Floor): >= 440 ScaledBps (+0.40..+1.64 bps net) after 15s of adverse flow or 45s stagnant.
+            // 3) Speed 3 (Wounded Trade Breakeven Rescue): if a trade has never reached 440 ScaledBps (`peak_gross_bps < 440`)
+            //    after >= 25s with joint adverse flow (or >= 60s stagnant), unlock passive Maker exit at >= 80 ScaledBps (+1 tick)
+            //    so trapped positions evacuate on the first bounce to entry (-1.5 to -3.2 bps net) instead of dying at -60 bps!
             let elastic_vol_floor_bps = (snap.realized_vol_5m.raw() / 10).clamp(600, 750);
             let in_trend_free_ride_zone = peak_gross_bps.raw() > 800;
-
             let ofi_reversed = match side {
                 Side::Bid => snap.factor_ofi.get() < -0.10,
                 Side::Ask => snap.factor_ofi.get() > 0.10,
@@ -628,7 +627,6 @@ impl ExecutionFsm {
             let flow_unwind = !in_trend_free_ride_zone
                 && current_gross_bps.raw() >= elastic_vol_floor_bps
                 && ofi_reversed;
-
             let strong_trend_continuation = match side {
                 Side::Bid => snap.factor_ofi.get() > 0.25 && snap.factor_tfi.get() > 0.35,
                 Side::Ask => snap.factor_ofi.get() < -0.25 && snap.factor_tfi.get() < -0.35,
@@ -638,22 +636,30 @@ impl ExecutionFsm {
                 && !strong_trend_continuation
                 && hold_elapsed >= 30_000_000_000
                 && current_gross_bps.raw() >= elastic_vol_floor_bps;
-
             let joint_adverse = match side {
                 Side::Bid => snap.factor_ofi.get() < -0.15 && snap.factor_tfi.get() < -0.15,
                 Side::Ask => snap.factor_ofi.get() > 0.15 && snap.factor_tfi.get() > 0.15,
             };
-            let scratch_escape = !in_trend_free_ride_zone
+            let wounded_adverse_rescue = !in_trend_free_ride_zone
+                && hold_elapsed >= 25_000_000_000
+                && peak_gross_bps.raw() < 440
+                && current_gross_bps.raw() >= 80
+                && joint_adverse;
+            let scratch_escape = (!in_trend_free_ride_zone
                 && hold_elapsed >= 15_000_000_000
                 && current_gross_bps.raw() >= 440
-                && joint_adverse;
-            let struggling_rescue = !in_trend_free_ride_zone
+                && joint_adverse)
+                || wounded_adverse_rescue;
+            let struggling_rescue = (!in_trend_free_ride_zone
                 && hold_elapsed >= 45_000_000_000
                 && peak_gross_bps.raw() < 600
-                && current_gross_bps.raw() >= 440;
+                && current_gross_bps.raw() >= 440)
+                || (!in_trend_free_ride_zone
+                    && hold_elapsed >= 60_000_000_000
+                    && peak_gross_bps.raw() < 440
+                    && current_gross_bps.raw() >= 80);
             let stagnant_unwind = struggling_rescue
                 || (hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 440);
-
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
                 let dynamic_70pct_floor = 400 + ((peak_gross_bps.raw() - 400) * 70) / 100;
                 current_gross_bps.raw() >= 480 && current_gross_bps.raw() <= dynamic_70pct_floor
@@ -838,6 +844,49 @@ impl ExecutionFsm {
         }
     }
 
+    /// Computes the Speed-3 wounded-position Maker rescue price (`entry_price +/- 1 structural tick`)
+    /// so trapped positions that never reached 440 ScaledBps can evacuate passively on the first bounce to entry.
+    #[inline]
+    #[must_use]
+    pub const fn scratch_breakeven_maker_exit_price(
+        side: Side,
+        entry_price: PriceTicks,
+    ) -> PriceTicks {
+        match side {
+            Side::Bid => PriceTicks(entry_price.0 + 1),
+            Side::Ask => {
+                let p = entry_price.0 - 1;
+                PriceTicks(if p > 1 { p } else { 1 })
+            }
+        }
+    }
+
+    /// Clamps a Speed-3 wounded rescue exit price to `entry_price +/- 1 tick`.
+    #[inline]
+    #[must_use]
+    pub const fn clamp_scratch_breakeven_floor(
+        side: Side,
+        entry_price: PriceTicks,
+        candidate_exit: PriceTicks,
+    ) -> PriceTicks {
+        let floor_price = Self::scratch_breakeven_maker_exit_price(side, entry_price);
+        match side {
+            Side::Bid => {
+                if candidate_exit.0 > floor_price.0 {
+                    candidate_exit
+                } else {
+                    floor_price
+                }
+            }
+            Side::Ask => {
+                if candidate_exit.0 > 0 && candidate_exit.0 < floor_price.0 {
+                    candidate_exit
+                } else {
+                    floor_price
+                }
+            }
+        }
+    }
     #[inline]
     const fn compute_gross_scaled_bps(
         side: Side,
@@ -941,9 +990,8 @@ impl ExecutionFsm {
     }
 }
 
-/// Online self-learning Bayesian & Replicator governor across all 6 slots and 2 directions (Bid/Ask).
-/// Continuously adapts entry composite thresholds, macro leader beta-coupling, and directional cooldowns
-/// directly from realized trade outcomes (zero static magic rules).
+/// Online self-learning Bayesian & Replicator governor across all 6 slots and 2 directions (Bid/Ask),
+/// coupled with Cross-Slot Global Directional Regime Memory (`global_dir_debt_bps_x100`).
 #[derive(Copy, Clone, Debug)]
 pub struct OnlineAdaptiveGovernor {
     ewma_net_bps_x100: [[i64; 2]; 6],
@@ -951,6 +999,9 @@ pub struct OnlineAdaptiveGovernor {
     sl_streak: [[u32; 2]; 6],
     win_streak: [[u32; 2]; 6],
     directional_cooldown_until_ns: [[i64; 2]; 6],
+    global_dir_debt_bps_x100: [i64; 2],
+    global_dir_sl_streak: [u32; 2],
+    global_dir_cooldown_until_ns: [i64; 2],
 }
 
 impl Default for OnlineAdaptiveGovernor {
@@ -970,6 +1021,9 @@ impl OnlineAdaptiveGovernor {
             sl_streak: [[0; 2]; 6],
             win_streak: [[0; 2]; 6],
             directional_cooldown_until_ns: [[0; 2]; 6],
+            global_dir_debt_bps_x100: [0; 2],
+            global_dir_sl_streak: [0; 2],
+            global_dir_cooldown_until_ns: [0; 2],
         }
     }
 
@@ -996,8 +1050,7 @@ impl OnlineAdaptiveGovernor {
         )
     }
 
-    /// Returns `true` when `(slot_idx, side)` carries an unrecovered cumulative net loss debt (`< -15.00 bps`),
-    /// signaling the execution engine to scale down notional size to probationary half-size until the debt is paid!
+    /// Returns `true` when `(slot_idx, side)` or the global directional regime carries unrecovered debt.
     #[inline]
     #[must_use]
     pub const fn is_in_scar_debt(&self, slot_idx: usize, side: Side) -> bool {
@@ -1005,10 +1058,12 @@ impl OnlineAdaptiveGovernor {
             return false;
         }
         let d = Self::dir_idx(side);
-        self.cum_net_bps_x100[slot_idx][d] < -1_500 || self.sl_streak[slot_idx][d] > 0
+        self.cum_net_bps_x100[slot_idx][d] < -1_500
+            || self.sl_streak[slot_idx][d] > 0
+            || self.global_dir_debt_bps_x100[d] < -6_000
     }
 
-    /// Feeds a closed trade outcome into the online learner to update the slot-direction health & scar-debt state.
+    /// Feeds a closed trade outcome into both the per-slot learner and the cross-slot global directional learner.
     #[inline]
     pub fn observe_closed_trade(
         &mut self,
@@ -1027,19 +1082,24 @@ impl OnlineAdaptiveGovernor {
         self.cum_net_bps_x100[slot_idx][d] = self.cum_net_bps_x100[slot_idx][d]
             .saturating_add(net_scaled_bps.raw())
             .clamp(-24_000, 24_000);
+        self.global_dir_debt_bps_x100[d] = self.global_dir_debt_bps_x100[d]
+            .saturating_add(net_scaled_bps.raw())
+            .clamp(-30_000, 12_000);
 
         if !is_maker_exit || net_scaled_bps.raw() <= -800 {
             let s = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
             self.sl_streak[slot_idx][d] = s;
             self.win_streak[slot_idx][d] = 0;
-            // Exponential directional quarantine after SL: 300s (5m) -> 600s (10m) -> 1200s (20m) -> 2400s (40m)
             let backoff_ns = 150_000_000_000_i64.saturating_mul(1_i64 << s.min(4));
             self.directional_cooldown_until_ns[slot_idx][d] = ts_ns.0.saturating_add(backoff_ns);
+
+            let gs = self.global_dir_sl_streak[d].saturating_add(1).min(4);
+            self.global_dir_sl_streak[d] = gs;
+            let global_pause_ns = 90_000_000_000_i64.saturating_mul(i64::from(gs));
+            self.global_dir_cooldown_until_ns[d] = ts_ns.0.saturating_add(global_pause_ns);
         } else if net_scaled_bps.raw() > 0 {
             let w = self.win_streak[slot_idx][d].saturating_add(1);
             self.win_streak[slot_idx][d] = w;
-            // 60s Anti-Wave-Exhaustion breather after every win on the same (slot, side)
-            // so the bot never re-enters 1s later into the exhausted top/bottom (as in #63 and #75)!
             let win_breather_ns = ts_ns.0.saturating_add(60_000_000_000);
             if win_breather_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = win_breather_ns;
@@ -1051,11 +1111,14 @@ impl OnlineAdaptiveGovernor {
                 self.sl_streak[slot_idx][d] -= 1;
                 self.win_streak[slot_idx][d] = 0;
             }
+            if self.global_dir_sl_streak[d] > 0 && self.global_dir_debt_bps_x100[d] >= -3_000 {
+                self.global_dir_sl_streak[d] -= 1;
+            }
         }
     }
 
-    /// Evaluates whether `(slot_idx, side)` is authorized under the current self-learned Scar-Debt Ledger
-    /// and continuous Slot-0 (`BTCUSDT`) macro composite & directional flow alignment.
+    /// Evaluates whether `(slot_idx, side)` is authorized under per-slot Scar-Debt,
+    /// Cross-Slot Global Directional Regime memory, and strict Slot-0 (`BTCUSDT`) macro conviction.
     #[inline]
     #[must_use]
     pub fn authorizes_adaptive_entry(
@@ -1069,7 +1132,9 @@ impl OnlineAdaptiveGovernor {
             return false;
         }
         let d = Self::dir_idx(side);
-        if candidate_snap.ts_local_ns.0 < self.directional_cooldown_until_ns[slot_idx][d] {
+        if candidate_snap.ts_local_ns.0 < self.directional_cooldown_until_ns[slot_idx][d]
+            || candidate_snap.ts_local_ns.0 < self.global_dir_cooldown_until_ns[d]
+        {
             return false;
         }
 
@@ -1077,7 +1142,6 @@ impl OnlineAdaptiveGovernor {
             + 0.35 * candidate_snap.factor_tfi.get()
             + 0.20 * candidate_snap.factor_geom.get())
         .abs();
-
         let btc_comp = 0.45 * btc_leader_snap.factor_ofi.get()
             + 0.35 * btc_leader_snap.factor_tfi.get()
             + 0.20 * btc_leader_snap.factor_geom.get();
@@ -1085,10 +1149,20 @@ impl OnlineAdaptiveGovernor {
         let sl_s = self.sl_streak[slot_idx][d] as f64;
         let debt_bps = self.cum_net_bps_x100[slot_idx][d] as f64;
         let debt_penalty = if debt_bps < 0.0 {
-            ((-debt_bps) / 18_000.0).min(0.28)
+            ((-debt_bps) / 16_000.0).min(0.28)
         } else {
             0.0
         };
+        let global_debt_bps = self.global_dir_debt_bps_x100[d] as f64;
+        let global_penalty = if global_debt_bps < -2_000.0 {
+            ((-global_debt_bps - 2_000.0) / 35_000.0).min(0.14)
+        } else {
+            0.0
+        };
+
+        if self.is_in_scar_debt(slot_idx, side) && candidate_snap.factor_tfi.get().abs() < 0.40 {
+            return false;
+        }
 
         if slot_idx > 0 {
             let signed_btc_alignment = match side {
@@ -1096,19 +1170,26 @@ impl OnlineAdaptiveGovernor {
                 Side::Ask => -btc_comp,
             };
             let btc_directional_support = match side {
-                Side::Bid => btc_leader_snap.factor_ofi.get() >= -0.05 && btc_leader_snap.factor_tfi.get() >= 0.0,
-                Side::Ask => btc_leader_snap.factor_ofi.get() <= 0.05 && btc_leader_snap.factor_tfi.get() <= 0.0,
+                Side::Bid => {
+                    btc_leader_snap.factor_ofi.get() >= 0.10
+                        && btc_leader_snap.factor_tfi.get() >= 0.10
+                }
+                Side::Ask => {
+                    btc_leader_snap.factor_ofi.get() <= -0.10
+                        && btc_leader_snap.factor_tfi.get() <= -0.10
+                }
             };
             if !btc_directional_support {
                 return false;
             }
-            let min_required_btc_alignment = 0.06 + 0.10 * sl_s + (debt_penalty * 0.5);
+            let min_required_btc_alignment =
+                0.18 + 0.10 * sl_s + 0.60 * (debt_penalty + global_penalty);
             if signed_btc_alignment < min_required_btc_alignment {
                 return false;
             }
         }
 
-        let adaptive_threshold = (0.42 + 0.08 * sl_s + debt_penalty).min(0.78);
+        let adaptive_threshold = (0.42 + 0.08 * sl_s + debt_penalty + global_penalty).min(0.80);
         cand_comp >= adaptive_threshold
     }
 }

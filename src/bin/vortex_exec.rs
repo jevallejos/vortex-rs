@@ -177,7 +177,7 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 31.1 Global Account Lock + Dual-Speed Elastic Profit Floor active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 32 Global Account Lock + Dual-Speed Elastic Profit Floor active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -413,16 +413,21 @@ impl BybitV5LiveClient {
         arena: &VortexShmArena,
         active_slot: usize,
         spec: &PairSpec,
-        open_side: Side,
-        entry_price: PriceTicks,
-        force_market_if_unfilled: bool,
+        summary: &ClosedTradeSummary,
     ) -> Option<PriceTicks> {
         let symbol = spec.symbol_id.name();
+        let open_side = summary.side;
+        let entry_price = summary.entry_price;
+        let candidate_exit = summary.exit_price;
+        let trigger_gross_bps = summary.gross_scaled_bps;
+        let force_market_if_unfilled = matches!(
+            summary.kind,
+            ClosedTradeKind::ServerMarkPriceStopLoss
+        );
         let close_side = match open_side {
             Side::Bid => "Sell",
             Side::Ask => "Buy",
         };
-
         let profit_floor_price =
             ExecutionFsm::min_profitable_maker_exit_price(open_side, entry_price);
         let mut last_pegged_price = PriceTicks(0);
@@ -432,8 +437,12 @@ impl BybitV5LiveClient {
             let (is_open, pos_qty) = self.get_open_position_size(symbol);
             if !is_open {
                 self.cancel_all_symbol_orders(symbol);
-                let realized_px = if last_pegged_price.0 > 0 {
+                let realized_px = if force_market_if_unfilled {
+                    candidate_exit
+                } else if last_pegged_price.0 > 0 {
                     last_pegged_price
+                } else if trigger_gross_bps.raw() < 440 {
+                    ExecutionFsm::clamp_scratch_breakeven_floor(open_side, entry_price, candidate_exit)
                 } else {
                     profit_floor_price
                 };
@@ -445,49 +454,27 @@ impl BybitV5LiveClient {
             }
 
             if force_market_if_unfilled {
-                // Stage 30 Smart Bailout: on attempt 0, try a 300ms passive BBO PostOnly unwind to save Taker fees;
-                // from attempt >= 1 onwards, fire immediate Market reduceOnly to guarantee hard loss truncation!
                 self.cancel_all_symbol_orders(symbol);
-                if attempt == 0 {
-                    if let Ok(slot) = arena.slot(active_slot) {
-                        if let Ok(latest_snap) = slot.read_snapshot(4) {
-                            let bbo_bailout_px = match open_side {
-                                Side::Bid if latest_snap.asks[0].price.0 > 0 => latest_snap.asks[0].price,
-                                Side::Ask if latest_snap.bids[0].price.0 > 0 => latest_snap.bids[0].price,
-                                _ => entry_price,
-                            };
-                            let (bw, bf) = spec.format_price_usdt_parts(bbo_bailout_px);
-                            let bailout_post_only = format!(
-                                "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",\"price\":\"{}.{:04}\",\"reduceOnly\":true,\"positionIdx\":0}}",
-                                symbol, close_side, pos_qty, bw, bf
-                            );
-                            let _ = self.post_v5("/v5/order/create", &bailout_post_only);
-                            thread::sleep(Duration::from_millis(300));
-                            let (still_open_after_passive, _) = self.get_open_position_size(symbol);
-                            if !still_open_after_passive {
-                                self.cancel_all_symbol_orders(symbol);
-                                return Some(bbo_bailout_px);
-                            }
-                            self.cancel_all_symbol_orders(symbol);
-                        }
-                    }
-                }
                 let mkt_body = format!(
                     "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Market\",\"qty\":\"{}\",\"reduceOnly\":true,\"positionIdx\":0}}",
                     symbol, close_side, pos_qty
                 );
                 let _ = self.post_v5("/v5/order/create", &mkt_body);
-                thread::sleep(Duration::from_millis(350));
+                thread::sleep(Duration::from_millis(150));
                 let (still_open, _) = self.get_open_position_size(symbol);
                 if !still_open {
                     let sl_px = if let Ok(slot) = arena.slot(active_slot) {
                         if let Ok(s) = slot.read_snapshot(4) {
-                            s.mark_price
+                            if s.last_trade_price.0 > 0 {
+                                s.last_trade_price
+                            } else {
+                                candidate_exit
+                            }
                         } else {
-                            entry_price
+                            candidate_exit
                         }
                     } else {
-                        entry_price
+                        candidate_exit
                     };
                     return Some(sl_px);
                 }
@@ -502,12 +489,13 @@ impl BybitV5LiveClient {
                         };
                     }
                 }
-
-                // Dual-Speed Elastic Profit Floor Law (Stage 31.1):
-                // Attempts 0..2 enforce the Offensive Floor (>= 600 ScaledBps = +2.00 bps net);
-                // Attempts >= 3 unlock the Defensive Zero-Loss Escape Floor (440 ScaledBps = +0.40..+1.64 bps net)
-                // so trapped positions escape in profit on a 4-tick bounce instead of dying at -60 bps!
-                let peg_price = if attempt < 3 {
+                let peg_price = if trigger_gross_bps.raw() < 440 || attempt >= 5 {
+                    ExecutionFsm::clamp_scratch_breakeven_floor(
+                        open_side,
+                        entry_price,
+                        raw_bbo_exit,
+                    )
+                } else if attempt < 3 {
                     ExecutionFsm::clamp_maker_exit_to_profit_floor(
                         open_side,
                         entry_price,
@@ -520,7 +508,6 @@ impl BybitV5LiveClient {
                         raw_bbo_exit,
                     )
                 };
-
                 if peg_price.0 != last_pegged_price.0 {
                     self.cancel_all_symbol_orders(symbol);
                     let (xw, xf) = spec.format_price_usdt_parts(peg_price);
@@ -537,8 +524,7 @@ impl BybitV5LiveClient {
                     }
                 }
             }
-
-            thread::sleep(Duration::from_millis(350));
+            thread::sleep(Duration::from_millis(300));
             attempt += 1;
         }
 
@@ -548,7 +534,7 @@ impl BybitV5LiveClient {
             let realized_px = if last_pegged_price.0 > 0 {
                 last_pegged_price
             } else {
-                profit_floor_price
+                candidate_exit
             };
             println!(
                 "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed @ {}t (0.00 remaining){}",
@@ -556,7 +542,6 @@ impl BybitV5LiveClient {
             );
             return Some(realized_px);
         }
-
         println!(
             "{}🟡 [BYBIT V5 EXIT STILL RESTING] {} position still open after peg cycle — retaining FSM custody (no abandonment!){}",
             ANSI_YELLOW, symbol, ANSI_RESET
@@ -564,7 +549,6 @@ impl BybitV5LiveClient {
         None
     }
 }
-
 fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSender<String>> {
     let token = load_env_var_with_fallback(&[
         "TELEGRAM_BOT_TOKEN",
@@ -1166,7 +1150,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 31.1 Dual-Speed Elastic Floor){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 32 Dual-Speed Elastic Floor){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),
@@ -1487,29 +1471,30 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
 
                         if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
                             let spec = APPROVED_SPECS[active_slot];
-                            let mut confirmed_exit_px: Option<PriceTicks> = Some(
+                            let default_clamped_px = if !summary.is_maker_exit {
+                                summary.exit_price
+                            } else if summary.gross_scaled_bps.raw() < 440 {
+                                ExecutionFsm::clamp_scratch_breakeven_floor(
+                                    summary.side,
+                                    summary.entry_price,
+                                    summary.exit_price,
+                                )
+                            } else {
                                 ExecutionFsm::clamp_defensive_zero_loss_floor(
                                     summary.side,
                                     summary.entry_price,
                                     summary.exit_price,
-                                ),
-                            );
-
+                                )
+                            };
+                            let mut confirmed_exit_px: Option<PriceTicks> = Some(default_clamped_px);
                             if let Some(ref client) = live_client {
-                                let force_mkt = matches!(
-                                    summary.kind,
-                                    ClosedTradeKind::ServerMarkPriceStopLoss
-                                );
                                 confirmed_exit_px = client.execute_verified_close_step(
                                     arena,
                                     active_slot,
                                     &spec,
-                                    summary.side,
-                                    summary.entry_price,
-                                    force_mkt,
+                                    &summary,
                                 );
                             }
-
                             let realized_exit_price = match confirmed_exit_px {
                                 Some(px) => px,
                                 None => {
