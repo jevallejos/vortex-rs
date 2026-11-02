@@ -622,22 +622,23 @@ impl ExecutionFsm {
                 Side::Bid => snap.factor_ofi.get() < -0.10,
                 Side::Ask => snap.factor_ofi.get() > 0.10,
             };
-            let flow_unwind = !in_trend_free_ride_zone
-                && current_gross_bps.raw() >= elastic_vol_floor_bps
-                && ofi_reversed;
-            let strong_trend_continuation = match side {
-                Side::Bid => snap.factor_ofi.get() > 0.25 && snap.factor_tfi.get() > 0.35,
-                Side::Ask => snap.factor_ofi.get() < -0.25 && snap.factor_tfi.get() < -0.35,
-            };
-            let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
-            let early_harvest = !in_trend_free_ride_zone
-                && !strong_trend_continuation
-                && hold_elapsed >= 30_000_000_000
-                && current_gross_bps.raw() >= elastic_vol_floor_bps;
             let joint_adverse = match side {
                 Side::Bid => snap.factor_ofi.get() < -0.15 && snap.factor_tfi.get() < -0.15,
                 Side::Ask => snap.factor_ofi.get() > 0.15 && snap.factor_tfi.get() > 0.15,
             };
+            // Unlock bigger winners: only unwind in Zone 1 when BOTH OFI and TFI reverse against us!
+            let flow_unwind = !in_trend_free_ride_zone
+                && current_gross_bps.raw() >= elastic_vol_floor_bps
+                && joint_adverse;
+            let strong_trend_continuation = match side {
+                Side::Bid => snap.factor_ofi.get() > 0.20 || snap.factor_tfi.get() > 0.25,
+                Side::Ask => snap.factor_ofi.get() < -0.20 || snap.factor_tfi.get() < -0.25,
+            };
+            let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
+            let early_harvest = !in_trend_free_ride_zone
+                && !strong_trend_continuation
+                && hold_elapsed >= 35_000_000_000
+                && current_gross_bps.raw() >= elastic_vol_floor_bps;
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= 15_000_000_000
                 && current_gross_bps.raw() >= 440
@@ -649,6 +650,7 @@ impl ExecutionFsm {
                 && current_gross_bps.raw() >= 440;
             let stagnant_unwind = struggling_rescue
                 || (hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 440);
+
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
                 let dynamic_70pct_floor = 400 + ((peak_gross_bps.raw() - 400) * 70) / 100;
                 current_gross_bps.raw() >= 480 && current_gross_bps.raw() <= dynamic_70pct_floor
@@ -1103,6 +1105,21 @@ impl OnlineAdaptiveGovernor {
         self.cum_net_bps_x100[slot_idx][d] < -1_500
             || self.sl_streak[slot_idx][d] > 0
             || self.global_dir_debt_bps_x100[d] < -6_000
+    }
+
+    /// Returns `true` when `(slot_idx, side)` has zero SL scars and strong positive cumulative surplus (`>= +12.00 bps`),
+    /// authorizing a `1.5x` Fractional-Kelly lot expansion on divisible pairs.
+    #[inline]
+    #[must_use]
+    pub const fn is_champion_cell(&self, slot_idx: usize, side: Side) -> bool {
+        if slot_idx >= 6 {
+            return false;
+        }
+        let d = Self::dir_idx(side);
+        self.sl_streak[slot_idx][d] == 0
+            && self.cum_net_bps_x100[slot_idx][d] >= 1_200
+            && self.ewma_net_bps_x100[slot_idx][d] >= 200
+            && self.global_dir_sl_streak[d] == 0
     }
 
     /// Feeds a closed trade outcome into both the per-slot learner and the cross-slot global directional learner.

@@ -96,18 +96,56 @@ fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static str
 const fn compute_optimal_50usdt_wallet_qty_str(
     symbol_id: SymbolId,
     in_scar_debt: bool,
+    is_champion: bool,
 ) -> &'static str {
     match symbol_id.0 {
         1 => "0.001",
-        2 => "0.01",
-        3 => if in_scar_debt { "0.1" } else { "0.2" },
-        4 => if in_scar_debt { "1.4" } else { "2.6" },
-        5 => if in_scar_debt { "0.05" } else { "0.1" },
-        6 => if in_scar_debt { "14" } else { "25" },
+        2 => {
+            if is_champion && !in_scar_debt {
+                "0.02"
+            } else {
+                "0.01"
+            }
+        }
+        3 => {
+            if in_scar_debt {
+                "0.1"
+            } else if is_champion {
+                "0.3"
+            } else {
+                "0.2"
+            }
+        }
+        4 => {
+            if in_scar_debt {
+                "1.4"
+            } else if is_champion {
+                "3.9"
+            } else {
+                "2.6"
+            }
+        }
+        5 => {
+            if in_scar_debt {
+                "0.05"
+            } else if is_champion {
+                "0.15"
+            } else {
+                "0.1"
+            }
+        }
+        6 => {
+            if in_scar_debt {
+                "14"
+            } else if is_champion {
+                "38"
+            } else {
+                "25"
+            }
+        }
         _ => "1",
     }
 }
-
 const ENV_FILE_CANDIDATES: [&str; 3] = [".env", "/home/ubuntu/vortex-rs/.env", "/home/ubuntu/.env"];
 
 fn load_env_var_with_fallback(keys: &[&str]) -> Option<String> {
@@ -374,7 +412,7 @@ impl BybitV5LiveClient {
             Side::Bid => "Buy",
             Side::Ask => "Sell",
         };
-        let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, in_scar_debt);
+        let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, in_scar_debt, gov_diag.1 == 0 && gov_diag.0 >= 220 && gov_diag.2 >= 2);
         let body = format!(
             "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",\"price\":\"{}.{:04}\",\"stopLoss\":\"{}.{:04}\",\"slTriggerBy\":\"MarkPrice\",\"positionIdx\":0}}",
             symbol, bybit_side, qty_str, ew, ef, sw, sf
@@ -1440,7 +1478,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             );
 
                             if let Some(ref tx) = tg_tx {
-                                let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, side));
+                                let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, side), adaptive_gov.is_champion_cell(active_slot, side));
                                 let alert = format!(
                                     "🟡 [VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?}) | Qty: {}\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT (Dynamic 70% MFE Ratchet)\nServer SL: {}.{:04} USDT (-0.520% | -5.20% @ 10x)",
                                     snap.symbol_id.name(),
@@ -1576,7 +1614,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 * 10_000.0;
                             let cum_pct_1x = cum_bps / 100.0;
                             let cum_pct_10x = cum_bps / 10.0;
-                            let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, summary.side));
+                            let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, summary.side), adaptive_gov.is_champion_cell(active_slot, summary.side));
                             let (c_col, c_icon, c_badge) = classify_pnl_badge(net_bps);
 
                             println!(
