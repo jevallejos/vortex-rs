@@ -20,7 +20,7 @@ SHORT_TARGET=$(echo "${TARGET_SHA}" | cut -c1-7)
 echo "[SHA LOCK] Target Git HEAD: ${TARGET_SHA}"
 
 VERIFIED=0
-for attempt in $(seq 1 18); do
+for attempt in $(seq 1 24); do
     REMOTE_SHA=$(curl -fsSL --max-time 5 "${SHA_URL}" 2>/dev/null | tr -d '[:space:]' || true)
     if [ "${REMOTE_SHA}" = "${TARGET_SHA}" ]; then
         echo "[OK] Verified exact binary SHA match (${TARGET_SHA}) on attempt #${attempt} (0% CPU jitter)."
@@ -28,7 +28,7 @@ for attempt in $(seq 1 18); do
         break
     fi
     SHORT_REMOTE=$(echo "${REMOTE_SHA}" | cut -c1-7)
-    echo "  [WAIT ${attempt}/18] Release binary SHA (${SHORT_REMOTE:-none}) != HEAD (${SHORT_TARGET}). GitHub Actions building... waiting 5s"
+    echo "  [WAIT ${attempt}/24] Release binary SHA (${SHORT_REMOTE:-none}) != HEAD (${SHORT_TARGET}). GitHub Actions building... waiting 5s"
     sleep 5
 done
 
@@ -104,6 +104,8 @@ case "${1:-live}" in
         cat "${VORTEX_DIR}/data/vortex_shadow_trades.jsonl" || true
         echo "=== [4. WALK-FORWARD PAR1 REPLAY (1,048,576 REAL EVENTS)] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay"
+        echo "=== [5. AI FORENSIC VAULT (data/vortex_ai_forensic_vault.jsonl)] ==="
+        tail -n 15 "${VORTEX_DIR}/data/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
         ;;
     live|-l)
         "${BIN_DIR}/vortex_exec" --live
@@ -135,6 +137,8 @@ case "${1:-live}" in
         ;;
     replay|-r)
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay"
+        echo "=== [5. AI FORENSIC VAULT (data/vortex_ai_forensic_vault.jsonl)] ==="
+        tail -n 15 "${VORTEX_DIR}/data/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
         ;;
     oos|-o)
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec"

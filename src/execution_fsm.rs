@@ -612,30 +612,63 @@ impl ExecutionFsm {
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
 
-            // Elastic volatility-coupled harvest floor: at least 600 ScaledBps (+2.00 bps net) or 10% of 5m realized vol
-            let elastic_vol_floor_bps = (snap.realized_vol_5m.raw() / 10).clamp(600, 750);
-            let in_trend_free_ride_zone = peak_gross_bps.raw() > 900;
+            // Stage 31 Law 1: Compressed Structural Stop-Loss (-28.00 bps gross = ~-35.50 bps net)
+            // after >= 20s when BOTH L2 OFI and Trade TFI are strongly adverse (cuts -60 bps tail losses
+            // nearly in half while staying safely outside -15 bps normal breathing noise!).
+            let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
+            let confirmed_adverse_crash = match side {
+                Side::Bid => snap.factor_ofi.get() < -0.22 && snap.factor_tfi.get() < -0.22,
+                Side::Ask => snap.factor_ofi.get() > 0.22 && snap.factor_tfi.get() > 0.22,
+            };
+            if hold_elapsed >= 20_000_000_000
+                && current_gross_bps.raw() <= -2_800
+                && confirmed_adverse_crash
+            {
+                let compressed_sl_px = if snap.mark_price.0 > 0 {
+                    snap.mark_price
+                } else {
+                    snap.last_trade_price
+                };
+                return Some(self.finalize_close(
+                    ClosedTradeKind::ServerMarkPriceStopLoss,
+                    side,
+                    entry_price,
+                    compressed_sl_px,
+                    snap.ts_local_ns,
+                    ledger,
+                ));
+            }
 
-            let ofi_reversed = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.08,
-                Side::Ask => snap.factor_ofi.get() > 0.08,
+            // Stage 31 Law 2: Winner Expansion! Never cut a winning trade at +2.00 bps while L2/Tape
+            // order flow is still pushing in our favor. Zone 2 engages at > 760 ScaledBps (+3.60 bps net),
+            // and Zone 1 harvest is ONLY permitted when BOTH OFI and TFI confirm momentum exhaustion!
+            let elastic_vol_floor_bps = (snap.realized_vol_5m.raw() / 8).clamp(640, 820);
+            let in_trend_free_ride_zone = peak_gross_bps.raw() > 760;
+
+            let confirmed_momentum_exhausted = match side {
+                Side::Bid => snap.factor_ofi.get() < -0.18 && snap.factor_tfi.get() < -0.05,
+                Side::Ask => snap.factor_ofi.get() > 0.18 && snap.factor_tfi.get() > 0.05,
             };
             let flow_unwind = !in_trend_free_ride_zone
                 && current_gross_bps.raw() >= elastic_vol_floor_bps
-                && ofi_reversed;
+                && confirmed_momentum_exhausted;
 
-            let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
+            let trend_stalled = match side {
+                Side::Bid => snap.factor_ofi.get() <= 0.05 && snap.factor_tfi.get() <= 0.10,
+                Side::Ask => snap.factor_ofi.get() >= -0.05 && snap.factor_tfi.get() >= -0.10,
+            };
             let early_harvest = !in_trend_free_ride_zone
-                && hold_elapsed >= 30_000_000_000
-                && current_gross_bps.raw() >= elastic_vol_floor_bps;
+                && hold_elapsed >= 75_000_000_000
+                && current_gross_bps.raw() >= elastic_vol_floor_bps
+                && trend_stalled;
 
             let joint_adverse = match side {
-                Side::Bid => snap.factor_ofi.get() < -0.20 && snap.factor_tfi.get() < -0.20,
-                Side::Ask => snap.factor_ofi.get() > 0.20 && snap.factor_tfi.get() > 0.20,
+                Side::Bid => snap.factor_ofi.get() < -0.28 && snap.factor_tfi.get() < -0.28,
+                Side::Ask => snap.factor_ofi.get() > 0.28 && snap.factor_tfi.get() > 0.28,
             };
             let scratch_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= 20_000_000_000
-                && current_gross_bps.raw() >= 560
+                && hold_elapsed >= 35_000_000_000
+                && current_gross_bps.raw() >= 600
                 && joint_adverse;
             let stagnant_unwind =
                 hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 560;
@@ -961,22 +994,26 @@ impl OnlineAdaptiveGovernor {
         self.ewma_net_bps_x100[slot_idx][d] = (prev * 75 + net_scaled_bps.raw() * 25) / 100;
         self.cum_net_bps_x100[slot_idx][d] = self.cum_net_bps_x100[slot_idx][d]
             .saturating_add(net_scaled_bps.raw())
-            .clamp(-18_000, 18_000);
+            .clamp(-24_000, 24_000);
 
         if !is_maker_exit || net_scaled_bps.raw() <= -800 {
             let s = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
             self.sl_streak[slot_idx][d] = s;
             self.win_streak[slot_idx][d] = 0;
-            // Exponential directional quarantine: 180s -> 360s -> 720s -> 1440s
-            let backoff_ns = 90_000_000_000_i64.saturating_mul(1_i64 << s.min(4));
+            // Exponential directional quarantine after SL: 300s (5m) -> 600s (10m) -> 1200s (20m) -> 2400s (40m)
+            let backoff_ns = 150_000_000_000_i64.saturating_mul(1_i64 << s.min(4));
             self.directional_cooldown_until_ns[slot_idx][d] = ts_ns.0.saturating_add(backoff_ns);
         } else if net_scaled_bps.raw() > 0 {
             let w = self.win_streak[slot_idx][d].saturating_add(1);
             self.win_streak[slot_idx][d] = w;
-            // Anti-Premature-Forgiveness Law: A Stop-Loss scar CANNOT be forgiven by 2 small wins
-            // while cumulative net debt is still deeply negative (< -15.00 bps)!
+            // Stage 31 Law 3: 60s Anti-Wave-Exhaustion breather after every win on the same (slot, side)
+            // so the bot never re-buys the same wave 4 times into the exhausted top (as in ETH #63)!
+            let win_breather_ns = ts_ns.0.saturating_add(60_000_000_000);
+            if win_breather_ns > self.directional_cooldown_until_ns[slot_idx][d] {
+                self.directional_cooldown_until_ns[slot_idx][d] = win_breather_ns;
+            }
             if self.sl_streak[slot_idx][d] > 0
-                && w >= 4
+                && w >= 5
                 && self.cum_net_bps_x100[slot_idx][d] >= -1_500
             {
                 self.sl_streak[slot_idx][d] -= 1;
@@ -1016,7 +1053,7 @@ impl OnlineAdaptiveGovernor {
         let sl_s = self.sl_streak[slot_idx][d] as f64;
         let debt_bps = self.cum_net_bps_x100[slot_idx][d] as f64;
         let debt_penalty = if debt_bps < 0.0 {
-            ((-debt_bps) / 25_000.0).min(0.24)
+            ((-debt_bps) / 18_000.0).min(0.28)
         } else {
             0.0
         };
@@ -1026,20 +1063,21 @@ impl OnlineAdaptiveGovernor {
                 Side::Bid => btc_comp,
                 Side::Ask => -btc_comp,
             };
+            // Strict BTC Leader Veto: Never open an altcoin position when BTC order book or trade tape opposes it!
             let btc_directional_support = match side {
-                Side::Bid => btc_leader_snap.factor_ofi.get() >= -0.05 && btc_leader_snap.factor_tfi.get() >= 0.0,
-                Side::Ask => btc_leader_snap.factor_ofi.get() <= 0.05 && btc_leader_snap.factor_tfi.get() <= 0.0,
+                Side::Bid => btc_leader_snap.factor_ofi.get() >= 0.05 && btc_leader_snap.factor_tfi.get() >= 0.10,
+                Side::Ask => btc_leader_snap.factor_ofi.get() <= -0.05 && btc_leader_snap.factor_tfi.get() <= -0.10,
             };
             if !btc_directional_support {
                 return false;
             }
-            let min_required_btc_alignment = 0.04 + 0.10 * sl_s + (debt_penalty * 0.5);
+            let min_required_btc_alignment = 0.12 + 0.10 * sl_s + (debt_penalty * 0.6);
             if signed_btc_alignment < min_required_btc_alignment {
                 return false;
             }
         }
 
-        let adaptive_threshold = (0.42 + 0.08 * sl_s + debt_penalty).min(0.78);
+        let adaptive_threshold = (0.44 + 0.09 * sl_s + debt_penalty).min(0.80);
         cand_comp >= adaptive_threshold
     }
 }
