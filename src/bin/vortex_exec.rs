@@ -852,10 +852,13 @@ fn append_shadow_trade_jsonl(
     }
 
     let vault_path = data_dir.join("vortex_ai_forensic_vault.jsonl");
+    let next_vault_id = File::open(&vault_path)
+        .map(|f| BufReader::new(f).lines().count() as u64 + 1)
+        .unwrap_or(ledger.closed_trades_count);
     if let Ok(mut vf) = OpenOptions::new().create(true).append(true).open(vault_path) {
         let vline = format!(
             "{{\"event\":\"TRADE_CLOSE\",\"trade_id\":{},\"ts_ns\":{},\"symbol\":\"{}\",\"side\":\"{:?}\",\"kind\":\"{:?}\",\"maker_exit\":{},\"entry_ticks\":{},\"exit_ticks\":{},\"floor_ticks\":{},\"gross_bps\":{:.2},\"fee_bps\":{:.2},\"net_bps\":{:.2},\"fee_drag_pct\":{:.1},\"pf_x100\":{},\"cum_net_pnl_1e8\":{}}}\n",
-            ledger.closed_trades_count,
+            next_vault_id,
             ts_ns,
             symbol,
             summary.side,

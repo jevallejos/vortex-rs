@@ -372,8 +372,9 @@ impl ExecutionFsm {
         };
         let vol_raw = snap.realized_vol_5m.raw().clamp(3_500, 12_500);
         let learned_raw = self.learned_mfe_ewma_bps.clamp(560, 1_600);
+        let target_raw = target_excursion.raw().clamp(3_500, 8_000);
         let elastic_sl_bps =
-            ((vol_raw * 78) / 100 + (learned_raw * 6) / 100).clamp(4_600, 5_200);
+            ((vol_raw * 42 + target_raw * 18 + learned_raw * 60) / 100).clamp(2_800, 4_400);
         let sl_distance_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
@@ -544,15 +545,43 @@ impl ExecutionFsm {
             snap.mark_price
         };
 
-        // 1. Elastic server-side MarkPrice Stop-Loss
+        // 1. Continuous Abraham Wald Survival Barrier & Elastic MarkPrice Stop-Loss
+        let base_sl_dist = (entry_price.0 - sl_trigger_price.0).abs().max(4);
+        let peak_gross_now =
+            Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price).raw();
+        let hold_ns = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
+        let learned_mfe_now = self.learned_mfe_ewma_bps.clamp(560, 1_600);
+        let immunity_ns = (learned_mfe_now.clamp(560, 1_200) * 35_000_000)
+            .clamp(20_000_000_000, 42_000_000_000);
+        let (s_ofi, s_tfi) = match side {
+            Side::Bid => (snap.factor_ofi.get(), snap.factor_tfi.get()),
+            Side::Ask => (-snap.factor_ofi.get(), -snap.factor_tfi.get()),
+        };
+        let w_o = 0.35 + s_ofi.abs();
+        let w_t = 0.30 + s_tfi.abs();
+        let f_conv = (w_o * s_ofi + w_t * s_tfi) / (w_o + w_t);
+        let adv_p = (-f_conv).max(0.0);
+        let wald_contraction_pct = if hold_ns > immunity_ns && peak_gross_now < 740 {
+            let over_ns = hold_ns - immunity_ns;
+            let time_c = ((over_ns * 28) / STAGNANT_PROFIT_HOLD_NS).clamp(0, 28);
+            let flow_c = (adv_p * adv_p * 35.0) as i64;
+            (time_c + flow_c).clamp(0, 48)
+        } else {
+            0
+        };
+        let eff_sl_dist = ((base_sl_dist * (100 - wald_contraction_pct)) / 100).max(4);
+        let eff_sl_trigger = match side {
+            Side::Bid => PriceTicks((entry_price.0 - eff_sl_dist).max(1)),
+            Side::Ask => PriceTicks(entry_price.0 + eff_sl_dist),
+        };
         let sl_hit = match side {
-            Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= sl_trigger_price.0,
-            Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= sl_trigger_price.0,
+            Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= eff_sl_trigger.0,
+            Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= eff_sl_trigger.0,
         };
         if sl_hit {
             let sl_fill_price = match side {
-                Side::Bid => PriceTicks((sl_trigger_price.0 - 1).max(1)),
-                Side::Ask => PriceTicks(sl_trigger_price.0 + 1),
+                Side::Bid => PriceTicks((eff_sl_trigger.0 - 1).max(1)),
+                Side::Ask => PriceTicks(eff_sl_trigger.0 + 1),
             };
             self.state = OrderLifecycleState::EmergencyStopTriggered {
                 side,
@@ -1947,7 +1976,8 @@ mod tests {
         use std::path::Path;
 
         let vault_path = Path::new("data/vortex_ai_forensic_vault.jsonl");
-        let file = match File::open(vault_path) {
+        let seed_path = Path::new("deploy/forensic_vault_171.seed");
+        let file = match File::open(vault_path).or_else(|_| File::open(seed_path)) {
             Ok(f) => f,
             Err(_) => return,
         };
