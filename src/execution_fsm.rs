@@ -376,11 +376,9 @@ impl ExecutionFsm {
         };
         let vol_raw = snap.realized_vol_5m.raw().clamp(3_500, 12_500);
         let learned_raw = self.learned_mfe_ewma_bps.clamp(560, 1_600);
-        let elastic_sl_bps = if vol_raw == 5_000 {
-            SERVER_SL_DISTANCE_SCALED_BPS
-        } else {
-            ((vol_raw * 38) / 100 + (learned_raw * 8) / 100).clamp(2_400, 3_600)
-        };
+        let _ = SERVER_SL_DISTANCE_SCALED_BPS;
+        let elastic_sl_bps =
+            ((vol_raw * 38) / 100 + (learned_raw * 8) / 100).clamp(2_400, 3_600);
         let sl_distance_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),

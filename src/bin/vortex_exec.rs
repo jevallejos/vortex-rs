@@ -1857,6 +1857,13 @@ mod tests {
     #[test]
     fn test_oos_520_trades_gate_passes_all_institutional_thresholds() {
         let res = run_oos_certification_suite();
-        assert_eq!(res, Ok((520, 8_000, 192, 5_761_600_000, 0)));
+        assert!(res.is_ok());
+        if let Ok((trades, maker_bps, pf_x100, net_pnl_1e8, drift)) = res {
+            assert_eq!(trades, 520);
+            assert_eq!(maker_bps, 8_000);
+            assert!(pf_x100 >= 350);
+            assert!(net_pnl_1e8 >= 8_500_000_000);
+            assert_eq!(drift, 0);
+        }
     }
 }
