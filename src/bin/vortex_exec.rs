@@ -462,7 +462,19 @@ impl BybitV5LiveClient {
             if !is_open {
                 self.cancel_all_symbol_orders(symbol);
                 let realized_px = if force_market_if_unfilled {
-                    candidate_exit
+                    if let Ok(slot) = arena.slot(active_slot) {
+                        if let Ok(s) = slot.read_snapshot(4) {
+                            if s.last_trade_price.0 > 0 {
+                                s.last_trade_price
+                            } else {
+                                candidate_exit
+                            }
+                        } else {
+                            candidate_exit
+                        }
+                    } else {
+                        candidate_exit
+                    }
                 } else if last_pegged_price.0 > 0 {
                     *last_pegged_price
                 } else {
@@ -680,15 +692,19 @@ fn rehydrate_shadow_ledger(
             ledger.record_closed_trade(gross_1e8, fee_1e8);
             if is_maker {
                 fsm.maker_exits_count += 1;
-                if gross_scaled_bps >= 440 {
-                    fsm.learned_mfe_ewma_bps = ((fsm.learned_mfe_ewma_bps * 80)
-                        + (gross_scaled_bps.min(2_400) * 20))
+                let observed_mfe = gross_scaled_bps.min(2_400);
+                if observed_mfe >= 440 {
+                    let surprise = (observed_mfe - fsm.learned_mfe_ewma_bps).abs();
+                    let alpha_pct = (18 + (surprise / 60)).clamp(18, 32);
+                    fsm.learned_mfe_ewma_bps = ((fsm.learned_mfe_ewma_bps * (100 - alpha_pct))
+                        + (observed_mfe * alpha_pct))
                         / 100;
                     fsm.learned_mfe_ewma_bps = fsm.learned_mfe_ewma_bps.clamp(560, 1_600);
                 }
             } else {
                 fsm.taker_sl_exits_count += 1;
-                fsm.learned_mfe_ewma_bps = (fsm.learned_mfe_ewma_bps - 80).clamp(560, 1_600);
+                fsm.learned_mfe_ewma_bps =
+                    (((fsm.learned_mfe_ewma_bps * 88) + (560 * 12)) / 100).clamp(560, 1_600);
             }
             if net_1e8 >= 0 {
                 fsm.gross_profit_accum_1e8 += net_1e8;
@@ -1287,6 +1303,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 side,
                 entry_price,
                 target_excursion,
+                sl_trigger_price: resting_sl_price,
                 ..
             } => {
                 if let Ok(slot) = arena.slot(active_slot) {
@@ -1425,18 +1442,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 }
                             }
                             let spec = APPROVED_SPECS[active_slot];
-                            let sl_dist_ticks =
-                                ((entry_price.0 * ((snap.realized_vol_5m.raw().clamp(3_500, 12_500) * 78) / 100 + (fsm.learned_mfe_ewma_bps.clamp(560, 1_600) * 6) / 100).clamp(4_600, 5_200)) / 1_000_000).max(4);
-                            let sl_trig = match side {
-                                Side::Bid => PriceTicks(entry_price.0 - sl_dist_ticks),
-                                Side::Ask => PriceTicks(entry_price.0 + sl_dist_ticks),
-                            };
                             fsm.state = OrderLifecycleState::RestingEntryQueue {
                                 side,
                                 entry_price,
                                 qty: LotQty(10),
                                 target_excursion,
-                                sl_trigger_price: sl_trig,
+                                sl_trigger_price: resting_sl_price,
                                 resting_since_ts: snap.ts_local_ns,
                             };
                             let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);

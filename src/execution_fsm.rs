@@ -658,24 +658,18 @@ impl ExecutionFsm {
             let time_decay_relaxation = (elapsed_secs
                 * (adaptive_base_target - zero_loss_scratch_floor).max(0))
                 / elastic_decay_span_secs.max(1);
-            let flow_relaxation = if deep_joint_adverse {
-                ((-flow_conviction).max(0.0) * 240.0) as i64
-            } else if joint_adverse {
-                ((-flow_conviction).max(0.0) * 160.0) as i64
-            } else if ofi_reversed && elapsed_secs >= (elastic_win_horizon_secs / 2) {
-                ((-flow_conviction).max(0.0) * 120.0) as i64
-            } else {
-                0
-            };
+            let adverse_pressure = (-flow_conviction).max(0.0);
+            let flow_relaxation =
+                (adverse_pressure * (90.0 + 180.0 * adverse_pressure)) as i64;
             let active_win_floor = (fee_barrier_bps
                 + ((adaptive_base_target - fee_barrier_bps) * 55) / 100)
                 .clamp(530, 660);
-            let min_dynamic_floor =
-                if elapsed_secs < elastic_win_horizon_secs && !deep_joint_adverse {
-                    active_win_floor
-                } else {
-                    zero_loss_scratch_floor
-                };
+            let floor_span = (active_win_floor - zero_loss_scratch_floor).max(0);
+            let time_bleed = (elapsed_secs * floor_span) / elastic_win_horizon_secs.max(1);
+            let adv_bleed =
+                (adverse_pressure * adverse_pressure * (floor_span as f64) * 4.0) as i64;
+            let min_dynamic_floor = (active_win_floor - time_bleed - adv_bleed)
+                .clamp(zero_loss_scratch_floor, active_win_floor);
             let elastic_harvest_floor = (adaptive_base_target
                 - time_decay_relaxation
                 - flow_relaxation)
@@ -1527,13 +1521,10 @@ impl OnlineAdaptiveGovernor {
             }
         }
 
-        let cand_comp = (0.45 * candidate_snap.factor_ofi.get()
-            + 0.35 * candidate_snap.factor_tfi.get()
-            + 0.20 * candidate_snap.factor_geom.get())
-        .abs();
-        let btc_comp = 0.45 * btc_leader_snap.factor_ofi.get()
-            + 0.35 * btc_leader_snap.factor_tfi.get()
-            + 0.20 * btc_leader_snap.factor_geom.get();
+        let cand_comp =
+            crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(candidate_snap).abs();
+        let btc_comp =
+            crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(btc_leader_snap);
 
         let sl_s = self.sl_streak[slot_idx][d] as f64;
         let win_s = (self.win_streak[slot_idx][d].min(4)) as f64;

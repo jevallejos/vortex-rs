@@ -225,6 +225,19 @@ impl OrthogonalFactorState {
         }
     }
 
+    /// Computes the continuous SNR-weighted composite score across (X_OFI, X_TFI, X_Geom).
+    #[inline]
+    #[must_use]
+    pub fn snr_composite_score(snap: &SymbolLobSnapshot) -> f64 {
+        let x_ofi = snap.factor_ofi.get();
+        let x_tfi = snap.factor_tfi.get();
+        let x_geom = snap.factor_geom.get();
+        let w_ofi = 0.25 + x_ofi * x_ofi;
+        let w_tfi = 0.20 + x_tfi * x_tfi;
+        let w_geom = 0.10 + 0.50 * x_geom * x_geom;
+        (w_ofi * x_ofi + w_tfi * x_tfi + w_geom * x_geom) / (w_ofi + w_tfi + w_geom)
+    }
+
     /// Evaluates whether the 3 orthogonal factors authorize a passive Maker entry
     /// after enforcing the Anti-Spoofing check and the 3x Round-Trip Friction Barrier.
     #[inline]
@@ -249,11 +262,7 @@ impl OrthogonalFactorState {
             return Ok(SignalVerdict::SpoofingVeto);
         }
 
-        let w_ofi = 0.25 + x_ofi * x_ofi;
-        let w_tfi = 0.20 + x_tfi * x_tfi;
-        let w_geom = 0.10 + 0.50 * x_geom * x_geom;
-        let composite =
-            (w_ofi * x_ofi + w_tfi * x_tfi + w_geom * x_geom) / (w_ofi + w_tfi + w_geom);
+        let composite = Self::snr_composite_score(snap);
         let abs_comp = composite.abs();
         if abs_comp < 0.42 {
             return Ok(SignalVerdict::NeutralNoAction);
