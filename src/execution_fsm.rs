@@ -372,11 +372,11 @@ impl ExecutionFsm {
             Side::Bid => best_bid.price,
             Side::Ask => best_ask.price,
         };
-        let vol_raw = snap.realized_vol_5m.raw().clamp(3_500, 12_500);
+        let vol_raw = snap.realized_vol_5m.raw().clamp(4_600, 11_500);
         let learned_raw = self.learned_mfe_ewma_bps.clamp(560, 1_600);
-        let target_raw = target_excursion.raw().clamp(3_500, 8_000);
+        let target_raw = target_excursion.raw().clamp(2_400, 8_000);
         let elastic_sl_bps =
-            ((vol_raw * 42 + target_raw * 18 + learned_raw * 60) / 100).clamp(2_800, 4_400);
+            ((vol_raw * 48 + target_raw * 20 + learned_raw * 45) / 100).clamp(3_500, 4_500);
         let sl_distance_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
@@ -574,14 +574,14 @@ impl ExecutionFsm {
         };
         let cur_gross_now =
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
-        let wald_contraction_pct = if hold_ns > immunity_ns
-            && (peak_gross_now < 740 || cur_gross_now < 0)
+        let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
+        let wald_contraction_pct = if hold_ns > wald_grace_ns
+            && (peak_gross_now < 650 || cur_gross_now < -800)
         {
-            let over_ns = hold_ns - immunity_ns;
-            let time_c = ((over_ns * 28) / STAGNANT_PROFIT_HOLD_NS).clamp(0, 28);
-            let flow_c = (adv_p * adv_p * 35.0) as i64;
-            let rev_c = ((peak_gross_now - 400).max(0) / 30).clamp(0, 14);
-            let inst_c = (time_c + flow_c + rev_c).clamp(0, 48);
+            let over_ns = hold_ns - wald_grace_ns;
+            let time_c = ((over_ns * 14) / STAGNANT_PROFIT_HOLD_NS).clamp(0, 14);
+            let flow_c = (adv_p * adv_p * 12.0) as i64;
+            let inst_c = (time_c + flow_c).clamp(0, 22);
             if inst_c > self.max_wald_contraction_pct {
                 self.max_wald_contraction_pct = inst_c;
             }
@@ -589,7 +589,9 @@ impl ExecutionFsm {
         } else {
             self.max_wald_contraction_pct
         };
-        let eff_sl_dist = ((base_sl_dist * (100 - wald_contraction_pct)) / 100).max(4);
+        let min_noise_sl_dist = ((entry_price.0 * 2_850) / 1_000_000).max(4);
+        let eff_sl_dist = ((base_sl_dist * (100 - wald_contraction_pct)) / 100)
+            .max(min_noise_sl_dist);
         let eff_sl_trigger = match side {
             Side::Bid => PriceTicks((entry_price.0 - eff_sl_dist).max(1)),
             Side::Ask => PriceTicks(entry_price.0 + eff_sl_dist),
@@ -1576,34 +1578,30 @@ impl OnlineAdaptiveGovernor {
         let learned_edge = self.ewma_net_bps_x100[slot_idx][d].clamp(-200, 400);
         let self_vol = candidate_snap.realized_vol_5m.raw().max(3_500);
         let btc_vol = btc_leader_snap.realized_vol_5m.raw().max(3_500);
-        let min_trend_drift = (((260 - learned_edge).max(60)) * self_vol) / 600_000;
-        let max_self_ext = ((self_vol / 11) + (learned_edge / 4)).max(320);
-        let max_btc_ext = ((btc_vol / 12) + (learned_edge / 5)).max(300);
+        let min_trend_drift = ((((260 - learned_edge).max(60)) * self_vol) / 32_000).max(8);
+        let max_self_ext = ((self_vol / 10) + (learned_edge / 4)).max(360);
+        let max_btc_ext = ((btc_vol / 10) + (learned_edge / 5)).max(360);
         match side {
             Side::Bid => {
                 if self_drift_bps < min_trend_drift
-                    || !(0..=max_self_ext).contains(&self_ext_bps)
+                    || !(-20..=max_self_ext).contains(&self_ext_bps)
                 {
                     return false;
                 }
                 if slot_idx > 0
-                    && (btc_drift_bps < 0
-                        || !(0..=max_btc_ext).contains(&btc_ext_bps)
-                        || self.global_dir_win_streak[d] >= 2)
+                    && (btc_drift_bps < -25 || btc_ext_bps > max_btc_ext)
                 {
                     return false;
                 }
             }
             Side::Ask => {
                 if self_drift_bps > -min_trend_drift
-                    || !(-max_self_ext..=0).contains(&self_ext_bps)
+                    || !(-max_self_ext..=20).contains(&self_ext_bps)
                 {
                     return false;
                 }
                 if slot_idx > 0
-                    && (btc_drift_bps > 0
-                        || !(-max_btc_ext..=0).contains(&btc_ext_bps)
-                        || self.global_dir_win_streak[d] >= 2)
+                    && (btc_drift_bps > 25 || btc_ext_bps < -max_btc_ext)
                 {
                     return false;
                 }
@@ -1619,19 +1617,19 @@ impl OnlineAdaptiveGovernor {
         let win_s = (self.win_streak[slot_idx][d].min(4)) as f64;
         let debt_bps = self.cum_net_bps_x100[slot_idx][d] as f64;
         let debt_penalty = if debt_bps < 0.0 {
-            ((-debt_bps) / 16_000.0).min(0.28)
+            ((-debt_bps) / 18_000.0).min(0.22)
         } else {
             0.0
         };
         let global_debt_bps = self.global_dir_debt_bps_x100[d] as f64;
         let global_penalty = if global_debt_bps < -2_000.0 {
-            ((-global_debt_bps - 2_000.0) / 35_000.0).min(0.14)
+            ((-global_debt_bps - 2_000.0) / 40_000.0).min(0.12)
         } else {
             0.0
         };
-        let staircase_penalty = if win_s >= 2.0 { 0.05 * (win_s - 1.0) } else { 0.0 };
+        let staircase_penalty = if win_s >= 2.0 { 0.04 * (win_s - 1.0) } else { 0.0 };
 
-        if self.is_in_scar_debt(slot_idx, side) && candidate_snap.factor_tfi.get().abs() < 0.40 {
+        if self.is_in_scar_debt(slot_idx, side) && candidate_snap.factor_tfi.get().abs() < 0.35 {
             return false;
         }
 
@@ -1640,22 +1638,17 @@ impl OnlineAdaptiveGovernor {
                 Side::Bid => btc_comp,
                 Side::Ask => -btc_comp,
             };
-            let btc_directional_support = match side {
+            let btc_not_opposing = match side {
                 Side::Bid => {
-                    btc_leader_snap.factor_ofi.get() >= 0.18
-                        && btc_leader_snap.factor_tfi.get() >= 0.15
+                    btc_leader_snap.factor_ofi.get() > -0.15
+                        && btc_leader_snap.factor_tfi.get() > -0.15
                 }
                 Side::Ask => {
-                    btc_leader_snap.factor_ofi.get() <= -0.18
-                        && btc_leader_snap.factor_tfi.get() <= -0.15
+                    btc_leader_snap.factor_ofi.get() < 0.15
+                        && btc_leader_snap.factor_tfi.get() < 0.15
                 }
             };
-            if !btc_directional_support {
-                return false;
-            }
-            let min_required_btc_alignment =
-                0.14 + 0.10 * sl_s + 0.55 * (debt_penalty + global_penalty);
-            if signed_btc_alignment < min_required_btc_alignment {
+            if !btc_not_opposing || signed_btc_alignment < -0.12 {
                 return false;
             }
         }

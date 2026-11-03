@@ -1257,6 +1257,13 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                     .and_then(|s0| s0.read_snapshot(4))
                     .unwrap_or_default();
 
+                let mut best_cand: Option<(
+                    usize,
+                    PairSpec,
+                    SymbolLobSnapshot,
+                    SignalVerdict,
+                    f64,
+                )> = None;
                 let mut s = 0;
                 while s < APPROVED_SPECS.len() {
                     let spec = APPROVED_SPECS[s];
@@ -1267,56 +1274,61 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 continue;
                             }
                             last_seen_seq[s] = snap.sequence_id;
-
                             if snap.ts_local_ns.0 < slot_cooldown_until_ns[s] {
                                 s += 1;
                                 continue;
                             }
-
                             if let Ok(verdict) = evaluator.evaluate_entry_signal(&spec, &snap) {
                                 if let SignalVerdict::AuthorizeMakerEntry { side, .. } = verdict {
-                                    if !adaptive_gov.authorizes_adaptive_entry(
+                                    if adaptive_gov.authorizes_adaptive_entry(
                                         s,
                                         side,
                                         &snap,
                                         &btc_leader_snap,
                                     ) {
-                                        s += 1;
-                                        continue;
+                                        let sc =
+                                            OrthogonalFactorState::snr_composite_score(&snap).abs();
+                                        let is_better = match best_cand {
+                                            Some((_, _, _, _, best_sc)) => sc > best_sc,
+                                            None => true,
+                                        };
+                                        if is_better {
+                                            best_cand = Some((s, spec, snap, verdict, sc));
+                                        }
                                     }
-                                }
-
-                                if let Ok(true) =
-                                    fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10))
-                                {
-                                    active_slot = s;
-                                    if let OrderLifecycleState::PlacingEntryMaker {
-                                        side: arm_side,
-                                        entry_price: arm_entry,
-                                        sl_trigger_price: arm_sl,
-                                        submitted_ts: arm_ts,
-                                        ..
-                                    } = fsm.state
-                                    {
-                                        arena.exec_side.store(arm_side as u64, Ordering::Release);
-                                        arena.exec_entry_ticks.store(arm_entry.0 as u64, Ordering::Release);
-                                        arena.exec_peak_ticks.store(arm_entry.0 as u64, Ordering::Release);
-                                        arena.exec_tp_ticks.store(0, Ordering::Release);
-                                        arena.exec_sl_ticks.store(arm_sl.0 as u64, Ordering::Release);
-                                        arena.exec_resting_since_ns.store(arm_ts.0 as u64, Ordering::Release);
-                                    }
-                                    arena.exec_active_slot.store(s as u64, Ordering::Release);
-                                    arena.exec_active_symbol.store(
-                                        u64::from(snap.symbol_id.0),
-                                        Ordering::Release,
-                                    );
-                                    arena.exec_state_code.store(1, Ordering::Release);
-                                    break;
                                 }
                             }
                         }
                     }
                     s += 1;
+                }
+                if let Some((b_slot, b_spec, b_snap, b_verdict, _)) = best_cand {
+                    if let Ok(true) =
+                        fsm.try_arm_maker_entry(&b_spec, &b_snap, b_verdict, LotQty(10))
+                    {
+                        active_slot = b_slot;
+                        if let OrderLifecycleState::PlacingEntryMaker {
+                            side: arm_side,
+                            entry_price: arm_entry,
+                            sl_trigger_price: arm_sl,
+                            submitted_ts: arm_ts,
+                            ..
+                        } = fsm.state
+                        {
+                            arena.exec_side.store(arm_side as u64, Ordering::Release);
+                            arena.exec_entry_ticks.store(arm_entry.0 as u64, Ordering::Release);
+                            arena.exec_peak_ticks.store(arm_entry.0 as u64, Ordering::Release);
+                            arena.exec_tp_ticks.store(0, Ordering::Release);
+                            arena.exec_sl_ticks.store(arm_sl.0 as u64, Ordering::Release);
+                            arena.exec_resting_since_ns.store(arm_ts.0 as u64, Ordering::Release);
+                        }
+                        arena.exec_active_slot.store(b_slot as u64, Ordering::Release);
+                        arena.exec_active_symbol.store(
+                            u64::from(b_snap.symbol_id.0),
+                            Ordering::Release,
+                        );
+                        arena.exec_state_code.store(1, Ordering::Release);
+                    }
                 }
             }
             OrderLifecycleState::RestingEntryQueue {

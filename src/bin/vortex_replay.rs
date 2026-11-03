@@ -333,13 +333,15 @@ fn replay_captured_live_parquet_segments() {
                                 if prev_mid_ticks[slot_idx] > 0 && mid_t > 0 {
                                     let dt = (mid_t - prev_mid_ticks[slot_idx]).abs();
                                     if dt > 0 {
-                                        let prev_v = learned_vol_5m_bps[slot_idx].clamp(3_800, 12_500);
-                                        let sp_t = (row.best_ask_ticks.0 - row.best_bid_ticks.0).max(1);
+                                        let prev_v = learned_vol_5m_bps[slot_idx].clamp(4_600, 11_500);
+                                        let sp_t =
+                                            (row.best_ask_ticks.0 - row.best_bid_ticks.0).clamp(1, 10);
                                         let inst_bps = (dt.saturating_mul(1_000_000)) / mid_t.max(1);
-                                        let sp_bps = (sp_t.saturating_mul(1_000_000)) / mid_t.max(1);
-                                        let imp = (inst_bps.saturating_mul(42) + sp_bps.saturating_mul(38))
-                                            .clamp(3_800, 12_500);
-                                        let alpha_v = if imp > prev_v { 8 } else { 3 };
+                                        let active_ticks = dt.min(20) + sp_t;
+                                        let imp = (active_ticks.saturating_mul(2_800)
+                                            + inst_bps.min(250).saturating_mul(8))
+                                            .clamp(4_600, 11_500);
+                                        let alpha_v = if imp > prev_v { 6 } else { 3 };
                                         learned_vol_5m_bps[slot_idx] =
                                             (prev_v * (100 - alpha_v) + imp * alpha_v) / 100;
                                     }

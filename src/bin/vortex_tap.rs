@@ -259,12 +259,13 @@ fn process_bybit_ws_frame(
             if snap.mark_price.0 > 0 && mid.0 > 0 {
                 let delta_ticks = (mid.0 - snap.mark_price.0).abs();
                 if delta_ticks > 0 {
-                    let prev_vol = snap.realized_vol_5m.raw().clamp(3_800, 12_500);
+                    let prev_vol = snap.realized_vol_5m.raw().clamp(4_600, 11_500);
                     let inst_bps = (delta_ticks.saturating_mul(1_000_000)) / mid.0.max(1);
-                    let sp_bps = (spread_ticks.max(1).saturating_mul(1_000_000)) / mid.0.max(1);
-                    let target_vol = (inst_bps.saturating_mul(42) + sp_bps.saturating_mul(38))
-                        .clamp(3_800, 12_500);
-                    let alpha_v = if target_vol > prev_vol { 8 } else { 3 };
+                    let active_ticks = delta_ticks.min(20) + spread_ticks.clamp(1, 10);
+                    let target_vol = (active_ticks.saturating_mul(2_800)
+                        + inst_bps.min(250).saturating_mul(8))
+                        .clamp(4_600, 11_500);
+                    let alpha_v = if target_vol > prev_vol { 6 } else { 3 };
                     snap.realized_vol_5m =
                         ScaledBps(((prev_vol * (100 - alpha_v)) + (target_vol * alpha_v)) / 100);
                 }

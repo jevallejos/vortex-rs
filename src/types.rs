@@ -306,11 +306,7 @@ impl PairSpec {
             / 100;
         let round_trip_cost = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 + exit_fee_expected + tick_bps.0;
         let required_3x = round_trip_cost * 3;
-        let effective_floor = if required_3x > ScaledBps::MIN_STRUCTURAL_EXCURSION_BPS.0 {
-            required_3x
-        } else {
-            ScaledBps::MIN_STRUCTURAL_EXCURSION_BPS.0
-        };
+        let effective_floor = required_3x;
 
         if expected_excursion_scaled_bps.0 < effective_floor {
             return Err(VortexError::FrictionBarrierRejected {
