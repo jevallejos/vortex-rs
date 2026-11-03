@@ -257,13 +257,8 @@ impl OrthogonalFactorState {
             return Ok(SignalVerdict::NeutralNoAction);
         }
 
-        let l1_bid_q = best_bid.qty.0.max(1) as f64;
-        let l1_ask_q = best_ask.qty.0.max(1) as f64;
-        let stoikov_l1_imb = (l1_bid_q - l1_ask_q) / (l1_bid_q + l1_ask_q);
-        let long_aligned =
-            x_ofi > 0.25 && x_tfi > 0.20 && x_geom > 0.10 && stoikov_l1_imb >= -0.35;
-        let short_aligned =
-            x_ofi < -0.25 && x_tfi < -0.20 && x_geom < -0.10 && stoikov_l1_imb <= 0.35;
+        let long_aligned = x_ofi > 0.25 && x_tfi > 0.20 && x_geom > 0.10;
+        let short_aligned = x_ofi < -0.25 && x_tfi < -0.20 && x_geom < -0.10;
         if !long_aligned && !short_aligned {
             return Ok(SignalVerdict::NeutralNoAction);
         }

@@ -433,23 +433,21 @@ impl ExecutionFsm {
             let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
             let ttl_expired = elapsed_ns >= MAX_RESTING_QUEUE_TTL_NS;
             let residence_satisfied = elapsed_ns >= MIN_QUEUE_RESIDENCE_NS;
-            let l1_bid_q = snap.bids[0].qty.0.max(1) as f64;
-            let l1_ask_q = snap.asks[0].qty.0.max(1) as f64;
-            let stoikov_l1_imb = (l1_bid_q - l1_ask_q) / (l1_bid_q + l1_ask_q);
-            let l1_queue_collapsed = residence_satisfied
-                && match side {
-                    Side::Bid => stoikov_l1_imb <= -0.45 && ofi <= 0.0,
-                    Side::Ask => stoikov_l1_imb >= 0.45 && ofi >= 0.0,
-                };
-            let flow_faded = l1_queue_collapsed
-                || match side {
-                    Side::Bid => residence_satisfied && ofi <= 0.05 && tfi <= 0.0,
-                    Side::Ask => residence_satisfied && ofi >= -0.05 && tfi >= 0.0,
-                };
+            let early_fade_ready = elapsed_ns >= 800_000_000;
+            let flow_faded = match side {
+                Side::Bid => {
+                    (residence_satisfied && ofi <= 0.05 && tfi <= 0.0)
+                        || (early_fade_ready && ofi <= 0.12 && tfi <= 0.05)
+                }
+                Side::Ask => {
+                    (residence_satisfied && ofi >= -0.05 && tfi >= 0.0)
+                        || (early_fade_ready && ofi >= -0.12 && tfi >= -0.05)
+                }
+            };
             let joint_flow_reversal = flow_faded
                 || match side {
-                    Side::Bid => ofi <= -0.20 && tfi <= -0.25,
-                    Side::Ask => ofi >= 0.20 && tfi >= 0.25,
+                    Side::Bid => ofi <= -0.12 && tfi <= -0.15,
+                    Side::Ask => ofi >= 0.12 && tfi >= 0.15,
                 };
             let vol_5m = snap.realized_vol_5m.raw().clamp(5_500, 7_800);
             let elastic_runaway_bps = (vol_5m / 18).clamp(320, 420);
@@ -1439,13 +1437,22 @@ impl OnlineAdaptiveGovernor {
         let learned_edge = self.ewma_net_bps_x100[slot_idx][d].clamp(-200, 400);
         let self_vol = candidate_snap.realized_vol_5m.raw().max(3_500);
         let btc_vol = btc_leader_snap.realized_vol_5m.raw().max(3_500);
-        let min_trend_drift = (((260 - learned_edge).max(60)) * self_vol) / 600_000;
+        let min_trend_drift = ((((260 - learned_edge).max(80)) * self_vol) / 95_000).max(4);
         let max_self_ext = ((self_vol / 11) + (learned_edge / 4)).max(320);
         let max_btc_ext = ((btc_vol / 12) + (learned_edge / 5)).max(300);
+        if self.global_dir_sl_streak[d] >= 1 && self.last_global_win_dir == ((1 - d) as u8) {
+            return false;
+        }
+        if self.last_global_win_dir == ((1 - d) as u8)
+            && candidate_snap.ts_local_ns.0.saturating_sub(self.last_global_win_ts_ns)
+                < 90_000_000_000
+        {
+            return false;
+        }
         match side {
             Side::Bid => {
                 if self_drift_bps < min_trend_drift
-                    || !(0..=max_self_ext).contains(&self_ext_bps)
+                    || !(min_trend_drift..=max_self_ext).contains(&self_ext_bps)
                 {
                     return false;
                 }
@@ -1459,7 +1466,7 @@ impl OnlineAdaptiveGovernor {
             }
             Side::Ask => {
                 if self_drift_bps > -min_trend_drift
-                    || !(-max_self_ext..=0).contains(&self_ext_bps)
+                    || !(-max_self_ext..=-min_trend_drift).contains(&self_ext_bps)
                 {
                     return false;
                 }

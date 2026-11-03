@@ -461,28 +461,23 @@ fn replay_captured_live_parquet_segments() {
                                         Side::Bid => snap.factor_ofi.get() <= -0.10,
                                         Side::Ask => snap.factor_ofi.get() >= 0.10,
                                     };
-                                if !toxic_sweep {
-                                    fifo_sim.on_market_row(&row);
-                                    if matches!(fifo_sim.state, SimulatedOrderState::FilledMaker { .. }) {
-                                        let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
-                                        idx += 1;
-                                        continue;
-                                    } else if matches!(
-                                        fifo_sim.state,
-                                        SimulatedOrderState::RejectedPostOnlyCross
-                                    ) {
-                                        fsm.state = OrderLifecycleState::Idle;
-                                        fifo_sim.state = SimulatedOrderState::Inactive;
-                                        idx += 1;
-                                        continue;
-                                    }
-                                }
                                 if toxic_sweep || fsm.check_resting_queue_abort(&snap) {
                                     queue_aborts += 1;
                                     fsm.state = OrderLifecycleState::Idle;
                                     slot_cooldown_until_ns[active_slot] =
                                         snap.ts_local_ns.0 + 15_000_000_000;
                                     fifo_sim.state = SimulatedOrderState::Inactive;
+                                } else {
+                                    fifo_sim.on_market_row(&row);
+                                    if matches!(fifo_sim.state, SimulatedOrderState::FilledMaker { .. }) {
+                                        let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
+                                    } else if matches!(
+                                        fifo_sim.state,
+                                        SimulatedOrderState::RejectedPostOnlyCross
+                                    ) {
+                                        fsm.state = OrderLifecycleState::Idle;
+                                        fifo_sim.state = SimulatedOrderState::Inactive;
+                                    }
                                 }
                             }
                             OrderLifecycleState::PositionOpenMakerExit { .. }

@@ -199,7 +199,7 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 36.3 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 36.4 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -619,9 +619,9 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
         ANSI_GREEN, ANSI_RESET
     );
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 STAGE 36.3 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
+        "🟢 [VORTEX-L2 STAGE 36.4 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
     } else {
-        "🟢 [VORTEX-L2 STAGE 36.3 — PAPER-TRUE LAB MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟢 [VORTEX-L2 STAGE 36.4 — PAPER-TRUE LAB MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
     thread::spawn(move || {
@@ -632,6 +632,8 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
             let _ = Command::new("curl")
                 .args([
                     "-sS",
+                    "--max-time",
+                    "5",
                     "-X",
                     "POST",
                     &url,
@@ -1201,7 +1203,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 36.3 Stoikov L1 & Convex Ratchet & 5-Phase Anti-Zombie){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 36.4 Stoikov L1 & Convex Ratchet & 5-Phase Anti-Zombie){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),
@@ -1319,7 +1321,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             Side::Bid => snap.cum_sell_trade_lots.0,
                             Side::Ask => snap.cum_buy_trade_lots.0,
                         };
-                        if cur_cum_trade > prev_cum_trade_lots.0 && prev_cum_trade_lots.0 > 0 {
+                        if cur_cum_trade > prev_cum_trade_lots.0 {
                             let traded_at_level = match side {
                                 Side::Bid => snap.last_trade_price.0 > 0 && snap.last_trade_price.0 <= entry_price.0,
                                 Side::Ask => snap.last_trade_price.0 >= entry_price.0,
@@ -1331,7 +1333,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             }
                         }
                         prev_cum_trade_lots = LotQty(cur_cum_trade);
-
                         let cur_l1_qty = match side {
                             Side::Bid if snap.bids[0].price.0 == entry_price.0 => snap.bids[0].qty.0,
                             Side::Ask if snap.asks[0].price.0 == entry_price.0 => snap.asks[0].qty.0,
@@ -1339,16 +1340,23 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         };
                         if cur_l1_qty < prev_l1_qty.0 {
                             let drop = prev_l1_qty.0 - cur_l1_qty;
+                            let credit = if live_client.is_none() {
+                                (drop / 2).max(1)
+                            } else {
+                                (drop / 4).max(1)
+                            };
                             resting_queue_ahead =
-                                LotQty((resting_queue_ahead.0 - (drop / 4).max(1)).max(0));
+                                LotQty((resting_queue_ahead.0 - credit).max(0));
+                        }
+                        if live_client.is_none() && cur_l1_qty > 0 {
+                            resting_queue_ahead =
+                                LotQty(resting_queue_ahead.0.min(cur_l1_qty));
                         }
                         prev_l1_qty = LotQty(cur_l1_qty);
-
                         arena.exec_queue_ahead_lots.store(
                             resting_queue_ahead.0 as u64,
                             Ordering::Release,
                         );
-
                         let toxic_sweep = level_swept
                             && resting_queue_ahead.0 > 0
                             && match side {
@@ -1786,6 +1794,25 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         arena.exec_resting_since_ns.store(snap.ts_local_ns.0 as u64, Ordering::Release);
                         arena.exec_queue_ahead_lots.store(resting_queue_ahead.0 as u64, Ordering::Release);
                         arena.exec_armed_count.fetch_add(1, Ordering::Release);
+                        if live_client.is_none() {
+                            if let Some(ref tx) = tg_tx {
+                                let (aw, af) = spec.format_price_usdt_parts(entry_price);
+                                let (sw, sf) = spec.format_price_usdt_parts(sl_trigger_price);
+                                let msg = format!(
+                                    "\u{1F9EA} [VORTEX-L2 PAPER-TRUE QUEUE ARMED]\nSymbol: {} ({:?}) | Queue Ahead: {} lots\nEntry L1: {}.{:04} USDT | SL: {}.{:04} USDT\nOFI: {:+.2} | TFI: {:+.2}",
+                                    snap.symbol_id.name(),
+                                    side,
+                                    resting_queue_ahead.0,
+                                    aw,
+                                    af,
+                                    sw,
+                                    sf,
+                                    snap.factor_ofi.get(),
+                                    snap.factor_tfi.get()
+                                );
+                                let _ = tx.try_send(msg);
+                            }
+                        }
 
                         println!(
                             "{}🟡 [QUEUE ARMED] {} {:?} resting at L1 after 25ms PostOnly check (Queue ahead: {} lots | Seq: {} | OFI: {:+.2} | TFI: {:+.2}){}",
