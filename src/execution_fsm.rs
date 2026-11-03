@@ -430,29 +430,33 @@ impl ExecutionFsm {
             ..
         } = self.state
         {
-            let ofi = snap.factor_ofi.get();
-            let tfi = snap.factor_tfi.get();
-            let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
-            let ttl_expired = elapsed_ns >= MAX_RESTING_QUEUE_TTL_NS;
-            let residence_satisfied = elapsed_ns >= MIN_QUEUE_RESIDENCE_NS;
-            let early_fade_ready = elapsed_ns >= 800_000_000;
-            let flow_faded = match side {
-                Side::Bid => {
-                    (residence_satisfied && ofi <= 0.05 && tfi <= 0.0)
-                        || (early_fade_ready && ofi <= 0.12 && tfi <= 0.05)
-                }
-                Side::Ask => {
-                    (residence_satisfied && ofi >= -0.05 && tfi >= 0.0)
-                        || (early_fade_ready && ofi >= -0.12 && tfi >= -0.05)
-                }
+            let (signed_ofi, signed_tfi) = match side {
+                Side::Bid => (snap.factor_ofi.get(), snap.factor_tfi.get()),
+                Side::Ask => (-snap.factor_ofi.get(), -snap.factor_tfi.get()),
             };
+            let vol_5m = snap.realized_vol_5m.raw().clamp(3_800, 12_500);
+            let learned_mfe = self.learned_mfe_ewma_bps.clamp(560, 1_600);
+            let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
+            let elastic_queue_ttl_ns =
+                ((MAX_RESTING_QUEUE_TTL_NS * 6_000) / vol_5m).clamp(5_000_000_000, 12_000_000_000);
+            let elastic_residence_ns =
+                ((MIN_QUEUE_RESIDENCE_NS * learned_mfe) / 720).clamp(1_250_000_000, 2_200_000_000);
+            let early_fade_ns = (elastic_residence_ns * 53) / 100;
+            let ttl_expired = elapsed_ns >= elastic_queue_ttl_ns;
+            let residence_satisfied = elapsed_ns >= elastic_residence_ns;
+            let vol_ratio = ((vol_5m as f64) / 6_000.0).clamp(0.80, 1.25);
+            let res_progress =
+                ((elapsed_ns as f64) / (elastic_residence_ns as f64)).clamp(0.5, 1.5);
+            let fade_ofi_floor = (0.19 - 0.14 * res_progress) * vol_ratio;
+            let fade_tfi_floor = (0.10 - 0.10 * res_progress) * vol_ratio;
+            let rev_threshold = (-0.12 * vol_ratio).clamp(-0.18, -0.09);
+            let flow_faded = elapsed_ns >= early_fade_ns
+                && signed_ofi <= fade_ofi_floor
+                && signed_tfi <= fade_tfi_floor;
             let joint_flow_reversal = flow_faded
-                || match side {
-                    Side::Bid => ofi <= -0.12 && tfi <= -0.15,
-                    Side::Ask => ofi >= 0.12 && tfi >= 0.15,
-                };
-            let vol_5m = snap.realized_vol_5m.raw().clamp(5_500, 7_800);
-            let elastic_runaway_bps = (vol_5m / 18).clamp(320, 420);
+                || (signed_ofi <= rev_threshold && signed_tfi <= (rev_threshold - 0.03));
+            let elastic_runaway_bps =
+                ((vol_5m / 18) + ((learned_mfe - 720) / 12)).clamp(260, 480);
             let runaway_allowance_ticks =
                 ((entry_price.0 * elastic_runaway_bps) / 1_000_000).max(3);
             let bbo_runaway = if residence_satisfied {
@@ -642,10 +646,14 @@ impl ExecutionFsm {
             let w_ofi = 0.35 + signed_ofi.abs();
             let w_tfi = 0.30 + signed_tfi.abs();
             let flow_conviction = (w_ofi * signed_ofi + w_tfi * signed_tfi) / (w_ofi + w_tfi);
-            let ofi_reversed = signed_ofi < -0.05;
-            let joint_adverse = signed_ofi < -0.15 && signed_tfi < -0.15;
-            let deep_joint_adverse = signed_ofi < -0.22 && signed_tfi < -0.22;
-            let strong_trend_continuation = signed_ofi > 0.20 || signed_tfi > 0.25;
+            let vol_norm = ((vol_5m as f64) / 6_000.0).clamp(0.80, 1.30);
+            let ofi_reversed = signed_ofi < (-0.05 * vol_norm);
+            let joint_adverse =
+                signed_ofi < (-0.15 * vol_norm) && signed_tfi < (-0.15 * vol_norm);
+            let deep_joint_adverse =
+                signed_ofi < (-0.22 * vol_norm) && signed_tfi < (-0.22 * vol_norm);
+            let strong_trend_continuation =
+                signed_ofi > (0.20 * vol_norm) || signed_tfi > (0.25 * vol_norm);
 
             let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
             let elapsed_secs = (hold_elapsed / 1_000_000_000).clamp(0, 180);
@@ -683,28 +691,38 @@ impl ExecutionFsm {
                     || (joint_adverse
                         && (hold_elapsed >= impulse_immunity_ns
                             || current_gross_bps.raw() >= 760)));
+            let elastic_early_harvest_ns = impulse_immunity_ns
+                + (elastic_win_horizon_secs * 420_000_000).clamp(22_000_000_000, 45_000_000_000);
+            let elastic_scratch_ns =
+                ((impulse_immunity_ns * 85) / 100).clamp(16_000_000_000, 34_000_000_000);
+            let elastic_struggle_ns =
+                ((impulse_immunity_ns * 110) / 100).clamp(20_000_000_000, 42_000_000_000);
+            let elastic_zombie_ns =
+                (elastic_decay_span_secs * 1_100_000_000).clamp(90_000_000_000, 150_000_000_000);
+            let elastic_stagnant_ns = ((STAGNANT_PROFIT_HOLD_NS * learned_mfe) / 720)
+                .clamp(135_000_000_000, 180_000_000_000);
             let early_harvest = !in_trend_free_ride_zone
                 && !strong_trend_continuation
-                && hold_elapsed >= (impulse_immunity_ns + 30_000_000_000)
+                && hold_elapsed >= elastic_early_harvest_ns
                 && current_gross_bps.raw() >= elastic_harvest_floor;
             let scratch_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= 22_000_000_000
+                && hold_elapsed >= elastic_scratch_ns
                 && current_gross_bps.raw() >= zero_loss_scratch_floor
                 && deep_joint_adverse;
             let struggling_rescue = !in_trend_free_ride_zone
-                && ((hold_elapsed >= 28_000_000_000
+                && ((hold_elapsed >= elastic_struggle_ns
                     && joint_adverse
                     && current_gross_bps.raw() >= elastic_harvest_floor)
                     || (elapsed_secs >= elastic_win_horizon_secs
                         && !strong_trend_continuation
                         && current_gross_bps.raw() >= elastic_harvest_floor));
             let zombie_breakeven_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= 120_000_000_000
+                && hold_elapsed >= elastic_zombie_ns
                 && ofi_reversed
                 && current_gross_bps.raw() >= zero_loss_scratch_floor;
             let stagnant_unwind = struggling_rescue
                 || zombie_breakeven_escape
-                || (hold_elapsed >= STAGNANT_PROFIT_HOLD_NS
+                || (hold_elapsed >= elastic_stagnant_ns
                     && current_gross_bps.raw() >= zero_loss_scratch_floor);
             let flow_conviction_bonus = if flow_conviction > 0.0 {
                 (flow_conviction * 140.0) as i64
@@ -1200,8 +1218,11 @@ impl OnlineAdaptiveGovernor {
             return;
         }
         self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
-        self.ewma_fast_px_1e4[slot_idx] = (fast_prev * 19 + px_1e4) / 20;
-        self.ewma_slow_px_1e4[slot_idx] = (slow_prev * 299 + px_1e4) / 300;
+        let vol_5m = snap.realized_vol_5m.raw().clamp(3_800, 12_500);
+        let fast_span = (28 - (vol_5m / 750)).clamp(12, 24);
+        let slow_span = (fast_span * 15).clamp(180, 360);
+        self.ewma_fast_px_1e4[slot_idx] = (fast_prev * (fast_span - 1) + px_1e4) / fast_span;
+        self.ewma_slow_px_1e4[slot_idx] = (slow_prev * (slow_span - 1) + px_1e4) / slow_span;
     }
 
     #[inline]
@@ -1384,6 +1405,7 @@ impl OnlineAdaptiveGovernor {
             .clamp(-30_000, 12_000);
         self.wave_anchor_ts_ns[slot_idx][d] = ts_ns.0;
 
+        let edge_clamped = self.ewma_net_bps_x100[slot_idx][d].clamp(-200, 400);
         if !is_maker_exit || net_scaled_bps.raw() <= -800 {
             let s = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
             self.sl_streak[slot_idx][d] = s;
@@ -1393,18 +1415,26 @@ impl OnlineAdaptiveGovernor {
             self.wave_anchor_px_1e4[slot_idx][d] = 0;
             self.wave_anchor_ts_ns[slot_idx][d] = 0;
             self.last_sl_ts_ns = ts_ns.0;
-            let backoff_ns = 150_000_000_000_i64.saturating_mul(1_i64 << s.min(4));
+            let loss_mag = (-net_scaled_bps.raw()).clamp(2_000, 7_500);
+            let severity_base_ns =
+                (loss_mag * 25_000_000).clamp(120_000_000_000, 180_000_000_000);
+            let backoff_ns = severity_base_ns.saturating_mul(1_i64 << s.min(4));
             self.directional_cooldown_until_ns[slot_idx][d] = ts_ns.0.saturating_add(backoff_ns);
 
             let gs = self.global_dir_sl_streak[d].saturating_add(1).min(4);
             self.global_dir_sl_streak[d] = gs;
-            let global_pause_ns = 180_000_000_000_i64.saturating_mul(i64::from(gs));
+            let global_base_ns =
+                (loss_mag * 30_000_000).clamp(150_000_000_000, 210_000_000_000);
+            let global_pause_ns = global_base_ns.saturating_mul(i64::from(gs));
             self.global_dir_cooldown_until_ns[d] = ts_ns.0.saturating_add(global_pause_ns);
         } else if net_scaled_bps.raw() <= 0 {
             self.win_streak[slot_idx][d] = 0;
             self.wave_step_count[slot_idx][d] = 0;
             self.global_dir_win_streak[d] = 0;
-            let scratch_cooldown_ns = ts_ns.0.saturating_add(120_000_000_000);
+            let sub_fee_mag = (-net_scaled_bps.raw()).clamp(0, 800);
+            let scratch_secs =
+                (115 + (sub_fee_mag / 20) - (edge_clamped / 20)).clamp(90, 160);
+            let scratch_cooldown_ns = ts_ns.0.saturating_add(scratch_secs * 1_000_000_000);
             if scratch_cooldown_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = scratch_cooldown_ns;
             }
@@ -1413,7 +1443,9 @@ impl OnlineAdaptiveGovernor {
             // and never wipe existing win_streak so VETO_WAVE_STAIRCASE_25BPS stays armed!
             self.wave_step_count[slot_idx][d] = self.wave_step_count[slot_idx][d].saturating_add(1);
             self.last_global_win_dir = d as u8;
-            let rescue_cooldown_ns = ts_ns.0.saturating_add(90_000_000_000);
+            let rescue_secs =
+                (102 - (net_scaled_bps.raw() / 4) - (edge_clamped / 25)).clamp(75, 115);
+            let rescue_cooldown_ns = ts_ns.0.saturating_add(rescue_secs * 1_000_000_000);
             if rescue_cooldown_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = rescue_cooldown_ns;
             }
@@ -1430,7 +1462,9 @@ impl OnlineAdaptiveGovernor {
             self.last_global_win_ts_ns = ts_ns.0;
 
             if gw >= 3 {
-                let global_wave_breather = ts_ns.0.saturating_add(180_000_000_000);
+                let glob_wave_secs = (185 - (edge_clamped / 20)).clamp(150, 210);
+                let global_wave_breather =
+                    ts_ns.0.saturating_add(glob_wave_secs * 1_000_000_000);
                 if global_wave_breather > self.global_dir_cooldown_until_ns[d] {
                     self.global_dir_cooldown_until_ns[d] = global_wave_breather;
                 }
@@ -1438,7 +1472,9 @@ impl OnlineAdaptiveGovernor {
             }
 
             let w_cap = i64::from(w.min(3));
-            let breather_secs = 30 * (2 * w_cap * w_cap - 3 * w_cap + 3);
+            let base_breather_secs = 30 * (2 * w_cap * w_cap - 3 * w_cap + 3);
+            let edge_mod_permille = (1_000 - ((edge_clamped - 200) / 4)).clamp(900, 1_150);
+            let breather_secs = (base_breather_secs * edge_mod_permille) / 1_000;
             let win_breather_ns = ts_ns.0.saturating_add(breather_secs * 1_000_000_000);
             if win_breather_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = win_breather_ns;
