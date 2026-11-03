@@ -924,6 +924,7 @@ impl ExecutionFsm {
     /// Continuous C1 tick-quantized Maker floor price driven by the Net-Capital Conservation Law.
     #[inline]
     #[must_use]
+    #[allow(clippy::manual_clamp)]
     pub const fn dynamic_maker_floor_price(
         side: Side,
         entry_price: PriceTicks,
@@ -1270,6 +1271,7 @@ impl OnlineAdaptiveGovernor {
     /// Returns `Some(shield_reason)` if the entry is vetoed, or `None` if structural guards pass.
     #[inline]
     #[must_use]
+    #[allow(clippy::manual_clamp)]
     pub const fn audit_historical_entry_veto(
         &self,
         slot_idx: usize,
@@ -1297,9 +1299,16 @@ impl OnlineAdaptiveGovernor {
                 Side::Bid => ((cur_1e4 - anchor_1e4).saturating_mul(1_000_000)) / anchor_1e4,
                 Side::Ask => ((anchor_1e4 - cur_1e4).saturating_mul(1_000_000)) / anchor_1e4,
             };
-            let learned_edge = self.ewma_net_bps_x100[slot_idx][d].clamp(-200, 400);
-            let elastic_stair_cap = (2_300 + learned_edge).clamp(2_200, 2_550);
-            let elastic_single_cap = (3_300 + learned_edge).clamp(3_100, 3_550);
+            let raw_edge = self.ewma_net_bps_x100[slot_idx][d];
+            let learned_edge = if raw_edge < -100 {
+                -100
+            } else if raw_edge > 250 {
+                250
+            } else {
+                raw_edge
+            };
+            let elastic_stair_cap = 2_300 + learned_edge;
+            let elastic_single_cap = 3_300 + learned_edge;
             if (self.win_streak[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
                 || (self.win_streak[slot_idx][d] >= 1 && chased_bps > elastic_single_cap)
                 || (slot_idx == 0
