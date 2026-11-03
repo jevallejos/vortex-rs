@@ -504,20 +504,20 @@ fn replay_captured_live_parquet_segments() {
                                 let saved_ledger = ledger;
                                 if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
                                     if summary.is_maker_exit {
-                                        let clamped_exit = if summary.gross_scaled_bps.raw() >= 580 {
+                                        let clamped_exit = if summary.gross_scaled_bps.raw() >= 540 {
                                             ExecutionFsm::clamp_maker_exit_to_profit_floor(
                                                 summary.side,
                                                 summary.entry_price,
                                                 summary.exit_price,
                                             )
-                                        } else if summary.gross_scaled_bps.raw() >= 440 {
+                                        } else if summary.gross_scaled_bps.raw() >= 405 {
                                             ExecutionFsm::clamp_defensive_zero_loss_floor(
                                                 summary.side,
                                                 summary.entry_price,
                                                 summary.exit_price,
                                             )
                                         } else {
-                                            ExecutionFsm::clamp_zombie_evacuation_floor(
+                                            ExecutionFsm::clamp_distressed_maker_evacuation_floor(
                                                 summary.side,
                                                 summary.entry_price,
                                                 summary.exit_price,

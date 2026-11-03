@@ -522,14 +522,14 @@ impl BybitV5LiveClient {
                         entry_price,
                         raw_bbo_exit,
                     )
-                } else if summary.gross_scaled_bps.raw() >= 440 {
+                } else if summary.gross_scaled_bps.raw() >= 405 {
                     ExecutionFsm::clamp_defensive_zero_loss_floor(
                         open_side,
                         entry_price,
                         raw_bbo_exit,
                     )
                 } else {
-                    ExecutionFsm::clamp_zombie_evacuation_floor(
+                    ExecutionFsm::clamp_distressed_maker_evacuation_floor(
                         open_side,
                         entry_price,
                         raw_bbo_exit,
@@ -1519,20 +1519,20 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let spec = APPROVED_SPECS[active_slot];
                             let default_clamped_px = if !summary.is_maker_exit {
                                 summary.exit_price
-                            } else if summary.gross_scaled_bps.raw() >= 580 {
+                            } else if summary.gross_scaled_bps.raw() >= 540 {
                                 ExecutionFsm::clamp_maker_exit_to_profit_floor(
                                     summary.side,
                                     summary.entry_price,
                                     summary.exit_price,
                                 )
-                            } else if summary.gross_scaled_bps.raw() >= 440 {
+                            } else if summary.gross_scaled_bps.raw() >= 405 {
                                 ExecutionFsm::clamp_defensive_zero_loss_floor(
                                     summary.side,
                                     summary.entry_price,
                                     summary.exit_price,
                                 )
                             } else {
-                                ExecutionFsm::clamp_zombie_evacuation_floor(
+                                ExecutionFsm::clamp_distressed_maker_evacuation_floor(
                                     summary.side,
                                     summary.entry_price,
                                     summary.exit_price,
