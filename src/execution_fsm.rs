@@ -634,53 +634,80 @@ impl ExecutionFsm {
             let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
             let elapsed_secs = (hold_elapsed / 1_000_000_000).clamp(0, 180);
             let time_decay_relaxation =
-                (elapsed_secs * (adaptive_base_target - 440).max(0)) / 90;
-            let flow_relaxation = if ofi_reversed {
-                ((-flow_conviction).max(0.0) * 260.0) as i64
+                (elapsed_secs * (adaptive_base_target - 440).max(0)) / 120;
+            let flow_relaxation = if deep_joint_adverse {
+                ((-flow_conviction).max(0.0) * 220.0) as i64
+            } else if joint_adverse {
+                ((-flow_conviction).max(0.0) * 140.0) as i64
             } else {
                 0
             };
-            let elastic_harvest_floor =
-                (adaptive_base_target - time_decay_relaxation - flow_relaxation).clamp(440, 750);
+            let min_dynamic_floor = if elapsed_secs < 90 { 540 } else { 440 };
+            let elastic_harvest_floor = (adaptive_base_target
+                - time_decay_relaxation
+                - flow_relaxation)
+                .clamp(min_dynamic_floor, 750);
+
+            let elastic_bailout_floor_bps =
+                -((snap.realized_vol_5m.raw() * 35) / 100).clamp(1_800, 2_400);
+            let adverse_flow_bailout = hold_elapsed >= 18_000_000_000
+                && current_gross_bps.raw() <= elastic_bailout_floor_bps
+                && deep_joint_adverse
+                && flow_conviction <= -0.40;
+            if adverse_flow_bailout {
+                return Some(self.finalize_close(
+                    ClosedTradeKind::ServerMarkPriceStopLoss,
+                    side,
+                    entry_price,
+                    bbo_exit_price,
+                    snap.ts_local_ns,
+                    ledger,
+                ));
+            }
+
             let flow_unwind = !in_trend_free_ride_zone
                 && current_gross_bps.raw() >= elastic_vol_floor_bps
                 && (deep_joint_adverse
                     || (joint_adverse
-                        && (hold_elapsed >= 30_000_000_000 || current_gross_bps.raw() >= 680)));
+                        && (hold_elapsed >= 30_000_000_000
+                            || current_gross_bps.raw() >= 680)));
             let early_harvest = !in_trend_free_ride_zone
                 && !strong_trend_continuation
                 && hold_elapsed >= 50_000_000_000
                 && current_gross_bps.raw() >= elastic_harvest_floor;
             let scratch_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= 12_000_000_000
+                && hold_elapsed >= 25_000_000_000
                 && current_gross_bps.raw() >= 440
-                && joint_adverse;
+                && deep_joint_adverse;
             let struggling_rescue = !in_trend_free_ride_zone
-                && ((hold_elapsed >= 22_000_000_000
-                    && ofi_reversed
+                && ((hold_elapsed >= 25_000_000_000
+                    && joint_adverse
                     && current_gross_bps.raw() >= elastic_harvest_floor)
-                    || (hold_elapsed >= 50_000_000_000
+                    || (hold_elapsed >= 90_000_000_000
                         && !strong_trend_continuation
-                        && current_gross_bps.raw() >= 440));
+                        && current_gross_bps.raw() >= elastic_harvest_floor));
             let zombie_breakeven_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= 120_000_000_000
                 && ofi_reversed
                 && current_gross_bps.raw() >= 405;
             let stagnant_unwind = struggling_rescue
                 || zombie_breakeven_escape
-                || (hold_elapsed >= STAGNANT_PROFIT_HOLD_NS && current_gross_bps.raw() >= 440);
+                || (hold_elapsed >= STAGNANT_PROFIT_HOLD_NS
+                    && current_gross_bps.raw() >= 440);
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
                 let convex_ratchet_floor = if peak_gross_bps.raw() > 1_150 {
                     400 + ((peak_gross_bps.raw() - 400) * 70) / 100
                 } else {
-                    let elastic_cushion = ((elastic_vol_floor_bps / 3) + 50).clamp(220, 260);
+                    let elastic_cushion =
+                        ((elastic_vol_floor_bps / 3) + 50).clamp(220, 260);
                     (peak_gross_bps.raw() - elastic_cushion).max(600)
                 };
-                current_gross_bps.raw() >= 580 && current_gross_bps.raw() <= convex_ratchet_floor
+                current_gross_bps.raw() >= 580
+                    && current_gross_bps.raw() <= convex_ratchet_floor
             } else {
                 peak_gross_bps.raw() >= 580
                     && ofi_reversed
-                    && current_gross_bps.raw() >= 440
+                    && current_gross_bps.raw() >= 500
                     && current_gross_bps.raw() <= (peak_gross_bps.raw() * 82) / 100
             };
             if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {

@@ -555,11 +555,11 @@ fn replay_captured_live_parquet_segments() {
                                     let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
                                     let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
                                     let (col, icon, badge) = if net_bps >= 1.00 {
-                                        ("\x1b[1;32m", "🟢", "WIN")
+                                        ("\x1b[1;32m", "\u{1F7E2}", "WIN")
                                     } else if net_bps >= -0.50 {
-                                        ("\x1b[38;5;208m", "🟠", "SCRATCH")
+                                        ("\x1b[38;5;208m", "\u{1F7E0}", "SCRATCH")
                                     } else {
-                                        ("\x1b[1;31m", "🔴", "LOSS")
+                                        ("\x1b[1;31m", "\u{1F534}", "LOSS")
                                     };
                                     println!(
                                         "  {}{} [REAL PAR1 TRADE #{:<2} {:<7}] {:<8} {:<3} {:?} | {}.{:04} -> {}.{:04} USDT | Net: {:+.2} bps (Maker={})\x1b[0m",
@@ -589,11 +589,11 @@ fn replay_captured_live_parquet_segments() {
     );
     let net_total_bps = (net_bps_accum as f64) / 100.0;
     let (sum_col, sum_icon) = if net_total_bps >= 0.20 {
-        ("\x1b[1;32m", "🟢")
+        ("\x1b[1;32m", "\u{1F7E2}")
     } else if net_total_bps >= -0.50 {
-        ("\x1b[38;5;208m", "🟠")
+        ("\x1b[38;5;208m", "\u{1F7E0}")
     } else {
-        ("\x1b[1;31m", "🔴")
+        ("\x1b[1;31m", "\u{1F534}")
     };
     println!(
         "  {}{} -> Live Walk-Forward PnL      : Net={:+.2} bps | MakerExit={}.{:02}% | PF={}.{:02} | FeesPaid={:.4} USDT\x1b[0m",

@@ -516,13 +516,13 @@ impl BybitV5LiveClient {
                         };
                     }
                 }
-                let peg_price = if summary.gross_scaled_bps.raw() >= 580 && attempt < 4 {
+                let peg_price = if summary.gross_scaled_bps.raw() >= 540 {
                     ExecutionFsm::clamp_maker_exit_to_profit_floor(
                         open_side,
                         entry_price,
                         raw_bbo_exit,
                     )
-                } else if summary.gross_scaled_bps.raw() >= 440 && attempt < 6 {
+                } else if summary.gross_scaled_bps.raw() >= 440 {
                     ExecutionFsm::clamp_defensive_zero_loss_floor(
                         open_side,
                         entry_price,
@@ -1385,27 +1385,28 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         if filled_on_exchange_during_abort || level_swept || resting_queue_ahead.0 == 0 {
                             if !filled_on_exchange_during_abort {
                                 if let Some(ref client) = live_client {
-                                    client.cancel_all_symbol_orders(snap.symbol_id.name());
                                     let (real_filled, real_qty) =
                                         client.get_open_position_size(snap.symbol_id.name());
                                     if !real_filled {
+                                        if !level_swept {
+                                            resting_queue_ahead = LotQty(1);
+                                            arena.exec_queue_ahead_lots.store(
+                                                1,
+                                                Ordering::Release,
+                                            );
+                                            continue;
+                                        }
+                                        client.cancel_all_symbol_orders(snap.symbol_id.name());
                                         fsm.state = OrderLifecycleState::Idle;
                                         slot_cooldown_until_ns[active_slot] =
                                             snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
                                         arena.exec_abort_count.fetch_add(1, Ordering::Release);
                                         arena.exec_state_code.store(0, Ordering::Release);
                                         arena.exec_queue_ahead_lots.store(0, Ordering::Release);
-                                        println!(
-                                            "{}🟠 [BYBIT V5 REAL QUEUE UNFILLED] {} {:?} did not fill on exchange before queue end (reset to Idle){}",
-                                            ANSI_ORANGE,
-                                            snap.symbol_id.name(),
-                                            side,
-                                            ANSI_RESET
-                                        );
                                         continue;
                                     }
                                     println!(
-                                        "{}🟢 [BYBIT V5 REAL FILL CONFIRMED] {} {:?} real open size={}{}",
+                                        "{}  [BYBIT V5 REAL FILL CONFIRMED] {} {:?} size={}{}",
                                         ANSI_GREEN,
                                         snap.symbol_id.name(),
                                         side,
@@ -1414,7 +1415,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     );
                                 }
                             }
-
                             let spec = APPROVED_SPECS[active_slot];
                             let sl_dist_ticks =
                                 ((entry_price.0 * 5_200) / 1_000_000).max(4);
@@ -1551,21 +1551,38 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let realized_exit_price = match confirmed_exit_px {
                                 Some(px) => px,
                                 None => {
+                                    let new_peak = match open_side {
+                                        Side::Bid => PriceTicks(
+                                            open_peak_price.0.max(snap.bids[0].price.0),
+                                        ),
+                                        Side::Ask => {
+                                            if open_peak_price.0 > 0 && snap.asks[0].price.0 > 0 {
+                                                PriceTicks(
+                                                    open_peak_price.0.min(snap.asks[0].price.0),
+                                                )
+                                            } else {
+                                                open_peak_price
+                                            }
+                                        }
+                                    };
                                     fsm = saved_fsm;
                                     ledger = saved_ledger;
                                     fsm.state = OrderLifecycleState::PositionOpenMakerExit {
                                         side: open_side,
                                         entry_price: open_entry_price,
-                                        peak_favorable_price: open_peak_price,
+                                        peak_favorable_price: new_peak,
                                         qty: open_qty,
                                         tp_maker_price: open_tp_price,
                                         sl_trigger_price: open_sl_price,
                                         opened_ts: open_since_ts,
                                     };
+                                    arena.exec_peak_ticks.store(
+                                        new_peak.0 as u64,
+                                        Ordering::Release,
+                                    );
                                     continue;
                                 }
                             };
-
                             // Recompute exact accounting with the actual realized exit price on Bybit (1:1 CSV parity!)
                             fsm = saved_fsm;
                             ledger = saved_ledger;
