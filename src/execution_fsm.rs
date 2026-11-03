@@ -436,13 +436,20 @@ impl ExecutionFsm {
             let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
             let ttl_expired = elapsed_ns >= MAX_RESTING_QUEUE_TTL_NS;
             let residence_satisfied = elapsed_ns >= MIN_QUEUE_RESIDENCE_NS;
+            let early_fade_ready = elapsed_ns >= 800_000_000;
             let flow_faded = match side {
-                Side::Bid => residence_satisfied && ofi <= 0.05 && tfi <= 0.0,
-                Side::Ask => residence_satisfied && ofi >= -0.05 && tfi >= 0.0,
+                Side::Bid => {
+                    (residence_satisfied && ofi <= 0.05 && tfi <= 0.0)
+                        || (early_fade_ready && ofi <= 0.12 && tfi <= 0.05)
+                }
+                Side::Ask => {
+                    (residence_satisfied && ofi >= -0.05 && tfi >= 0.0)
+                        || (early_fade_ready && ofi >= -0.12 && tfi >= -0.05)
+                }
             };
             let joint_flow_reversal = flow_faded || match side {
-                Side::Bid => ofi <= -0.20 && tfi <= -0.25,
-                Side::Ask => ofi >= 0.20 && tfi >= 0.25,
+                Side::Bid => ofi <= -0.12 && tfi <= -0.15,
+                Side::Ask => ofi >= 0.12 && tfi >= 0.15,
             };
             let runaway_allowance_ticks =
                 ((entry_price.0 * BBO_RUNAWAY_SCALED_BPS) / 1_000_000).max(3);
@@ -634,36 +641,22 @@ impl ExecutionFsm {
             let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
             let elapsed_secs = (hold_elapsed / 1_000_000_000).clamp(0, 180);
             let time_decay_relaxation =
-                (elapsed_secs * (adaptive_base_target - 440).max(0)) / 120;
+                (elapsed_secs * (adaptive_base_target - 440).max(0)) / 110;
             let flow_relaxation = if deep_joint_adverse {
-                ((-flow_conviction).max(0.0) * 220.0) as i64
+                ((-flow_conviction).max(0.0) * 240.0) as i64
             } else if joint_adverse {
-                ((-flow_conviction).max(0.0) * 140.0) as i64
+                ((-flow_conviction).max(0.0) * 160.0) as i64
+            } else if ofi_reversed && elapsed_secs >= 45 {
+                ((-flow_conviction).max(0.0) * 120.0) as i64
             } else {
                 0
             };
-            let min_dynamic_floor = if elapsed_secs < 90 { 540 } else { 440 };
+            let min_dynamic_floor =
+                if elapsed_secs < 75 && !deep_joint_adverse { 540 } else { 440 };
             let elastic_harvest_floor = (adaptive_base_target
                 - time_decay_relaxation
                 - flow_relaxation)
                 .clamp(min_dynamic_floor, 750);
-
-            let elastic_bailout_floor_bps =
-                -((snap.realized_vol_5m.raw() * 35) / 100).clamp(1_800, 2_400);
-            let adverse_flow_bailout = hold_elapsed >= 18_000_000_000
-                && current_gross_bps.raw() <= elastic_bailout_floor_bps
-                && deep_joint_adverse
-                && flow_conviction <= -0.40;
-            if adverse_flow_bailout {
-                return Some(self.finalize_close(
-                    ClosedTradeKind::ServerMarkPriceStopLoss,
-                    side,
-                    entry_price,
-                    bbo_exit_price,
-                    snap.ts_local_ns,
-                    ledger,
-                ));
-            }
 
             let flow_unwind = !in_trend_free_ride_zone
                 && current_gross_bps.raw() >= elastic_vol_floor_bps
@@ -676,14 +669,14 @@ impl ExecutionFsm {
                 && hold_elapsed >= 50_000_000_000
                 && current_gross_bps.raw() >= elastic_harvest_floor;
             let scratch_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= 25_000_000_000
+                && hold_elapsed >= 20_000_000_000
                 && current_gross_bps.raw() >= 440
                 && deep_joint_adverse;
             let struggling_rescue = !in_trend_free_ride_zone
                 && ((hold_elapsed >= 25_000_000_000
                     && joint_adverse
                     && current_gross_bps.raw() >= elastic_harvest_floor)
-                    || (hold_elapsed >= 90_000_000_000
+                    || (hold_elapsed >= 80_000_000_000
                         && !strong_trend_continuation
                         && current_gross_bps.raw() >= elastic_harvest_floor));
             let zombie_breakeven_escape = !in_trend_free_ride_zone
@@ -1217,16 +1210,17 @@ impl OnlineAdaptiveGovernor {
         // beyond the start of the wave, block buying the exhausted top (#63) or selling the bottom (#75, #119, #122)!
         let anchor_1e4 = self.wave_anchor_px_1e4[slot_idx][d];
         let cur_1e4 = entry_ticks.saturating_mul(10_000);
-        if self.win_streak[slot_idx][d] >= 2 && anchor_1e4 > 0 && cur_1e4 > 0 {
+        if anchor_1e4 > 0 && cur_1e4 > 0 {
             let chased_bps = match side {
                 Side::Bid => ((cur_1e4 - anchor_1e4).saturating_mul(1_000_000)) / anchor_1e4,
                 Side::Ask => ((anchor_1e4 - cur_1e4).saturating_mul(1_000_000)) / anchor_1e4,
             };
-            if chased_bps > 2_500 {
+            if (self.win_streak[slot_idx][d] >= 2 && chased_bps > 2_500)
+                || (self.win_streak[slot_idx][d] >= 1 && chased_bps > 3_500)
+            {
                 return Some("VETO_WAVE_STAIRCASE_25BPS");
             }
         }
-
         if self.sl_streak[slot_idx][d] >= 1 && self.cum_net_bps_x100[slot_idx][d] <= -4_500 {
             return Some("VETO_DEEP_SCAR_DEBT_QUARANTINE");
         }
@@ -1298,10 +1292,9 @@ impl OnlineAdaptiveGovernor {
                 self.directional_cooldown_until_ns[slot_idx][d] = scratch_cooldown_ns;
             }
         } else if net_scaled_bps.raw() < 100 {
-            // Honest SCRATCH (+0.01 to +0.99 bps net defensive rescue): never inflate win_streak!
-            // Record directional survival and apply a 90s defensive breather on this stalled slot/side.
+            // Honest SCRATCH (+0.01 to +0.99 bps net defensive rescue): never inflate win_streak,
+            // and never wipe existing win_streak so VETO_WAVE_STAIRCASE_25BPS stays armed!
             self.last_global_win_dir = d as u8;
-            self.win_streak[slot_idx][d] = 0;
             let rescue_cooldown_ns = ts_ns.0.saturating_add(90_000_000_000);
             if rescue_cooldown_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = rescue_cooldown_ns;
