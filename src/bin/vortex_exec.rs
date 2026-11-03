@@ -528,11 +528,19 @@ impl BybitV5LiveClient {
                         };
                     }
                 }
+                let q_bps = ((defensive_floor_price.0 - entry_price.0)
+                    .abs()
+                    .saturating_mul(1_000_000))
+                    / entry_price.0.max(1);
+                let span_bps = (summary.gross_scaled_bps.raw() - q_bps).max(0);
+                let att_i64 = attempt as i64;
+                let relaxed_ref_bps =
+                    ScaledBps(q_bps + (span_bps * (8 - att_i64)) / (8 + att_i64));
                 let peg_price = ExecutionFsm::clamp_continuous_maker_floor(
                     open_side,
                     entry_price,
                     raw_bbo_exit,
-                    summary.gross_scaled_bps,
+                    relaxed_ref_bps,
                 );
                 if peg_price.0 != last_pegged_price.0 {
                     self.cancel_all_symbol_orders(symbol);
@@ -693,7 +701,7 @@ fn rehydrate_shadow_ledger(
             if is_maker {
                 fsm.maker_exits_count += 1;
                 let observed_mfe = gross_scaled_bps.min(2_400);
-                if observed_mfe >= 440 {
+                if observed_mfe > 400 {
                     let surprise = (observed_mfe - fsm.learned_mfe_ewma_bps).abs();
                     let alpha_pct = (18 + (surprise / 60)).clamp(18, 32);
                     fsm.learned_mfe_ewma_bps = ((fsm.learned_mfe_ewma_bps * (100 - alpha_pct))
@@ -1175,7 +1183,16 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
             };
             let entry_saved = PriceTicks(arena.exec_entry_ticks.load(Ordering::Acquire) as i64);
             let peak_saved = PriceTicks(arena.exec_peak_ticks.load(Ordering::Acquire) as i64);
-            let tp_saved = PriceTicks(arena.exec_tp_ticks.load(Ordering::Acquire) as i64);
+            let raw_tp_saved = arena.exec_tp_ticks.load(Ordering::Acquire) as i64;
+            let tp_saved = if raw_tp_saved > 0 {
+                PriceTicks(raw_tp_saved)
+            } else {
+                let fallback_d = ((entry_saved.0 * 4_500) / 1_000_000).max(2);
+                match side_saved {
+                    Side::Bid => PriceTicks(entry_saved.0 + fallback_d),
+                    Side::Ask => PriceTicks((entry_saved.0 - fallback_d).max(1)),
+                }
+            };
             let sl_saved = PriceTicks(arena.exec_sl_ticks.load(Ordering::Acquire) as i64);
             let since_saved = TimestampNs(arena.exec_resting_since_ns.load(Ordering::Acquire) as i64);
             let q_saved = LotQty(arena.exec_queue_ahead_lots.load(Ordering::Acquire) as i64);

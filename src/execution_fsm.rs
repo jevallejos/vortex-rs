@@ -313,6 +313,7 @@ pub struct ExecutionFsm {
     pub gross_loss_accum_1e8: i64,
     pub learned_mfe_ewma_bps: i64,
     pub last_peak_gross_bps: i64,
+    pub max_wald_contraction_pct: i64,
 }
 
 impl Default for ExecutionFsm {
@@ -337,6 +338,7 @@ impl ExecutionFsm {
             gross_loss_accum_1e8: 0,
             learned_mfe_ewma_bps: 720,
             last_peak_gross_bps: 0,
+            max_wald_contraction_pct: 0,
         }
     }
 
@@ -497,6 +499,7 @@ impl ExecutionFsm {
                 Side::Bid => PriceTicks(entry_price.0 + tp_delta_ticks),
                 Side::Ask => PriceTicks((entry_price.0 - tp_delta_ticks).max(1)),
             };
+            self.max_wald_contraction_pct = 0;
             self.state = OrderLifecycleState::PositionOpenMakerExit {
                 side,
                 entry_price,
@@ -561,13 +564,30 @@ impl ExecutionFsm {
         let w_t = 0.30 + s_tfi.abs();
         let f_conv = (w_o * s_ofi + w_t * s_tfi) / (w_o + w_t);
         let adv_p = (-f_conv).max(0.0);
-        let wald_contraction_pct = if hold_ns > immunity_ns && peak_gross_now < 740 {
+        let cur_bbo_ref = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
+            match side {
+                Side::Bid => snap.bids[0].price,
+                Side::Ask => snap.asks[0].price,
+            }
+        } else {
+            ref_trade_price
+        };
+        let cur_gross_now =
+            Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
+        let wald_contraction_pct = if hold_ns > immunity_ns
+            && (peak_gross_now < 740 || cur_gross_now < 0)
+        {
             let over_ns = hold_ns - immunity_ns;
             let time_c = ((over_ns * 28) / STAGNANT_PROFIT_HOLD_NS).clamp(0, 28);
             let flow_c = (adv_p * adv_p * 35.0) as i64;
-            (time_c + flow_c).clamp(0, 48)
+            let rev_c = ((peak_gross_now - 400).max(0) / 30).clamp(0, 14);
+            let inst_c = (time_c + flow_c + rev_c).clamp(0, 48);
+            if inst_c > self.max_wald_contraction_pct {
+                self.max_wald_contraction_pct = inst_c;
+            }
+            self.max_wald_contraction_pct
         } else {
-            0
+            self.max_wald_contraction_pct
         };
         let eff_sl_dist = ((base_sl_dist * (100 - wald_contraction_pct)) / 100).max(4);
         let eff_sl_trigger = match side {
@@ -601,10 +621,11 @@ impl ExecutionFsm {
         }
 
         // 2. Passive Limit PostOnly structural Take-Profit fill
-        let tp_hit = match side {
-            Side::Bid => ref_trade_price.0 > 0 && ref_trade_price.0 >= tp_maker_price.0,
-            Side::Ask => ref_trade_price.0 > 0 && ref_trade_price.0 <= tp_maker_price.0,
-        };
+        let tp_hit = tp_maker_price.0 > 0
+            && match side {
+                Side::Bid => ref_trade_price.0 > 0 && ref_trade_price.0 >= tp_maker_price.0,
+                Side::Ask => ref_trade_price.0 > 0 && ref_trade_price.0 <= tp_maker_price.0,
+            };
         if tp_hit {
             return Some(self.finalize_close(
                 ClosedTradeKind::MakerStructuralTp,
@@ -688,28 +709,29 @@ impl ExecutionFsm {
             let elapsed_secs = (hold_elapsed / 1_000_000_000).clamp(0, 180);
             let fee_barrier_bps =
                 ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+            let quantum_floor_px =
+                Self::defensive_zero_loss_maker_exit_price(side, entry_price);
             let zero_loss_scratch_floor =
-                fee_barrier_bps + (vol_5m / 150).clamp(40, 60);
+                Self::compute_gross_scaled_bps(side, entry_price, quantum_floor_px)
+                    .raw()
+                    .max(fee_barrier_bps + 1);
             let elastic_win_horizon_secs = (learned_mfe / 10).clamp(60, 105);
             let elastic_decay_span_secs = (elastic_win_horizon_secs * 3) / 2;
-            let time_decay_relaxation = (elapsed_secs
-                * (adaptive_base_target - zero_loss_scratch_floor).max(0))
-                / elastic_decay_span_secs.max(1);
             let adverse_pressure = (-flow_conviction).max(0.0);
-            let flow_relaxation =
-                (adverse_pressure * (90.0 + 180.0 * adverse_pressure)) as i64;
-            let active_win_floor = (fee_barrier_bps
-                + ((adaptive_base_target - fee_barrier_bps) * 55) / 100)
-                .clamp(530, 660);
+            let active_win_floor = (zero_loss_scratch_floor
+                + ((adaptive_base_target - zero_loss_scratch_floor).max(0) * 55) / 100)
+                .clamp(zero_loss_scratch_floor, 680);
             let floor_span = (active_win_floor - zero_loss_scratch_floor).max(0);
             let time_bleed = (elapsed_secs * floor_span) / elastic_win_horizon_secs.max(1);
             let adv_bleed =
                 (adverse_pressure * adverse_pressure * (floor_span as f64) * 4.0) as i64;
             let min_dynamic_floor = (active_win_floor - time_bleed - adv_bleed)
                 .clamp(zero_loss_scratch_floor, active_win_floor);
-            let elastic_harvest_floor = (adaptive_base_target
-                - time_decay_relaxation
-                - flow_relaxation)
+            let base_eps = (adaptive_base_target - zero_loss_scratch_floor).max(0) as f64;
+            let tau = (elapsed_secs as f64) / (elastic_win_horizon_secs.max(1) as f64);
+            let denom = 1.0 + tau * tau + 3.0 * adverse_pressure * adverse_pressure * tau;
+            let epsilon_elastico = (base_eps / denom) as i64;
+            let elastic_harvest_floor = (zero_loss_scratch_floor + epsilon_elastico)
                 .clamp(min_dynamic_floor, 780);
 
             let impulse_immunity_ns =
@@ -881,12 +903,10 @@ impl ExecutionFsm {
         side: Side,
         entry_price: PriceTicks,
     ) -> PriceTicks {
-        let target_440bps_ticks = (entry_price.0.saturating_mul(440) + 999_999) / 1_000_000;
-        let min_profit_delta_ticks = if target_440bps_ticks > 2 {
-            target_440bps_ticks
-        } else {
-            2
-        };
+        let fee_rt_bps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+        let fee_ticks = (entry_price.0.saturating_mul(fee_rt_bps) + 999_999) / 1_000_000;
+        let quantum_ticks = fee_ticks + 1;
+        let min_profit_delta_ticks = if quantum_ticks > 2 { quantum_ticks } else { 2 };
         match side {
             Side::Bid => PriceTicks(entry_price.0 + min_profit_delta_ticks),
             Side::Ask => {
@@ -971,21 +991,23 @@ impl ExecutionFsm {
         entry_price: PriceTicks,
         reference_gross_bps: ScaledBps,
     ) -> PriceTicks {
+        let quantum_floor = Self::defensive_zero_loss_maker_exit_price(side, entry_price);
+        let fee_rt_bps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
         let g = reference_gross_bps.raw();
-        let target_bps = if g <= 440 {
-            440
-        } else if g >= 600 {
-            600
-        } else {
-            g
-        };
-        let target_ticks = (entry_price.0.saturating_mul(target_bps) + 999_999) / 1_000_000;
+        if g <= fee_rt_bps {
+            return quantum_floor;
+        }
+        let target_ticks = (entry_price.0.saturating_mul(g) + 999_999) / 1_000_000;
         let min_delta_ticks = if target_ticks > 2 { target_ticks } else { 2 };
         match side {
-            Side::Bid => PriceTicks(entry_price.0 + min_delta_ticks),
+            Side::Bid => {
+                let cand = entry_price.0 + min_delta_ticks;
+                PriceTicks(if cand > quantum_floor.0 { cand } else { quantum_floor.0 })
+            }
             Side::Ask => {
                 let p = entry_price.0 - min_delta_ticks;
-                PriceTicks(if p > 1 { p } else { 1 })
+                let cand = if p > 1 { p } else { 1 };
+                PriceTicks(if cand < quantum_floor.0 { cand } else { quantum_floor.0 })
             }
         }
     }
@@ -1069,8 +1091,9 @@ impl ExecutionFsm {
         if is_maker_exit {
             self.maker_exits_count += 1;
             self.cooldown_until_ns = TimestampNs(0);
+            let fee_rt_bps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
             let observed_mfe = gross_scaled_bps.raw().max(self.last_peak_gross_bps).min(2_400);
-            if observed_mfe >= 440 {
+            if observed_mfe > fee_rt_bps {
                 let surprise = (observed_mfe - self.learned_mfe_ewma_bps).abs();
                 let alpha_pct = (18 + (surprise / 60)).clamp(18, 32);
                 self.learned_mfe_ewma_bps = ((self.learned_mfe_ewma_bps * (100 - alpha_pct))
@@ -1085,6 +1108,7 @@ impl ExecutionFsm {
                 (((self.learned_mfe_ewma_bps * 88) + (560 * 12)) / 100).clamp(560, 1_600);
         }
         self.last_peak_gross_bps = 0;
+        self.max_wald_contraction_pct = 0;
 
         if net_pnl_1e8 >= 0 {
             self.gross_profit_accum_1e8 += net_pnl_1e8;
@@ -1977,7 +2001,7 @@ mod tests {
 
         let vault_path = Path::new("data/vortex_ai_forensic_vault.jsonl");
         let seed_path = Path::new("deploy/forensic_vault_171.seed");
-        let file = match File::open(vault_path).or_else(|_| File::open(seed_path)) {
+        let file = match File::open(seed_path).or_else(|_| File::open(vault_path)) {
             Ok(f) => f,
             Err(_) => return,
         };
@@ -2171,7 +2195,7 @@ mod tests {
             PriceTicks(225_483),
             PriceTicks(225_400),
         );
-        assert_eq!(clamped_px, PriceTicks(225_583));
+        assert_eq!(clamped_px, PriceTicks(225_575));
     }
 
     #[test]
@@ -2182,7 +2206,7 @@ mod tests {
             PriceTicks(768_026),
             PriceTicks(768_192),
         );
-        assert_eq!(clamped_btc, PriceTicks(768_364));
+        assert_eq!(clamped_btc, PriceTicks(768_335));
         let mut ledger = ParitySyncLedger::new(10_000_000_000);
         let mut fsm = ExecutionFsm::new(1_250_000_000, 1_250_000_000);
         assert_eq!(fsm.learned_mfe_ewma_bps, 720);

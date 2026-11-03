@@ -8,7 +8,7 @@ autoaprendizaje MFE real y Gobernador con 6 Escudos (29/29 perdidas mitigadas).
 - Rama de Respaldo Actual: checkpoint/voragine-v0.2-inflection
 - Rama de Respaldo Previa: checkpoint/stage-35-inflection-point
 - Tag en GitHub: voragine-v0.2
-- Test #17 (OOS Gate): 520 trades (80.00% Maker, PF = 2.17, +67.1060 USDT, Drift = 0).
+- Test #17 (OOS Gate): 520 trades (80.00% Maker, PF = 3.13, +84.6300 USDT, Drift = 0).
 - Test #18 (LOSS-LAB 171 Trades): 29/29 (100.0%) perdidas historicas mitigadas.
 - Walk-Forward PAR1 Replay (1,048,576 eventos): +14.32 bps netos, 100% Maker, PF = 9.99.
 

@@ -15,13 +15,11 @@ SHA_URL="${RELEASE_BASE}/COMMIT_SHA"
 mkdir -p "${BIN_DIR}" "${DATA_DIR}"
 cd "${VORTEX_DIR}"
 SEED_V="${VORTEX_DIR}/deploy/forensic_vault_171.seed"
-DEST_V="${DATA_DIR}/vortex_ai_forensic_vault.jsonl"
+ARCH_DIR="${DATA_DIR}/archive_pre_voragine_v02"
+mkdir -p "${ARCH_DIR}"
 if [ -f "${SEED_V}" ]; then
-    CUR_V=$(wc -l < "${DEST_V}" 2>/dev/null || echo 0)
-    if [ "${CUR_V}" -lt 171 ]; then
-        cp -f "${SEED_V}" "${DEST_V}"
-        echo "[VAULT SEAL] Hydrated data/vortex_ai_forensic_vault.jsonl (171 trades)."
-    fi
+    cp -f "${SEED_V}" "${ARCH_DIR}/forensic_vault_171_historico.jsonl"
+    echo "[VAULT ARCHIVE] 171 historical trades sealed in ${ARCH_DIR}."
 fi
 
 TARGET_SHA=$(git rev-parse HEAD)
