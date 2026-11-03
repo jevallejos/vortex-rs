@@ -1396,6 +1396,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 Side::Bid => snap.factor_ofi.get() <= -0.10,
                                 Side::Ask => snap.factor_ofi.get() >= 0.10,
                             };
+                        let periodic_poll = live_client.is_some() && (snap.sequence_id & 31) == 0;
                         let clean_sweep_fill = level_swept && !toxic_sweep;
                         let paper_queue_filled = live_client.is_none()
                             && (resting_queue_ahead.0 == 0 || clean_sweep_fill);
@@ -1442,7 +1443,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 continue;
                             }
                         }
-                        if filled_on_exchange_during_abort || level_swept || resting_queue_ahead.0 == 0 {
+                        if filled_on_exchange_during_abort || level_swept || resting_queue_ahead.0 == 0 || periodic_poll {
                             if !filled_on_exchange_during_abort {
                                 if let Some(ref client) = live_client {
                                     let (real_filled, real_qty) =
@@ -1476,11 +1477,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 }
                             }
                             let spec = APPROVED_SPECS[active_slot];
-                            let eff_open_ts = if filled_on_exchange_during_abort {
-                                TimestampNs(snap.ts_local_ns.0.saturating_sub(24_000_000_000))
-                            } else {
-                                snap.ts_local_ns
-                            };
+                            let eff_open_ts = snap.ts_local_ns;
                             fsm.state = OrderLifecycleState::RestingEntryQueue {
                                 side,
                                 entry_price,
@@ -1777,7 +1774,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         let tfi_exc =
                             (snap.factor_tfi.get().abs() - snap.factor_ofi.get().abs()).max(0.0);
                         let max_q_permille = 720 + ((tfi_exc * 100.0) as i64).min(60);
-                        let queue_wall_blocked = (own_q * 1_000) / tot_q > max_q_permille;
+                        let queue_wall_blocked = own_q > 12_000 || (own_q * 1_000) / tot_q > max_q_permille;
                         if post_only_crossed
                             || !signal_still_valid
                             || own_q < 15

@@ -717,23 +717,33 @@ impl ExecutionFsm {
                 Self::compute_gross_scaled_bps(side, entry_price, quantum_floor_px)
                     .raw()
                     .max(fee_barrier_bps + 1);
+            let structural_win_floor = (fee_barrier_bps + (vol_5m / 60))
+                .clamp(500, 550)
+                .max(zero_loss_scratch_floor);
             let elastic_win_horizon_secs = (learned_mfe / 10).clamp(60, 105);
             let elastic_decay_span_secs = (elastic_win_horizon_secs * 3) / 2;
+            let elastic_zombie_ns =
+                (elastic_decay_span_secs * 1_100_000_000).clamp(90_000_000_000, 150_000_000_000);
+            let allowed_base_floor = if hold_elapsed >= elastic_zombie_ns && !strong_trend_continuation {
+                zero_loss_scratch_floor
+            } else {
+                structural_win_floor
+            };
             let adverse_pressure = (-flow_conviction).max(0.0);
             let active_win_floor = (zero_loss_scratch_floor
                 + ((adaptive_base_target - zero_loss_scratch_floor).max(0) * 55) / 100)
-                .clamp(zero_loss_scratch_floor, 680);
-            let floor_span = (active_win_floor - zero_loss_scratch_floor).max(0);
+                .clamp(structural_win_floor, 680);
+            let floor_span = (active_win_floor - allowed_base_floor).max(0);
             let time_bleed = (elapsed_secs * floor_span) / elastic_win_horizon_secs.max(1);
             let adv_bleed =
-                (adverse_pressure * adverse_pressure * (floor_span as f64) * 4.0) as i64;
+                (adverse_pressure * adverse_pressure * (floor_span as f64) * 3.0) as i64;
             let min_dynamic_floor = (active_win_floor - time_bleed - adv_bleed)
-                .clamp(zero_loss_scratch_floor, active_win_floor);
-            let base_eps = (adaptive_base_target - zero_loss_scratch_floor).max(0) as f64;
+                .clamp(allowed_base_floor, active_win_floor);
+            let base_eps = (adaptive_base_target - allowed_base_floor).max(0) as f64;
             let tau = (elapsed_secs as f64) / (elastic_win_horizon_secs.max(1) as f64);
-            let denom = 1.0 + tau * tau + 3.0 * adverse_pressure * adverse_pressure * tau;
+            let denom = 1.0 + tau * tau + 2.5 * adverse_pressure * adverse_pressure * tau;
             let epsilon_elastico = (base_eps / denom) as i64;
-            let elastic_harvest_floor = (zero_loss_scratch_floor + epsilon_elastico)
+            let elastic_harvest_floor = (allowed_base_floor + epsilon_elastico)
                 .clamp(min_dynamic_floor, 780);
 
             let impulse_immunity_ns =
@@ -746,15 +756,13 @@ impl ExecutionFsm {
                                 || current_gross_bps.raw() >= 760))))
                     || (current_gross_bps.raw() >= active_win_floor
                         && (deep_joint_adverse
-                            || (joint_adverse && hold_elapsed >= 8_000_000_000))));
+                            || (joint_adverse && hold_elapsed >= impulse_immunity_ns))));
             let elastic_early_harvest_ns = impulse_immunity_ns
                 + (elastic_win_horizon_secs * 420_000_000).clamp(22_000_000_000, 45_000_000_000);
             let elastic_scratch_ns =
                 ((impulse_immunity_ns * 85) / 100).clamp(16_000_000_000, 34_000_000_000);
             let elastic_struggle_ns =
                 ((impulse_immunity_ns * 110) / 100).clamp(20_000_000_000, 42_000_000_000);
-            let elastic_zombie_ns =
-                (elastic_decay_span_secs * 1_100_000_000).clamp(90_000_000_000, 150_000_000_000);
             let elastic_stagnant_ns = ((STAGNANT_PROFIT_HOLD_NS * learned_mfe) / 720)
                 .clamp(135_000_000_000, 180_000_000_000);
             let early_harvest = !in_trend_free_ride_zone
@@ -763,7 +771,7 @@ impl ExecutionFsm {
                 && current_gross_bps.raw() >= elastic_harvest_floor;
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= elastic_scratch_ns
-                && current_gross_bps.raw() >= zero_loss_scratch_floor
+                && current_gross_bps.raw() >= structural_win_floor
                 && deep_joint_adverse;
             let struggling_rescue = !in_trend_free_ride_zone
                 && ((hold_elapsed >= elastic_struggle_ns
@@ -774,11 +782,13 @@ impl ExecutionFsm {
                         && current_gross_bps.raw() >= elastic_harvest_floor));
             let zombie_breakeven_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= elastic_zombie_ns
+                && !strong_trend_continuation
                 && ofi_reversed
                 && current_gross_bps.raw() >= zero_loss_scratch_floor;
             let stagnant_unwind = struggling_rescue
                 || zombie_breakeven_escape
                 || (hold_elapsed >= elastic_stagnant_ns
+                    && !strong_trend_continuation
                     && current_gross_bps.raw() >= zero_loss_scratch_floor);
             let flow_conviction_bonus = if flow_conviction > 0.0 {
                 (flow_conviction * 140.0) as i64
@@ -799,7 +809,7 @@ impl ExecutionFsm {
                 peak_gross_bps.raw() >= active_win_floor
                     && hold_elapsed >= impulse_immunity_ns
                     && flow_conviction <= -0.12
-                    && current_gross_bps.raw() >= zero_loss_scratch_floor
+                    && current_gross_bps.raw() >= structural_win_floor
                     && current_gross_bps.raw() <= convex_ratchet_floor
             };
             if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {
@@ -1382,7 +1392,7 @@ impl OnlineAdaptiveGovernor {
             };
             let elastic_stair_cap = 2_300 + learned_edge;
             let elastic_single_cap = 3_300 + learned_edge;
-            let exhausted_scratch_cap = 1_100 + (learned_edge / 2);
+            let exhausted_scratch_cap = 550 + (learned_edge / 3);
             let had_exhausted_scratch =
                 self.wave_step_count[slot_idx][d] > self.win_streak[slot_idx][d];
             if (self.win_streak[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
@@ -1409,7 +1419,7 @@ impl OnlineAdaptiveGovernor {
 
         if slot_idx > 0 {
             if self.global_dir_win_streak[1 - d] >= 2
-                && check_ts_ns.saturating_sub(self.last_global_win_ts_ns) <= 300_000_000_000
+                && check_ts_ns.saturating_sub(self.last_global_win_ts_ns) <= 900_000_000_000
             {
                 return Some("VETO_ALTCOIN_COUNTER_CASCADE");
             }
