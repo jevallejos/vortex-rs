@@ -199,7 +199,7 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 36.1 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 36.2 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -466,9 +466,17 @@ impl BybitV5LiveClient {
                 } else if last_pegged_price.0 > 0 {
                     *last_pegged_price
                 } else if summary.gross_scaled_bps.raw() >= 540 {
-                    profit_floor_price
+                    ExecutionFsm::clamp_maker_exit_to_profit_floor(
+                        open_side,
+                        entry_price,
+                        candidate_exit,
+                    )
                 } else if summary.gross_scaled_bps.raw() >= 405 {
-                    defensive_floor_price
+                    ExecutionFsm::clamp_defensive_zero_loss_floor(
+                        open_side,
+                        entry_price,
+                        candidate_exit,
+                    )
                 } else {
                     ExecutionFsm::clamp_distressed_maker_evacuation_floor(
                         open_side,
@@ -611,9 +619,9 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
         ANSI_GREEN, ANSI_RESET
     );
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 STAGE 36.1 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
+        "🟢 [VORTEX-L2 STAGE 36.2 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
     } else {
-        "🟢 [VORTEX-L2 STAGE 36.1 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟢 [VORTEX-L2 STAGE 36.2 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
     thread::spawn(move || {
@@ -1193,7 +1201,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 36.1 Stoikov L1 & Convex Ratchet & 5-Phase Anti-Zombie){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 36.2 Stoikov L1 & Convex Ratchet & 5-Phase Anti-Zombie){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),

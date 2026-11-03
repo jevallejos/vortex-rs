@@ -380,11 +380,15 @@ fn replay_captured_live_parquet_segments() {
                                 let mid_t = (row.best_bid_ticks.0 + row.best_ask_ticks.0) / 2;
                                 if prev_mid_ticks[slot_idx] > 0 && mid_t > 0 {
                                     let dt = (mid_t - prev_mid_ticks[slot_idx]).abs();
+                                    let prev_v = learned_vol_5m_bps[slot_idx].clamp(4_200, 9_200);
                                     if dt > 0 {
-                                        let imp = ((dt * 1_000_000) / mid_t.max(1) * 220)
-                                            .clamp(3_800, 12_500);
+                                        let imp = ((dt * 1_000_000) / mid_t.max(1) * 180)
+                                            .clamp(4_200, 9_200);
                                         learned_vol_5m_bps[slot_idx] =
-                                            (learned_vol_5m_bps[slot_idx] * 96 + imp * 4) / 100;
+                                            (prev_v * 95 + imp * 5) / 100;
+                                    } else {
+                                        learned_vol_5m_bps[slot_idx] =
+                                            (prev_v * 99 + 6_000) / 100;
                                     }
                                 }
                                 if mid_t > 0 {
