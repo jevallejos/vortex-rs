@@ -377,11 +377,15 @@ fn replay_captured_live_parquet_segments() {
                                 if prev_mid_ticks[slot_idx] > 0 && mid_t > 0 {
                                     let dt = (mid_t - prev_mid_ticks[slot_idx]).abs();
                                     if dt > 0 {
-                                        let prev_v = learned_vol_5m_bps[slot_idx].clamp(4_200, 11_500);
+                                        let prev_v = learned_vol_5m_bps[slot_idx].clamp(3_800, 12_500);
+                                        let sp_t = (row.best_ask_ticks.0 - row.best_bid_ticks.0).max(1);
                                         let inst_bps = (dt.saturating_mul(1_000_000)) / mid_t.max(1);
-                                        let imp = (5_800 + inst_bps.saturating_mul(18)).clamp(4_200, 11_500);
+                                        let sp_bps = (sp_t.saturating_mul(1_000_000)) / mid_t.max(1);
+                                        let imp = (inst_bps.saturating_mul(42) + sp_bps.saturating_mul(38))
+                                            .clamp(3_800, 12_500);
+                                        let alpha_v = if imp > prev_v { 8 } else { 3 };
                                         learned_vol_5m_bps[slot_idx] =
-                                            (prev_v * 96 + imp * 4) / 100;
+                                            (prev_v * (100 - alpha_v) + imp * alpha_v) / 100;
                                     }
                                 }
                                 if mid_t > 0 {
@@ -532,19 +536,12 @@ fn replay_captured_live_parquet_segments() {
                                 let saved_ledger = ledger;
                                 if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
                                     if summary.is_maker_exit {
-                                        let clamped_exit = if summary.gross_scaled_bps.raw() >= 540 {
-                                            ExecutionFsm::clamp_maker_exit_to_profit_floor(
-                                                summary.side,
-                                                summary.entry_price,
-                                                summary.exit_price,
-                                            )
-                                        } else {
-                                            ExecutionFsm::clamp_defensive_zero_loss_floor(
-                                                summary.side,
-                                                summary.entry_price,
-                                                summary.exit_price,
-                                            )
-                                        };
+                                        let clamped_exit = ExecutionFsm::clamp_continuous_maker_floor(
+                                            summary.side,
+                                            summary.entry_price,
+                                            summary.exit_price,
+                                            summary.gross_scaled_bps,
+                                        );
                                         fsm = saved_fsm;
                                         ledger = saved_ledger;
                                         summary = fsm.finalize_close(

@@ -312,6 +312,7 @@ pub struct ExecutionFsm {
     pub gross_profit_accum_1e8: i64,
     pub gross_loss_accum_1e8: i64,
     pub learned_mfe_ewma_bps: i64,
+    pub last_peak_gross_bps: i64,
 }
 
 impl Default for ExecutionFsm {
@@ -335,6 +336,7 @@ impl ExecutionFsm {
             gross_profit_accum_1e8: 0,
             gross_loss_accum_1e8: 0,
             learned_mfe_ewma_bps: 720,
+            last_peak_gross_bps: 0,
         }
     }
 
@@ -631,11 +633,14 @@ impl ExecutionFsm {
                 ((elastic_vol_floor_bps * 55) + (learned_mfe.clamp(560, 920) * 45)) / 100;
             let in_trend_free_ride_zone = peak_gross_bps.raw() > 800;
 
+            self.last_peak_gross_bps = peak_gross_bps.raw();
             let (signed_ofi, signed_tfi) = match side {
                 Side::Bid => (snap.factor_ofi.get(), snap.factor_tfi.get()),
                 Side::Ask => (-snap.factor_ofi.get(), -snap.factor_tfi.get()),
             };
-            let flow_conviction = 0.55 * signed_ofi + 0.45 * signed_tfi;
+            let w_ofi = 0.35 + signed_ofi.abs();
+            let w_tfi = 0.30 + signed_tfi.abs();
+            let flow_conviction = (w_ofi * signed_ofi + w_tfi * signed_tfi) / (w_ofi + w_tfi);
             let ofi_reversed = signed_ofi < -0.05;
             let joint_adverse = signed_ofi < -0.15 && signed_tfi < -0.15;
             let deep_joint_adverse = signed_ofi < -0.22 && signed_tfi < -0.22;
@@ -712,15 +717,14 @@ impl ExecutionFsm {
                 0
             };
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
-                let convex_ratchet_floor = if peak_gross_bps.raw() > 1_150 {
-                    let base_70 =
-                        fee_barrier_bps + ((peak_gross_bps.raw() - fee_barrier_bps) * 70) / 100;
-                    (base_70 - flow_conviction_bonus).max(620)
-                } else {
-                    let elastic_cushion =
-                        ((elastic_vol_floor_bps / 3) + 50 + flow_conviction_bonus).clamp(220, 360);
-                    (peak_gross_bps.raw() - elastic_cushion).max(600)
-                };
+                let net_peak = (peak_gross_bps.raw() - fee_barrier_bps).max(0);
+                let half_sat_bps = ((elastic_vol_floor_bps * 22) + (learned_mfe * 22)) / 100;
+                let ret_permille =
+                    350 + (410 * net_peak) / (net_peak + half_sat_bps.max(1));
+                let convex_ratchet_floor = (fee_barrier_bps
+                    + (net_peak * ret_permille) / 1_000
+                    - flow_conviction_bonus)
+                    .max(600);
                 current_gross_bps.raw() >= 580
                     && current_gross_bps.raw() <= convex_ratchet_floor
             } else {
@@ -917,6 +921,61 @@ impl ExecutionFsm {
         }
     }
 
+    /// Continuous C1 tick-quantized Maker floor price driven by the Net-Capital Conservation Law.
+    #[inline]
+    #[must_use]
+    pub const fn dynamic_maker_floor_price(
+        side: Side,
+        entry_price: PriceTicks,
+        reference_gross_bps: ScaledBps,
+    ) -> PriceTicks {
+        let g = reference_gross_bps.raw();
+        let target_bps = if g <= 440 {
+            440
+        } else if g >= 600 {
+            600
+        } else {
+            g
+        };
+        let target_ticks = (entry_price.0.saturating_mul(target_bps) + 999_999) / 1_000_000;
+        let min_delta_ticks = if target_ticks > 2 { target_ticks } else { 2 };
+        match side {
+            Side::Bid => PriceTicks(entry_price.0 + min_delta_ticks),
+            Side::Ask => {
+                let p = entry_price.0 - min_delta_ticks;
+                PriceTicks(if p > 1 { p } else { 1 })
+            }
+        }
+    }
+
+    /// Clamps any candidate passive exit price to the continuous tick-quantized Maker floor.
+    #[inline]
+    #[must_use]
+    pub const fn clamp_continuous_maker_floor(
+        side: Side,
+        entry_price: PriceTicks,
+        candidate_exit: PriceTicks,
+        reference_gross_bps: ScaledBps,
+    ) -> PriceTicks {
+        let floor_price = Self::dynamic_maker_floor_price(side, entry_price, reference_gross_bps);
+        match side {
+            Side::Bid => {
+                if candidate_exit.0 > floor_price.0 {
+                    candidate_exit
+                } else {
+                    floor_price
+                }
+            }
+            Side::Ask => {
+                if candidate_exit.0 > 0 && candidate_exit.0 < floor_price.0 {
+                    candidate_exit
+                } else {
+                    floor_price
+                }
+            }
+        }
+    }
+
     #[inline]
     const fn compute_gross_scaled_bps(
         side: Side,
@@ -968,17 +1027,22 @@ impl ExecutionFsm {
         if is_maker_exit {
             self.maker_exits_count += 1;
             self.cooldown_until_ns = TimestampNs(0);
-            if gross_scaled_bps.raw() >= 440 {
-                self.learned_mfe_ewma_bps = ((self.learned_mfe_ewma_bps * 80)
-                    + (gross_scaled_bps.raw().min(2_400) * 20))
+            let observed_mfe = gross_scaled_bps.raw().max(self.last_peak_gross_bps).min(2_400);
+            if observed_mfe >= 440 {
+                let surprise = (observed_mfe - self.learned_mfe_ewma_bps).abs();
+                let alpha_pct = (18 + (surprise / 60)).clamp(18, 32);
+                self.learned_mfe_ewma_bps = ((self.learned_mfe_ewma_bps * (100 - alpha_pct))
+                    + (observed_mfe * alpha_pct))
                     / 100;
                 self.learned_mfe_ewma_bps = self.learned_mfe_ewma_bps.clamp(560, 1_600);
             }
         } else {
             self.taker_sl_exits_count += 1;
             self.cooldown_until_ns = TimestampNs(close_ts_ns.0 + STOP_LOSS_COOLDOWN_NS);
-            self.learned_mfe_ewma_bps = (self.learned_mfe_ewma_bps - 80).clamp(560, 1_600);
+            self.learned_mfe_ewma_bps =
+                (((self.learned_mfe_ewma_bps * 88) + (560 * 12)) / 100).clamp(560, 1_600);
         }
+        self.last_peak_gross_bps = 0;
 
         if net_pnl_1e8 >= 0 {
             self.gross_profit_accum_1e8 += net_pnl_1e8;
@@ -1233,9 +1297,14 @@ impl OnlineAdaptiveGovernor {
                 Side::Bid => ((cur_1e4 - anchor_1e4).saturating_mul(1_000_000)) / anchor_1e4,
                 Side::Ask => ((anchor_1e4 - cur_1e4).saturating_mul(1_000_000)) / anchor_1e4,
             };
-            if (self.win_streak[slot_idx][d] >= 2 && chased_bps > 2_500)
-                || (self.win_streak[slot_idx][d] >= 1 && chased_bps > 3_500)
-                || (slot_idx == 0 && self.wave_step_count[slot_idx][d] >= 2 && chased_bps > 2_500)
+            let learned_edge = self.ewma_net_bps_x100[slot_idx][d].clamp(-200, 400);
+            let elastic_stair_cap = (2_300 + learned_edge).clamp(2_200, 2_550);
+            let elastic_single_cap = (3_300 + learned_edge).clamp(3_100, 3_550);
+            if (self.win_streak[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
+                || (self.win_streak[slot_idx][d] >= 1 && chased_bps > elastic_single_cap)
+                || (slot_idx == 0
+                    && self.wave_step_count[slot_idx][d] >= 2
+                    && chased_bps > elastic_stair_cap)
             {
                 return Some("VETO_WAVE_STAIRCASE_25BPS");
             }
@@ -1365,13 +1434,8 @@ impl OnlineAdaptiveGovernor {
                 self.global_dir_win_streak[d] = 0;
             }
 
-            let breather_secs = if w >= 3 {
-                360_i64
-            } else if w == 2 {
-                150_i64
-            } else {
-                60_i64
-            };
+            let w_cap = i64::from(w.min(3));
+            let breather_secs = 30 * (2 * w_cap * w_cap - 3 * w_cap + 3);
             let win_breather_ns = ts_ns.0.saturating_add(breather_secs * 1_000_000_000);
             if win_breather_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = win_breather_ns;

@@ -199,7 +199,7 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Voragine V0.1 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Voragine V0.2 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -465,17 +465,12 @@ impl BybitV5LiveClient {
                     candidate_exit
                 } else if last_pegged_price.0 > 0 {
                     *last_pegged_price
-                } else if summary.gross_scaled_bps.raw() >= 540 {
-                    ExecutionFsm::clamp_maker_exit_to_profit_floor(
-                        open_side,
-                        entry_price,
-                        candidate_exit,
-                    )
                 } else {
-                    ExecutionFsm::clamp_defensive_zero_loss_floor(
+                    ExecutionFsm::clamp_continuous_maker_floor(
                         open_side,
                         entry_price,
                         candidate_exit,
+                        summary.gross_scaled_bps,
                     )
                 };
                 println!(
@@ -521,19 +516,12 @@ impl BybitV5LiveClient {
                         };
                     }
                 }
-                let peg_price = if summary.gross_scaled_bps.raw() >= 540 {
-                    ExecutionFsm::clamp_maker_exit_to_profit_floor(
-                        open_side,
-                        entry_price,
-                        raw_bbo_exit,
-                    )
-                } else {
-                    ExecutionFsm::clamp_defensive_zero_loss_floor(
-                        open_side,
-                        entry_price,
-                        raw_bbo_exit,
-                    )
-                };
+                let peg_price = ExecutionFsm::clamp_continuous_maker_floor(
+                    open_side,
+                    entry_price,
+                    raw_bbo_exit,
+                    summary.gross_scaled_bps,
+                );
                 if peg_price.0 != last_pegged_price.0 {
                     self.cancel_all_symbol_orders(symbol);
                     let (xw, xf) = spec.format_price_usdt_parts(peg_price);
@@ -607,9 +595,9 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
         ANSI_GREEN, ANSI_RESET
     );
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 VORAGINE V0.1 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
+        "🟢 [VORTEX-L2 VORAGINE V0.2 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
     } else {
-        "🟢 [VORTEX-L2 VORAGINE V0.1 — PAPER-TRUE LAB MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟢 [VORTEX-L2 VORAGINE V0.2 — PAPER-TRUE LAB MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
     thread::spawn(move || {
@@ -817,10 +805,13 @@ fn append_shadow_trade_jsonl(
     };
     let floor_ticks = if !summary.is_maker_exit {
         summary.exit_price.0
-    } else if summary.gross_scaled_bps.raw() >= 540 {
-        ExecutionFsm::min_profitable_maker_exit_price(summary.side, summary.entry_price).0
     } else {
-        ExecutionFsm::defensive_zero_loss_maker_exit_price(summary.side, summary.entry_price).0
+        ExecutionFsm::dynamic_maker_floor_price(
+            summary.side,
+            summary.entry_price,
+            summary.gross_scaled_bps,
+        )
+        .0
     };
     let ts_ns = now_epoch_ns();
     let pf_x100 = fsm.net_profit_factor_x100();
@@ -1196,7 +1187,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Voragine V0.1 Stoikov L1 & Convex Ratchet & 5-Phase Anti-Zombie){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Voragine V0.2 Stoikov L1 & Convex Ratchet & 5-Phase Anti-Zombie){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),
@@ -1537,17 +1528,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let spec = APPROVED_SPECS[active_slot];
                             let default_clamped_px = if !summary.is_maker_exit {
                                 summary.exit_price
-                            } else if summary.gross_scaled_bps.raw() >= 540 {
-                                ExecutionFsm::clamp_maker_exit_to_profit_floor(
-                                    summary.side,
-                                    summary.entry_price,
-                                    summary.exit_price,
-                                )
                             } else {
-                                ExecutionFsm::clamp_defensive_zero_loss_floor(
+                                ExecutionFsm::clamp_continuous_maker_floor(
                                     summary.side,
                                     summary.entry_price,
                                     summary.exit_price,
+                                    summary.gross_scaled_bps,
                                 )
                             };
                             let mut confirmed_exit_px: Option<PriceTicks> = Some(default_clamped_px);

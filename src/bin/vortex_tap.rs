@@ -254,16 +254,19 @@ fn process_bybit_ws_frame(
         snap.ts_exchange_ns = TimestampNs(exch_ns);
         snap.ts_local_ns = TimestampNs(local_ns);
 
-        if let Some((best_bid, best_ask, _)) = snap.bbo_and_spread_ticks() {
+        if let Some((best_bid, best_ask, spread_ticks)) = snap.bbo_and_spread_ticks() {
             let mid = PriceTicks((best_bid.price.0 + best_ask.price.0) / 2);
             if snap.mark_price.0 > 0 && mid.0 > 0 {
                 let delta_ticks = (mid.0 - snap.mark_price.0).abs();
                 if delta_ticks > 0 {
-                    let prev_vol = snap.realized_vol_5m.raw().clamp(4_200, 11_500);
+                    let prev_vol = snap.realized_vol_5m.raw().clamp(3_800, 12_500);
                     let inst_bps = (delta_ticks.saturating_mul(1_000_000)) / mid.0.max(1);
-                    let target_vol = (5_800 + inst_bps.saturating_mul(18)).clamp(4_200, 11_500);
+                    let sp_bps = (spread_ticks.max(1).saturating_mul(1_000_000)) / mid.0.max(1);
+                    let target_vol = (inst_bps.saturating_mul(42) + sp_bps.saturating_mul(38))
+                        .clamp(3_800, 12_500);
+                    let alpha_v = if target_vol > prev_vol { 8 } else { 3 };
                     snap.realized_vol_5m =
-                        ScaledBps(((prev_vol * 96) + (target_vol * 4)) / 100);
+                        ScaledBps(((prev_vol * (100 - alpha_v)) + (target_vol * alpha_v)) / 100);
                 }
             }
             snap.mark_price = mid;

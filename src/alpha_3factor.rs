@@ -249,7 +249,11 @@ impl OrthogonalFactorState {
             return Ok(SignalVerdict::SpoofingVeto);
         }
 
-        let composite = 0.45 * x_ofi + 0.35 * x_tfi + 0.20 * x_geom;
+        let w_ofi = 0.25 + x_ofi * x_ofi;
+        let w_tfi = 0.20 + x_tfi * x_tfi;
+        let w_geom = 0.10 + 0.50 * x_geom * x_geom;
+        let composite =
+            (w_ofi * x_ofi + w_tfi * x_tfi + w_geom * x_geom) / (w_ofi + w_tfi + w_geom);
         let abs_comp = composite.abs();
         if abs_comp < 0.42 {
             return Ok(SignalVerdict::NeutralNoAction);
