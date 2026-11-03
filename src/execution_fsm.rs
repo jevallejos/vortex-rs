@@ -623,12 +623,15 @@ impl ExecutionFsm {
                 Self::compute_gross_scaled_bps(side, entry_price, peak_favorable_price);
 
 
-            // Stage 35.2 Elastic Self-Learning MFE & Zero-Dead-Zone Green Harvest Physics:
-            let elastic_vol_floor_bps = (snap.realized_vol_5m.raw() / 10).clamp(600, 750);
-            let adaptive_base_target = ((elastic_vol_floor_bps * 60)
-                + (self.learned_mfe_ewma_bps.clamp(560, 900) * 40))
-                / 100;
+            // Stage 35.6 Pure Elastic Self-Learning MFE & Zero-Loss Harvest Physics:
+            let vol_5m = snap.realized_vol_5m.raw().max(3_500);
+            let learned_mfe = self.learned_mfe_ewma_bps.clamp(560, 1_600);
+            let elastic_vol_floor_bps =
+                ((vol_5m / 10) + ((learned_mfe - 720) / 6)).clamp(580, 780);
+            let adaptive_base_target =
+                ((elastic_vol_floor_bps * 55) + (learned_mfe.clamp(560, 920) * 45)) / 100;
             let in_trend_free_ride_zone = peak_gross_bps.raw() > 800;
+
             let (signed_ofi, signed_tfi) = match side {
                 Side::Bid => (snap.factor_ofi.get(), snap.factor_tfi.get()),
                 Side::Ask => (-snap.factor_ofi.get(), -snap.factor_tfi.get()),
@@ -638,74 +641,73 @@ impl ExecutionFsm {
             let joint_adverse = signed_ofi < -0.15 && signed_tfi < -0.15;
             let deep_joint_adverse = signed_ofi < -0.22 && signed_tfi < -0.22;
             let strong_trend_continuation = signed_ofi > 0.20 || signed_tfi > 0.25;
+
             let hold_elapsed = snap.ts_local_ns.0.saturating_sub(opened_ts.0);
             let elapsed_secs = (hold_elapsed / 1_000_000_000).clamp(0, 180);
-            let time_decay_relaxation =
-                (elapsed_secs * (adaptive_base_target - 440).max(0)) / 110;
+            let fee_barrier_bps =
+                ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+            let zero_loss_scratch_floor =
+                fee_barrier_bps + (vol_5m / 150).clamp(40, 60);
+            let elastic_win_horizon_secs = (learned_mfe / 10).clamp(60, 105);
+            let elastic_decay_span_secs = (elastic_win_horizon_secs * 3) / 2;
+            let time_decay_relaxation = (elapsed_secs
+                * (adaptive_base_target - zero_loss_scratch_floor).max(0))
+                / elastic_decay_span_secs.max(1);
             let flow_relaxation = if deep_joint_adverse {
                 ((-flow_conviction).max(0.0) * 240.0) as i64
             } else if joint_adverse {
                 ((-flow_conviction).max(0.0) * 160.0) as i64
-            } else if ofi_reversed && elapsed_secs >= 45 {
+            } else if ofi_reversed && elapsed_secs >= (elastic_win_horizon_secs / 2) {
                 ((-flow_conviction).max(0.0) * 120.0) as i64
             } else {
                 0
             };
+            let active_win_floor = (fee_barrier_bps
+                + ((adaptive_base_target - fee_barrier_bps) * 55) / 100)
+                .clamp(530, 660);
             let min_dynamic_floor =
-                if elapsed_secs < 75 && !deep_joint_adverse { 540 } else { 440 };
+                if elapsed_secs < elastic_win_horizon_secs && !deep_joint_adverse {
+                    active_win_floor
+                } else {
+                    zero_loss_scratch_floor
+                };
             let elastic_harvest_floor = (adaptive_base_target
                 - time_decay_relaxation
                 - flow_relaxation)
-                .clamp(min_dynamic_floor, 750);
+                .clamp(min_dynamic_floor, 780);
 
             let flow_unwind = !in_trend_free_ride_zone
                 && current_gross_bps.raw() >= elastic_vol_floor_bps
                 && (deep_joint_adverse
                     || (joint_adverse
                         && (hold_elapsed >= 30_000_000_000
-                            || current_gross_bps.raw() >= 680)));
+                            || current_gross_bps.raw() >= adaptive_base_target)));
             let early_harvest = !in_trend_free_ride_zone
                 && !strong_trend_continuation
                 && hold_elapsed >= 50_000_000_000
                 && current_gross_bps.raw() >= elastic_harvest_floor;
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= 20_000_000_000
-                && current_gross_bps.raw() >= 440
+                && current_gross_bps.raw() >= zero_loss_scratch_floor
                 && deep_joint_adverse;
             let struggling_rescue = !in_trend_free_ride_zone
                 && ((hold_elapsed >= 25_000_000_000
                     && joint_adverse
                     && current_gross_bps.raw() >= elastic_harvest_floor)
-                    || (hold_elapsed >= 80_000_000_000
+                    || (elapsed_secs >= elastic_win_horizon_secs
                         && !strong_trend_continuation
                         && current_gross_bps.raw() >= elastic_harvest_floor));
-            let distressed_scratch_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= 45_000_000_000
-                && joint_adverse
-                && current_gross_bps.raw() >= 350;
-            let distressed_time_slide =
-                ((elapsed_secs.saturating_sub(75)) * 10).clamp(0, 650);
-            let distressed_flow_slide = if deep_joint_adverse {
-                150
-            } else if joint_adverse {
-                80
-            } else {
-                0
-            };
-            let elastic_distressed_floor =
-                (350 - distressed_time_slide - distressed_flow_slide).clamp(-350, 350);
             let zombie_breakeven_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= 75_000_000_000
-                && (ofi_reversed || peak_gross_bps.raw() < 440)
-                && current_gross_bps.raw() >= elastic_distressed_floor;
+                && hold_elapsed >= 120_000_000_000
+                && ofi_reversed
+                && current_gross_bps.raw() >= zero_loss_scratch_floor;
             let stagnant_unwind = struggling_rescue
-                || distressed_scratch_escape
                 || zombie_breakeven_escape
                 || (hold_elapsed >= STAGNANT_PROFIT_HOLD_NS
-                    && current_gross_bps.raw() >= elastic_distressed_floor);
+                    && current_gross_bps.raw() >= zero_loss_scratch_floor);
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
                 let convex_ratchet_floor = if peak_gross_bps.raw() > 1_150 {
-                    400 + ((peak_gross_bps.raw() - 400) * 70) / 100
+                    fee_barrier_bps + ((peak_gross_bps.raw() - fee_barrier_bps) * 70) / 100
                 } else {
                     let elastic_cushion =
                         ((elastic_vol_floor_bps / 3) + 50).clamp(220, 260);
@@ -852,27 +854,12 @@ impl ExecutionFsm {
         entry_price: PriceTicks,
         candidate_exit: PriceTicks,
     ) -> PriceTicks {
-        let max_loss_ticks = ((entry_price.0.saturating_mul(350)) / 1_000_000) + 1;
-        match side {
-            Side::Bid => {
-                let floor_px = entry_price.0 - max_loss_ticks;
-                if candidate_exit.0 > floor_px {
-                    candidate_exit
-                } else {
-                    PriceTicks(if floor_px > 1 { floor_px } else { 1 })
-                }
-            }
-            Side::Ask => {
-                let ceil_px = entry_price.0 + max_loss_ticks;
-                if candidate_exit.0 > 0 && candidate_exit.0 < ceil_px {
-                    candidate_exit
-                } else {
-                    PriceTicks(ceil_px)
-                }
-            }
-        }
+        Self::clamp_defensive_zero_loss_floor(side, entry_price, candidate_exit)
     }
 
+    /// Clamps an aged zombie position to the defensive zero-loss floor.
+    #[inline]
+    #[must_use]
     pub const fn clamp_zombie_evacuation_floor(
         side: Side,
         entry_price: PriceTicks,
@@ -1418,48 +1405,44 @@ impl OnlineAdaptiveGovernor {
         let learned_edge = self.ewma_net_bps_x100[slot_idx][d].clamp(-200, 400);
         let self_vol = candidate_snap.realized_vol_5m.raw().max(3_500);
         let btc_vol = btc_leader_snap.realized_vol_5m.raw().max(3_500);
+        let min_trend_drift = (((260 - learned_edge).max(60)) * self_vol) / 600_000;
         let max_self_ext = ((self_vol / 11) + (learned_edge / 4)).max(320);
-        let min_self_pullback = -((self_vol / 32) + (learned_edge / 8)).max(90);
         let max_btc_ext = ((btc_vol / 12) + (learned_edge / 5)).max(300);
-        let min_btc_pullback = -((btc_vol / 45) + (learned_edge / 10)).max(80);
-        let max_drift_against = (self_vol / 500).max(5);
         match side {
             Side::Bid => {
-                if self_drift_bps < -max_drift_against
-                    || !(min_self_pullback..=max_self_ext).contains(&self_ext_bps)
+                if self_drift_bps < min_trend_drift
+                    || !(0..=max_self_ext).contains(&self_ext_bps)
                 {
                     return false;
                 }
                 if slot_idx > 0
-                    && (self_drift_bps < 0
-                        || btc_drift_bps < 0
-                        || !(min_btc_pullback..=max_btc_ext).contains(&btc_ext_bps)
+                    && (btc_drift_bps < 0
+                        || !(0..=max_btc_ext).contains(&btc_ext_bps)
                         || self.global_dir_win_streak[d] >= 2)
                 {
                     return false;
                 }
             }
             Side::Ask => {
-                if self_drift_bps > max_drift_against
-                    || !(-max_self_ext..=-min_self_pullback).contains(&self_ext_bps)
+                if self_drift_bps > -min_trend_drift
+                    || !(-max_self_ext..=0).contains(&self_ext_bps)
                 {
                     return false;
                 }
                 if slot_idx > 0
-                    && (self_drift_bps > 0
-                        || btc_drift_bps > 0
-                        || !(-max_btc_ext..=-min_btc_pullback).contains(&btc_ext_bps)
+                    && (btc_drift_bps > 0
+                        || !(-max_btc_ext..=0).contains(&btc_ext_bps)
                         || self.global_dir_win_streak[d] >= 2)
                 {
                     return false;
                 }
             }
         }
+
         let cand_comp = (0.45 * candidate_snap.factor_ofi.get()
             + 0.35 * candidate_snap.factor_tfi.get()
             + 0.20 * candidate_snap.factor_geom.get())
         .abs();
-
         let btc_comp = 0.45 * btc_leader_snap.factor_ofi.get()
             + 0.35 * btc_leader_snap.factor_tfi.get()
             + 0.20 * btc_leader_snap.factor_geom.get();
@@ -1472,14 +1455,12 @@ impl OnlineAdaptiveGovernor {
         } else {
             0.0
         };
-
         let global_debt_bps = self.global_dir_debt_bps_x100[d] as f64;
         let global_penalty = if global_debt_bps < -2_000.0 {
             ((-global_debt_bps - 2_000.0) / 35_000.0).min(0.14)
         } else {
             0.0
         };
-
         let staircase_penalty = if win_s >= 2.0 { 0.05 * (win_s - 1.0) } else { 0.0 };
 
         if self.is_in_scar_debt(slot_idx, side) && candidate_snap.factor_tfi.get().abs() < 0.40 {
@@ -1511,8 +1492,11 @@ impl OnlineAdaptiveGovernor {
             }
         }
 
-        let adaptive_threshold =
-            (0.42 + 0.08 * sl_s + debt_penalty + global_penalty + staircase_penalty).min(0.80);
+        let drift_bonus = ((self_drift_bps.abs().min(120) as f64) / 2_400.0).min(0.04);
+        let edge_bonus = ((learned_edge.max(0) as f64) / 10_000.0).min(0.03);
+        let adaptive_threshold = (0.45 + 0.08 * sl_s + debt_penalty + global_penalty
+            + staircase_penalty - drift_bonus - edge_bonus)
+            .clamp(0.42, 0.80);
         cand_comp >= adaptive_threshold
     }
 }
