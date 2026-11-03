@@ -17,12 +17,6 @@ pub const MIN_QUEUE_RESIDENCE_NS: i64 = 1_500_000_000;
 /// Maximum time a passive `Limit PostOnly` entry order may sit unfilled in the L1 queue (25 seconds).
 pub const MAX_RESTING_QUEUE_TTL_NS: i64 = 8_000_000_000;
 
-/// Scale-invariant BBO runaway threshold in ScaledBps after 1.5s residence (3.50 bps = 350 units, min 3 ticks).
-pub const BBO_RUNAWAY_SCALED_BPS: i64 = 350;
-
-/// Structural server-side MarkPrice Stop-Loss distance (52.00 bps = 5_200 ScaledBps, min 4 ticks).
-pub const SERVER_SL_DISTANCE_SCALED_BPS: i64 = 5_200;
-
 /// Maximum hold time for a stagnant net-profitable position (>= +4.50 bps gross / +0.50 bps net) before passive Maker release (180 seconds).
 pub const STAGNANT_PROFIT_HOLD_NS: i64 = 180_000_000_000;
 
@@ -376,7 +370,6 @@ impl ExecutionFsm {
         };
         let vol_raw = snap.realized_vol_5m.raw().clamp(3_500, 12_500);
         let learned_raw = self.learned_mfe_ewma_bps.clamp(560, 1_600);
-        let _ = SERVER_SL_DISTANCE_SCALED_BPS;
         let elastic_sl_bps =
             ((vol_raw * 38) / 100 + (learned_raw * 8) / 100).clamp(2_400, 3_600);
         let sl_distance_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
@@ -715,7 +708,7 @@ impl ExecutionFsm {
             let never_reached_green = peak_gross_bps.raw() < zero_loss_scratch_floor;
             let trapped_breakeven_floor = if never_reached_green && elapsed_secs >= 105 {
                 let overtime = (elapsed_secs - 105).clamp(0, 75);
-                (fee_barrier_bps + 5 - (overtime * 5)).clamp(50, fee_barrier_bps + 5)
+                (fee_barrier_bps + 5 - (overtime * 3) / 5).clamp(360, fee_barrier_bps + 5)
             } else {
                 fee_barrier_bps + 5
             };
@@ -868,11 +861,9 @@ impl ExecutionFsm {
         }
     }
 
-    /// Clamps an aged zombie position (>= 120s..180s) so it never exits worse than `entry_price` (0.00 bps gross = -4.00 bps net Maker fee),
-    /// while preserving any positive tick bounce above `entry_price` (such as the 405 ScaledBps true breakeven floor).
-    /// Elastic Maker evacuation clamp for aged/distressed positions (< 405 ScaledBps)
-    /// so trapped trades escape passively via Limit PostOnly (-0.50..-7.50 bps net)
-    /// instead of waiting for +4.40 bps and dying at -60.00 bps Taker SL.
+    /// Elastic Maker evacuation clamp for aged/trapped positions (< 405 ScaledBps):
+    /// guarantees at least 360 ScaledBps (+3.60 bps gross = -0.40 bps net SCRATCH)
+    /// so passive exits never cross into LOSS (< -0.50 bps net) on BTC or ETH.
     #[inline]
     #[must_use]
     pub const fn clamp_distressed_maker_evacuation_floor(
@@ -880,31 +871,40 @@ impl ExecutionFsm {
         entry_price: PriceTicks,
         candidate_exit: PriceTicks,
     ) -> PriceTicks {
-        let min_step_px = match side {
-            Side::Bid => PriceTicks(entry_price.0 + 1),
+        let target_360bps_ticks = (entry_price.0.saturating_mul(360) + 999_999) / 1_000_000;
+        let min_scratch_delta_ticks = if target_360bps_ticks > 1 {
+            target_360bps_ticks
+        } else {
+            1
+        };
+        let floor_px = match side {
+            Side::Bid => PriceTicks(entry_price.0 + min_scratch_delta_ticks),
             Side::Ask => {
-                let p = entry_price.0 - 1;
+                let p = entry_price.0 - min_scratch_delta_ticks;
                 PriceTicks(if p > 1 { p } else { 1 })
             }
         };
         match side {
             Side::Bid => {
-                if candidate_exit.0 > min_step_px.0 {
+                if candidate_exit.0 > floor_px.0 {
                     candidate_exit
                 } else {
-                    min_step_px
+                    floor_px
                 }
             }
             Side::Ask => {
-                if candidate_exit.0 > 0 && candidate_exit.0 < min_step_px.0 {
+                if candidate_exit.0 > 0 && candidate_exit.0 < floor_px.0 {
                     candidate_exit
                 } else {
-                    min_step_px
+                    floor_px
                 }
             }
         }
     }
 
+    /// Clamps a standard zombie position to the 440 ScaledBps defensive zero-loss floor.
+    #[inline]
+    #[must_use]
     pub const fn clamp_zombie_evacuation_floor(
         side: Side,
         entry_price: PriceTicks,
@@ -1245,20 +1245,6 @@ impl OnlineAdaptiveGovernor {
         self.cum_net_bps_x100[slot_idx][d] < -1_500
             || self.sl_streak[slot_idx][d] > 0
             || self.global_dir_debt_bps_x100[d] < -6_000
-    }
-
-    /// Returns `true` when `(slot_idx, side)` has zero SL scars and strong positive cumulative surplus.
-    #[inline]
-    #[must_use]
-    pub const fn is_champion_cell(&self, slot_idx: usize, side: Side) -> bool {
-        if slot_idx >= 6 {
-            return false;
-        }
-        let d = Self::dir_idx(side);
-        self.sl_streak[slot_idx][d] == 0
-            && self.cum_net_bps_x100[slot_idx][d] >= 1_200
-            && self.ewma_net_bps_x100[slot_idx][d] >= 200
-            && self.global_dir_sl_streak[d] == 0
     }
 
     /// Evaluates the 6 structural anti-loss shields shared between live execution and `--loss-lab`.

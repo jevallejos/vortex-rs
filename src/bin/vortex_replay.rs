@@ -289,6 +289,8 @@ fn replay_captured_live_parquet_segments() {
 
     let evaluator = OrthogonalFactorState::new();
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
+    let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
+    let mut ledger = ParitySyncLedger::new(10_000_000_000);
     if let Ok(shadow_file) = std::fs::File::open("data/vortex_shadow_trades.jsonl") {
         use std::io::{BufRead, BufReader};
         let reader = BufReader::new(shadow_file);
@@ -298,6 +300,20 @@ fn replay_captured_live_parquet_segments() {
                 let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
                 let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
                 let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+                let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let net_scaled = (net_bps * 100.0).round() as i64;
+                let fee_scaled = if is_maker { 400 } else { 750 };
+                let gross_scaled = net_scaled + fee_scaled;
+                if is_maker {
+                    if gross_scaled >= 440 {
+                        fsm.learned_mfe_ewma_bps = ((fsm.learned_mfe_ewma_bps * 80)
+                            + (gross_scaled.min(2_400) * 20))
+                            / 100;
+                        fsm.learned_mfe_ewma_bps = fsm.learned_mfe_ewma_bps.clamp(560, 1_600);
+                    }
+                } else {
+                    fsm.learned_mfe_ewma_bps = (fsm.learned_mfe_ewma_bps - 80).clamp(560, 1_600);
+                }
                 let slot_opt = match sym_str {
                     "BTCUSDT" => Some(0),
                     "ETHUSDT" => Some(1),
@@ -315,16 +331,14 @@ fn replay_captured_live_parquet_segments() {
                     adaptive_gov.observe_closed_trade(
                         s_idx,
                         s_side,
-                        ScaledBps((net_bps * 100.0).round() as i64),
+                        ScaledBps(net_scaled),
                         is_maker,
-                        TimestampNs(0),
+                        TimestampNs(ts_saved),
                     );
                 }
             }
         }
     }
-    let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
-    let mut ledger = ParitySyncLedger::new(10_000_000_000);
     let mut fifo_sim = FifoQueueSimulator::new();
     let mut btc_leader_snap = SymbolLobSnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];

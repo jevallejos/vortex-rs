@@ -95,7 +95,6 @@ fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static str
 #[inline]const fn compute_optimal_50usdt_wallet_qty_str(
     symbol_id: SymbolId,
     in_scar_debt: bool,
-    _is_champion: bool,
 ) -> &'static str {
     match symbol_id.0 {
         1 => "0.001",
@@ -200,7 +199,7 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 35 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 36.1 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -397,7 +396,7 @@ impl BybitV5LiveClient {
             Side::Bid => "Buy",
             Side::Ask => "Sell",
         };
-        let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, in_scar_debt, gov_diag.1 == 0 && gov_diag.0 >= 220 && gov_diag.2 >= 2);
+        let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, in_scar_debt);
         let body = format!(
             "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",\"price\":\"{}.{:04}\",\"stopLoss\":\"{}.{:04}\",\"slTriggerBy\":\"MarkPrice\",\"positionIdx\":0}}",
             symbol, bybit_side, qty_str, ew, ef, sw, sf
@@ -466,12 +465,16 @@ impl BybitV5LiveClient {
                     candidate_exit
                 } else if last_pegged_price.0 > 0 {
                     *last_pegged_price
-                } else if summary.gross_scaled_bps.raw() >= 580 {
+                } else if summary.gross_scaled_bps.raw() >= 540 {
                     profit_floor_price
-                } else if summary.gross_scaled_bps.raw() >= 440 {
+                } else if summary.gross_scaled_bps.raw() >= 405 {
                     defensive_floor_price
                 } else {
-                    ExecutionFsm::clamp_zombie_evacuation_floor(open_side, entry_price, candidate_exit)
+                    ExecutionFsm::clamp_distressed_maker_evacuation_floor(
+                        open_side,
+                        entry_price,
+                        candidate_exit,
+                    )
                 };
                 println!(
                     "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed @ {}t (0.00 remaining){}",
@@ -608,9 +611,9 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
         ANSI_GREEN, ANSI_RESET
     );
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 STAGE 36.0 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
+        "🟢 [VORTEX-L2 STAGE 36.1 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
     } else {
-        "🟢 [VORTEX-L2 STAGE 36.0 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟢 [VORTEX-L2 STAGE 36.1 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
     thread::spawn(move || {
@@ -691,8 +694,15 @@ fn rehydrate_shadow_ledger(
             ledger.record_closed_trade(gross_1e8, fee_1e8);
             if is_maker {
                 fsm.maker_exits_count += 1;
+                if gross_scaled_bps >= 440 {
+                    fsm.learned_mfe_ewma_bps = ((fsm.learned_mfe_ewma_bps * 80)
+                        + (gross_scaled_bps.min(2_400) * 20))
+                        / 100;
+                    fsm.learned_mfe_ewma_bps = fsm.learned_mfe_ewma_bps.clamp(560, 1_600);
+                }
             } else {
                 fsm.taker_sl_exits_count += 1;
+                fsm.learned_mfe_ewma_bps = (fsm.learned_mfe_ewma_bps - 80).clamp(560, 1_600);
             }
             if net_1e8 >= 0 {
                 fsm.gross_profit_accum_1e8 += net_1e8;
@@ -1183,7 +1193,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 35 Convex Ratchet & 5-Phase Anti-Zombie){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 36.1 Stoikov L1 & Convex Ratchet & 5-Phase Anti-Zombie){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),
@@ -1475,9 +1485,9 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             );
 
                             if let Some(ref tx) = tg_tx {
-                                let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, side), adaptive_gov.is_champion_cell(active_slot, side));
+                                let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, side));
                                 let alert = format!(
-                                    "🟡 [VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?}) | Qty: {}\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT (Dynamic 70% MFE Ratchet)\nServer SL: {}.{:04} USDT (-0.520% | -5.20% @ 10x)",
+                                    "🟡 [VORTEX-L2 MAKER FILL]\nSymbol: {} ({:?}) | Qty: {}\nEntry: {}.{:04} USDT (PostOnly Maker)\nTarget TP: {}.{:04} USDT (Dynamic 70% MFE Ratchet)\nServer SL: {}.{:04} USDT (Elastic Volatility SL)",
                                     snap.symbol_id.name(),
                                     side,
                                     qty_str,
@@ -1636,7 +1646,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 * 10_000.0;
                             let cum_pct_1x = cum_bps / 100.0;
                             let cum_pct_10x = cum_bps / 10.0;
-                            let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, summary.side), adaptive_gov.is_champion_cell(active_slot, summary.side));
+                            let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, summary.side));
                             let (c_col, c_icon, c_badge) = classify_pnl_badge(net_bps);
 
                             println!(

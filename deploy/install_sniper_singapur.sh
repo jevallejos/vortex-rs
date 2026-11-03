@@ -66,7 +66,7 @@ EOF
 
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Stage 31.1 Live Capital)
+Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Stage 36.1 Live Capital)
 After=vortex-tap.service
 Requires=vortex-tap.service
 
@@ -158,6 +158,11 @@ VORTEX_CLI_EOF
 
 sudo chmod +x /usr/local/bin/vortex
 sudo systemctl daemon-reload
+if [ "${1:-}" = "--no-start" ]; then
+    sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
+    echo "[OK] VORTEX-L2 Stage 36.1 binaries installed and verified (Services kept in STOP mode)."
+    exit 0
+fi
 sudo systemctl enable vortex-tap.service vortex-exec.service >/dev/null 2>&1 || true
 sudo systemctl restart vortex-tap.service
 sleep 2
