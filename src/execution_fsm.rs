@@ -739,11 +739,14 @@ impl ExecutionFsm {
             let impulse_immunity_ns =
                 (learned_mfe.clamp(560, 1_200) * 35_000_000).clamp(20_000_000_000, 42_000_000_000);
             let flow_unwind = !in_trend_free_ride_zone
-                && current_gross_bps.raw() >= elastic_vol_floor_bps
-                && (deep_joint_adverse
-                    || (joint_adverse
-                        && (hold_elapsed >= impulse_immunity_ns
-                            || current_gross_bps.raw() >= 760)));
+                && ((current_gross_bps.raw() >= elastic_vol_floor_bps
+                    && (deep_joint_adverse
+                        || (joint_adverse
+                            && (hold_elapsed >= impulse_immunity_ns
+                                || current_gross_bps.raw() >= 760))))
+                    || (current_gross_bps.raw() >= active_win_floor
+                        && (deep_joint_adverse
+                            || (joint_adverse && hold_elapsed >= 8_000_000_000))));
             let elastic_early_harvest_ns = impulse_immunity_ns
                 + (elastic_win_horizon_secs * 420_000_000).clamp(22_000_000_000, 45_000_000_000);
             let elastic_scratch_ns =
@@ -793,7 +796,7 @@ impl ExecutionFsm {
                 current_gross_bps.raw() >= active_win_floor
                     && current_gross_bps.raw() <= convex_ratchet_floor
             } else {
-                peak_gross_bps.raw() >= elastic_vol_floor_bps
+                peak_gross_bps.raw() >= active_win_floor
                     && hold_elapsed >= impulse_immunity_ns
                     && flow_conviction <= -0.12
                     && current_gross_bps.raw() >= zero_loss_scratch_floor
@@ -1379,11 +1382,13 @@ impl OnlineAdaptiveGovernor {
             };
             let elastic_stair_cap = 2_300 + learned_edge;
             let elastic_single_cap = 3_300 + learned_edge;
+            let exhausted_scratch_cap = 1_100 + (learned_edge / 2);
+            let had_exhausted_scratch =
+                self.wave_step_count[slot_idx][d] > self.win_streak[slot_idx][d];
             if (self.win_streak[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
                 || (self.win_streak[slot_idx][d] >= 1 && chased_bps > elastic_single_cap)
-                || (slot_idx == 0
-                    && self.wave_step_count[slot_idx][d] >= 2
-                    && chased_bps > elastic_stair_cap)
+                || (self.wave_step_count[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
+                || (had_exhausted_scratch && chased_bps > exhausted_scratch_cap)
             {
                 return Some("VETO_WAVE_STAIRCASE_25BPS");
             }
@@ -1589,7 +1594,9 @@ impl OnlineAdaptiveGovernor {
                     return false;
                 }
                 if slot_idx > 0
-                    && (btc_drift_bps < -25 || btc_ext_bps > max_btc_ext)
+                    && (btc_drift_bps < 0
+                        || !(0..=max_btc_ext).contains(&btc_ext_bps)
+                        || self.global_dir_win_streak[d] >= 2)
                 {
                     return false;
                 }
@@ -1601,10 +1608,32 @@ impl OnlineAdaptiveGovernor {
                     return false;
                 }
                 if slot_idx > 0
-                    && (btc_drift_bps > 25 || btc_ext_bps < -max_btc_ext)
+                    && (btc_drift_bps > 0
+                        || !(-max_btc_ext..=0).contains(&btc_ext_bps)
+                        || self.global_dir_win_streak[d] >= 2)
                 {
                     return false;
                 }
+            }
+        }
+        let (own_l1_q, opp_l1_q) = match side {
+            Side::Bid => (
+                candidate_snap.bids[0].qty.0.max(0),
+                candidate_snap.asks[0].qty.0.max(0),
+            ),
+            Side::Ask => (
+                candidate_snap.asks[0].qty.0.max(0),
+                candidate_snap.bids[0].qty.0.max(0),
+            ),
+        };
+        let total_l1_q = own_l1_q + opp_l1_q;
+        if total_l1_q > 0 {
+            let tfi_exc =
+                (candidate_snap.factor_tfi.get().abs() - candidate_snap.factor_ofi.get().abs())
+                    .max(0.0);
+            let max_q_permille = 720 + ((tfi_exc * 100.0) as i64).min(60);
+            if (own_l1_q * 1_000) / total_l1_q > max_q_permille {
+                return false;
             }
         }
 
@@ -1640,15 +1669,16 @@ impl OnlineAdaptiveGovernor {
             };
             let btc_not_opposing = match side {
                 Side::Bid => {
-                    btc_leader_snap.factor_ofi.get() > -0.15
-                        && btc_leader_snap.factor_tfi.get() > -0.15
+                    btc_leader_snap.factor_ofi.get() >= 0.05
+                        && btc_leader_snap.factor_tfi.get() >= 0.0
                 }
                 Side::Ask => {
-                    btc_leader_snap.factor_ofi.get() < 0.15
-                        && btc_leader_snap.factor_tfi.get() < 0.15
+                    btc_leader_snap.factor_ofi.get() <= -0.05
+                        && btc_leader_snap.factor_tfi.get() <= 0.0
                 }
             };
-            if !btc_not_opposing || signed_btc_alignment < -0.12 {
+            let min_btc_align = 0.08 + 0.08 * sl_s + 0.45 * (debt_penalty + global_penalty);
+            if !btc_not_opposing || signed_btc_alignment < min_btc_align {
                 return false;
             }
         }

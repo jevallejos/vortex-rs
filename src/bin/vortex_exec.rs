@@ -1396,10 +1396,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 Side::Bid => snap.factor_ofi.get() <= -0.10,
                                 Side::Ask => snap.factor_ofi.get() >= 0.10,
                             };
-                        let paper_queue_filled =
-                            live_client.is_none() && (resting_queue_ahead.0 == 0 || (level_swept && !toxic_sweep));
-                        let want_abort =
-                            !paper_queue_filled && (toxic_sweep || fsm.check_resting_queue_abort(&snap));
+                        let clean_sweep_fill = level_swept && !toxic_sweep;
+                        let paper_queue_filled = live_client.is_none()
+                            && (resting_queue_ahead.0 == 0 || clean_sweep_fill);
+                        let want_abort = !paper_queue_filled
+                            && !clean_sweep_fill
+                            && (toxic_sweep || fsm.check_resting_queue_abort(&snap));
                         let mut filled_on_exchange_during_abort = false;
                         if want_abort {
                             if let Some(ref client) = live_client {
@@ -1474,15 +1476,20 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 }
                             }
                             let spec = APPROVED_SPECS[active_slot];
+                            let eff_open_ts = if filled_on_exchange_during_abort {
+                                TimestampNs(snap.ts_local_ns.0.saturating_sub(24_000_000_000))
+                            } else {
+                                snap.ts_local_ns
+                            };
                             fsm.state = OrderLifecycleState::RestingEntryQueue {
                                 side,
                                 entry_price,
                                 qty: LotQty(10),
                                 target_excursion,
                                 sl_trigger_price: resting_sl_price,
-                                resting_since_ts: snap.ts_local_ns,
+                                resting_since_ts: eff_open_ts,
                             };
-                            let _ = fsm.on_entry_filled_maker(snap.ts_local_ns);
+                            let _ = fsm.on_entry_filled_maker(eff_open_ts);
 
                             let mut tp_t: i64 = 0;
                             let mut sl_t: i64 = 0;
@@ -1762,11 +1769,20 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             evaluator.evaluate_entry_signal(&spec, &snap),
                             Ok(SignalVerdict::AuthorizeMakerEntry { side: s_now, .. }) if s_now == side
                         );
-                        let l1_cushion_lots = match side {
-                            Side::Bid => snap.bids[0].qty.0,
-                            Side::Ask => snap.asks[0].qty.0,
+                        let (own_q, opp_q) = match side {
+                            Side::Bid => (snap.bids[0].qty.0.max(0), snap.asks[0].qty.0.max(0)),
+                            Side::Ask => (snap.asks[0].qty.0.max(0), snap.bids[0].qty.0.max(0)),
                         };
-                        if post_only_crossed || !signal_still_valid || l1_cushion_lots < 15 {
+                        let tot_q = (own_q + opp_q).max(1);
+                        let tfi_exc =
+                            (snap.factor_tfi.get().abs() - snap.factor_ofi.get().abs()).max(0.0);
+                        let max_q_permille = 720 + ((tfi_exc * 100.0) as i64).min(60);
+                        let queue_wall_blocked = (own_q * 1_000) / tot_q > max_q_permille;
+                        if post_only_crossed
+                            || !signal_still_valid
+                            || own_q < 15
+                            || queue_wall_blocked
+                        {
                             fsm.state = OrderLifecycleState::Idle;
                             arena.exec_state_code.store(0, Ordering::Release);
                             continue;
