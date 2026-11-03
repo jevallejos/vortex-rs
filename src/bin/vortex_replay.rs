@@ -328,6 +328,8 @@ fn replay_captured_live_parquet_segments() {
     let mut fifo_sim = FifoQueueSimulator::new();
     let mut btc_leader_snap = SymbolLobSnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
+    let mut learned_vol_5m_bps = [6_000_i64; 6];
+    let mut prev_mid_ticks = [0_i64; 6];
     let mut active_sym = SymbolId(0);
     let mut active_slot: usize = 0;
     let mut verified_files: u64 = 0;
@@ -360,7 +362,22 @@ fn replay_captured_live_parquet_segments() {
                             ts_local_ns: row.ts_local_ns,
                             mark_price: row.mark_price_ticks,
                             last_trade_price: row.price_ticks,
-                            realized_vol_5m: ScaledBps::from_whole_bps(60),
+                            realized_vol_5m: {
+                                let mid_t = (row.best_bid_ticks.0 + row.best_ask_ticks.0) / 2;
+                                if prev_mid_ticks[slot_idx] > 0 && mid_t > 0 {
+                                    let dt = (mid_t - prev_mid_ticks[slot_idx]).abs();
+                                    if dt > 0 {
+                                        let imp = ((dt * 1_000_000) / mid_t.max(1) * 220)
+                                            .clamp(3_800, 12_500);
+                                        learned_vol_5m_bps[slot_idx] =
+                                            (learned_vol_5m_bps[slot_idx] * 96 + imp * 4) / 100;
+                                    }
+                                }
+                                if mid_t > 0 {
+                                    prev_mid_ticks[slot_idx] = mid_t;
+                                }
+                                ScaledBps(learned_vol_5m_bps[slot_idx])
+                            },
                             factor_ofi: BoundedScore::new_clamped(f64::from(row.ofi_bps) / 10_000.0),
                             factor_tfi: BoundedScore::new_clamped(f64::from(row.tfi_bps) / 10_000.0),
                             factor_geom: BoundedScore::new_clamped(f64::from(row.geom_bps) / 10_000.0),

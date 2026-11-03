@@ -262,10 +262,10 @@ fn process_bybit_ws_frame(
                     let inst_move_scaled_bps =
                         (delta_ticks.saturating_mul(1_000_000)) / mid.0.max(1);
                     let projected_5m_vol =
-                        (inst_move_scaled_bps.saturating_mul(240)).clamp(5_500, 7_800);
-                    let prev_vol = snap.realized_vol_5m.raw().max(5_800);
+                        (inst_move_scaled_bps.saturating_mul(220)).clamp(3_800, 12_500);
+                    let prev_vol = snap.realized_vol_5m.raw().clamp(3_800, 12_500);
                     snap.realized_vol_5m =
-                        ScaledBps(((prev_vol * 95) + (projected_5m_vol * 5)) / 100);
+                        ScaledBps(((prev_vol * 96) + (projected_5m_vol * 4)) / 100);
                 }
             }
             snap.mark_price = mid;

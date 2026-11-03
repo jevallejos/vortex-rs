@@ -608,9 +608,9 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
         ANSI_GREEN, ANSI_RESET
     );
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 STAGE 31.1 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
+        "🟢 [VORTEX-L2 STAGE 36.0 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
     } else {
-        "🟢 [VORTEX-L2 STAGE 31.1 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟢 [VORTEX-L2 STAGE 36.0 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
     thread::spawn(move || {
@@ -1417,7 +1417,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             }
                             let spec = APPROVED_SPECS[active_slot];
                             let sl_dist_ticks =
-                                ((entry_price.0 * 5_200) / 1_000_000).max(4);
+                                ((entry_price.0 * ((snap.realized_vol_5m.raw().clamp(3_500, 12_500) * 38) / 100 + (fsm.learned_mfe_ewma_bps.clamp(560, 1_600) * 8) / 100).clamp(2_400, 3_600)) / 1_000_000).max(4);
                             let sl_trig = match side {
                                 Side::Bid => PriceTicks(entry_price.0 - sl_dist_ticks),
                                 Side::Ask => PriceTicks(entry_price.0 + sl_dist_ticks),

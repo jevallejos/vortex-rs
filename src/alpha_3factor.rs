@@ -180,6 +180,18 @@ impl OrthogonalFactorState {
             self.last_ofi = BoundedScore::new_clamped(blended_ofi);
             self.prev_bids = cur_bids;
             self.prev_asks = cur_asks;
+
+            // Continuous L2-clocked Hawkes decay on TFI accumulators so stale trade bursts fade:
+            self.tfi_buy_accum *= 0.985;
+            self.tfi_sell_accum *= 0.985;
+            let tfi_total = self.tfi_buy_accum + self.tfi_sell_accum;
+            if tfi_total <= 1e-6 {
+                self.last_tfi = BoundedScore::ZERO;
+            } else {
+                self.last_tfi = BoundedScore::new_clamped(
+                    (self.tfi_buy_accum - self.tfi_sell_accum) / tfi_total,
+                );
+            }
         }
 
         // Factor 3: Liquidity Geometry & Vacuum Ratio across L1..L10 penalized by spread in ticks
@@ -245,8 +257,13 @@ impl OrthogonalFactorState {
             return Ok(SignalVerdict::NeutralNoAction);
         }
 
-        let long_aligned = x_ofi > 0.25 && x_tfi > 0.20 && x_geom > 0.10;
-        let short_aligned = x_ofi < -0.25 && x_tfi < -0.20 && x_geom < -0.10;
+        let l1_bid_q = best_bid.qty.0.max(1) as f64;
+        let l1_ask_q = best_ask.qty.0.max(1) as f64;
+        let stoikov_l1_imb = (l1_bid_q - l1_ask_q) / (l1_bid_q + l1_ask_q);
+        let long_aligned =
+            x_ofi > 0.25 && x_tfi > 0.20 && x_geom > 0.10 && stoikov_l1_imb >= -0.35;
+        let short_aligned =
+            x_ofi < -0.25 && x_tfi < -0.20 && x_geom < -0.10 && stoikov_l1_imb <= 0.35;
         if !long_aligned && !short_aligned {
             return Ok(SignalVerdict::NeutralNoAction);
         }

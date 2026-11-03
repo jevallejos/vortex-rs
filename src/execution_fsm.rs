@@ -374,8 +374,14 @@ impl ExecutionFsm {
             Side::Bid => best_bid.price,
             Side::Ask => best_ask.price,
         };
-        let sl_distance_ticks =
-            ((entry_price.0 * SERVER_SL_DISTANCE_SCALED_BPS) / 1_000_000).max(4);
+        let vol_raw = snap.realized_vol_5m.raw().clamp(3_500, 12_500);
+        let learned_raw = self.learned_mfe_ewma_bps.clamp(560, 1_600);
+        let elastic_sl_bps = if vol_raw == 5_000 {
+            SERVER_SL_DISTANCE_SCALED_BPS
+        } else {
+            ((vol_raw * 38) / 100 + (learned_raw * 8) / 100).clamp(2_400, 3_600)
+        };
+        let sl_distance_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
             Side::Ask => PriceTicks(entry_price.0 + sl_distance_ticks),
@@ -436,23 +442,35 @@ impl ExecutionFsm {
             let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
             let ttl_expired = elapsed_ns >= MAX_RESTING_QUEUE_TTL_NS;
             let residence_satisfied = elapsed_ns >= MIN_QUEUE_RESIDENCE_NS;
-            let early_fade_ready = elapsed_ns >= 800_000_000;
-            let flow_faded = match side {
-                Side::Bid => {
-                    (residence_satisfied && ofi <= 0.05 && tfi <= 0.0)
-                        || (early_fade_ready && ofi <= 0.12 && tfi <= 0.05)
-                }
-                Side::Ask => {
-                    (residence_satisfied && ofi >= -0.05 && tfi >= 0.0)
-                        || (early_fade_ready && ofi >= -0.12 && tfi >= -0.05)
-                }
-            };
-            let joint_flow_reversal = flow_faded || match side {
-                Side::Bid => ofi <= -0.12 && tfi <= -0.15,
-                Side::Ask => ofi >= 0.12 && tfi >= 0.15,
-            };
+            let early_fade_ready = elapsed_ns >= 450_000_000;
+            let l1_bid_q = snap.bids[0].qty.0.max(1) as f64;
+            let l1_ask_q = snap.asks[0].qty.0.max(1) as f64;
+            let stoikov_l1_imb = (l1_bid_q - l1_ask_q) / (l1_bid_q + l1_ask_q);
+            let l1_queue_collapsed = early_fade_ready
+                && match side {
+                    Side::Bid => stoikov_l1_imb <= -0.42 && ofi <= 0.08,
+                    Side::Ask => stoikov_l1_imb >= 0.42 && ofi >= -0.08,
+                };
+            let flow_faded = l1_queue_collapsed
+                || match side {
+                    Side::Bid => {
+                        (residence_satisfied && ofi <= 0.05 && tfi <= 0.0)
+                            || (early_fade_ready && ofi <= 0.12 && tfi <= 0.05)
+                    }
+                    Side::Ask => {
+                        (residence_satisfied && ofi >= -0.05 && tfi >= 0.0)
+                            || (early_fade_ready && ofi >= -0.12 && tfi >= -0.05)
+                    }
+                };
+            let joint_flow_reversal = flow_faded
+                || match side {
+                    Side::Bid => ofi <= -0.10 && tfi <= -0.12,
+                    Side::Ask => ofi >= 0.10 && tfi >= 0.12,
+                };
+            let vol_5m = snap.realized_vol_5m.raw().clamp(3_500, 12_500);
+            let elastic_runaway_bps = (vol_5m / 18).clamp(280, 420);
             let runaway_allowance_ticks =
-                ((entry_price.0 * BBO_RUNAWAY_SCALED_BPS) / 1_000_000).max(3);
+                ((entry_price.0 * elastic_runaway_bps) / 1_000_000).max(3);
             let bbo_runaway = if residence_satisfied {
                 match snap.bbo_and_spread_ticks() {
                     Some((best_bid, best_ask, _)) => match side {
@@ -464,7 +482,6 @@ impl ExecutionFsm {
             } else {
                 false
             };
-
             if joint_flow_reversal || ttl_expired || bbo_runaway {
                 self.state = OrderLifecycleState::Idle;
                 return true;
@@ -697,14 +714,25 @@ impl ExecutionFsm {
                     || (elapsed_secs >= elastic_win_horizon_secs
                         && !strong_trend_continuation
                         && current_gross_bps.raw() >= elastic_harvest_floor));
+            let never_reached_green = peak_gross_bps.raw() < zero_loss_scratch_floor;
+            let trapped_breakeven_floor = if never_reached_green && elapsed_secs >= 105 {
+                let overtime = (elapsed_secs - 105).clamp(0, 75);
+                (fee_barrier_bps + 5 - (overtime * 5)).clamp(50, fee_barrier_bps + 5)
+            } else {
+                fee_barrier_bps + 5
+            };
             let zombie_breakeven_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= 120_000_000_000
-                && ofi_reversed
-                && current_gross_bps.raw() >= zero_loss_scratch_floor;
+                && ((hold_elapsed >= 95_000_000_000
+                    && never_reached_green
+                    && ofi_reversed
+                    && current_gross_bps.raw() >= trapped_breakeven_floor)
+                    || (hold_elapsed >= 120_000_000_000
+                        && ofi_reversed
+                        && current_gross_bps.raw() >= trapped_breakeven_floor));
             let stagnant_unwind = struggling_rescue
                 || zombie_breakeven_escape
                 || (hold_elapsed >= STAGNANT_PROFIT_HOLD_NS
-                    && current_gross_bps.raw() >= zero_loss_scratch_floor);
+                    && current_gross_bps.raw() >= trapped_breakeven_floor);
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
                 let convex_ratchet_floor = if peak_gross_bps.raw() > 1_150 {
                     fee_barrier_bps + ((peak_gross_bps.raw() - fee_barrier_bps) * 70) / 100
@@ -854,12 +882,31 @@ impl ExecutionFsm {
         entry_price: PriceTicks,
         candidate_exit: PriceTicks,
     ) -> PriceTicks {
-        Self::clamp_defensive_zero_loss_floor(side, entry_price, candidate_exit)
+        let min_step_px = match side {
+            Side::Bid => PriceTicks(entry_price.0 + 1),
+            Side::Ask => {
+                let p = entry_price.0 - 1;
+                PriceTicks(if p > 1 { p } else { 1 })
+            }
+        };
+        match side {
+            Side::Bid => {
+                if candidate_exit.0 > min_step_px.0 {
+                    candidate_exit
+                } else {
+                    min_step_px
+                }
+            }
+            Side::Ask => {
+                if candidate_exit.0 > 0 && candidate_exit.0 < min_step_px.0 {
+                    candidate_exit
+                } else {
+                    min_step_px
+                }
+            }
+        }
     }
 
-    /// Clamps an aged zombie position to the defensive zero-loss floor.
-    #[inline]
-    #[must_use]
     pub const fn clamp_zombie_evacuation_floor(
         side: Side,
         entry_price: PriceTicks,
