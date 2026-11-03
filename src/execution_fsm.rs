@@ -1,7 +1,7 @@
 //! Exhaustive Finite-State Machine (`OrderLifecycleState`) for Bybit UTA V5 execution:
 //! 100% `Limit PostOnly` normal exits, Two-Zone Dynamic 70% MFE Trailing Ratchet,
 //! Strict 1.50s Anti-Burst Queue Residence Floor, Zero Premature Micro-Scratches,
-//! Structural `-52.00 bps` Server `MarkPrice` Stop-Loss, and `HMAC-SHA256` Signer.
+//! Elastic Volatility Server `MarkPrice` Stop-Loss, and `HMAC-SHA256` Signer.
 
 use crate::alpha_3factor::SignalVerdict;
 use crate::forensic_parquet::ParitySyncLedger;
@@ -433,33 +433,26 @@ impl ExecutionFsm {
             let elapsed_ns = snap.ts_local_ns.0.saturating_sub(resting_since_ts.0);
             let ttl_expired = elapsed_ns >= MAX_RESTING_QUEUE_TTL_NS;
             let residence_satisfied = elapsed_ns >= MIN_QUEUE_RESIDENCE_NS;
-            let early_fade_ready = elapsed_ns >= 450_000_000;
             let l1_bid_q = snap.bids[0].qty.0.max(1) as f64;
             let l1_ask_q = snap.asks[0].qty.0.max(1) as f64;
             let stoikov_l1_imb = (l1_bid_q - l1_ask_q) / (l1_bid_q + l1_ask_q);
-            let l1_queue_collapsed = early_fade_ready
+            let l1_queue_collapsed = residence_satisfied
                 && match side {
-                    Side::Bid => stoikov_l1_imb <= -0.42 && ofi <= 0.08,
-                    Side::Ask => stoikov_l1_imb >= 0.42 && ofi >= -0.08,
+                    Side::Bid => stoikov_l1_imb <= -0.45 && ofi <= 0.0,
+                    Side::Ask => stoikov_l1_imb >= 0.45 && ofi >= 0.0,
                 };
             let flow_faded = l1_queue_collapsed
                 || match side {
-                    Side::Bid => {
-                        (residence_satisfied && ofi <= 0.05 && tfi <= 0.0)
-                            || (early_fade_ready && ofi <= 0.12 && tfi <= 0.05)
-                    }
-                    Side::Ask => {
-                        (residence_satisfied && ofi >= -0.05 && tfi >= 0.0)
-                            || (early_fade_ready && ofi >= -0.12 && tfi >= -0.05)
-                    }
+                    Side::Bid => residence_satisfied && ofi <= 0.05 && tfi <= 0.0,
+                    Side::Ask => residence_satisfied && ofi >= -0.05 && tfi >= 0.0,
                 };
             let joint_flow_reversal = flow_faded
                 || match side {
-                    Side::Bid => ofi <= -0.10 && tfi <= -0.12,
-                    Side::Ask => ofi >= 0.10 && tfi >= 0.12,
+                    Side::Bid => ofi <= -0.20 && tfi <= -0.25,
+                    Side::Ask => ofi >= 0.20 && tfi >= 0.25,
                 };
-            let vol_5m = snap.realized_vol_5m.raw().clamp(3_500, 12_500);
-            let elastic_runaway_bps = (vol_5m / 18).clamp(280, 420);
+            let vol_5m = snap.realized_vol_5m.raw().clamp(5_500, 7_800);
+            let elastic_runaway_bps = (vol_5m / 18).clamp(320, 420);
             let runaway_allowance_ticks =
                 ((entry_price.0 * elastic_runaway_bps) / 1_000_000).max(3);
             let bbo_runaway = if residence_satisfied {
@@ -547,7 +540,7 @@ impl ExecutionFsm {
             snap.mark_price
         };
 
-        // 1. Catastrophic server-side MarkPrice Stop-Loss (-52.00 bps)
+        // 1. Elastic server-side MarkPrice Stop-Loss
         let sl_hit = match side {
             Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= sl_trigger_price.0,
             Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= sl_trigger_price.0,

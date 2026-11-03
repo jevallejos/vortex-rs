@@ -291,54 +291,6 @@ fn replay_captured_live_parquet_segments() {
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
     let mut ledger = ParitySyncLedger::new(10_000_000_000);
-    if let Ok(shadow_file) = std::fs::File::open("data/vortex_shadow_trades.jsonl") {
-        use std::io::{BufRead, BufReader};
-        let reader = BufReader::new(shadow_file);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-                let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
-                let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
-                let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
-                let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let net_scaled = (net_bps * 100.0).round() as i64;
-                let fee_scaled = if is_maker { 400 } else { 750 };
-                let gross_scaled = net_scaled + fee_scaled;
-                if is_maker {
-                    if gross_scaled >= 440 {
-                        fsm.learned_mfe_ewma_bps = ((fsm.learned_mfe_ewma_bps * 80)
-                            + (gross_scaled.min(2_400) * 20))
-                            / 100;
-                        fsm.learned_mfe_ewma_bps = fsm.learned_mfe_ewma_bps.clamp(560, 1_600);
-                    }
-                } else {
-                    fsm.learned_mfe_ewma_bps = (fsm.learned_mfe_ewma_bps - 80).clamp(560, 1_600);
-                }
-                let slot_opt = match sym_str {
-                    "BTCUSDT" => Some(0),
-                    "ETHUSDT" => Some(1),
-                    "SOLUSDT" => Some(2),
-                    "AVAXUSDT" => Some(3),
-                    "TAOUSDT" => Some(4),
-                    "SUIUSDT" => Some(5),
-                    _ => None,
-                };
-                if let Some(s_idx) = slot_opt {
-                    let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
-                    let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                    let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                    adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
-                    adaptive_gov.observe_closed_trade(
-                        s_idx,
-                        s_side,
-                        ScaledBps(net_scaled),
-                        is_maker,
-                        TimestampNs(ts_saved),
-                    );
-                }
-            }
-        }
-    }
     let mut fifo_sim = FifoQueueSimulator::new();
     let mut btc_leader_snap = SymbolLobSnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
@@ -380,15 +332,11 @@ fn replay_captured_live_parquet_segments() {
                                 let mid_t = (row.best_bid_ticks.0 + row.best_ask_ticks.0) / 2;
                                 if prev_mid_ticks[slot_idx] > 0 && mid_t > 0 {
                                     let dt = (mid_t - prev_mid_ticks[slot_idx]).abs();
-                                    let prev_v = learned_vol_5m_bps[slot_idx].clamp(4_200, 9_200);
                                     if dt > 0 {
-                                        let imp = ((dt * 1_000_000) / mid_t.max(1) * 180)
-                                            .clamp(4_200, 9_200);
+                                        let prev_v = learned_vol_5m_bps[slot_idx].clamp(5_600, 7_800);
+                                        let imp = (5_600 + dt.saturating_mul(350)).clamp(5_600, 7_800);
                                         learned_vol_5m_bps[slot_idx] =
-                                            (prev_v * 95 + imp * 5) / 100;
-                                    } else {
-                                        learned_vol_5m_bps[slot_idx] =
-                                            (prev_v * 99 + 6_000) / 100;
+                                            (prev_v * 96 + imp * 4) / 100;
                                     }
                                 }
                                 if mid_t > 0 {
@@ -513,23 +461,28 @@ fn replay_captured_live_parquet_segments() {
                                         Side::Bid => snap.factor_ofi.get() <= -0.10,
                                         Side::Ask => snap.factor_ofi.get() >= 0.10,
                                     };
-                                if toxic_sweep || fsm.check_resting_queue_abort(&snap) {
-                                    queue_aborts += 1;
-                                    fsm.state = OrderLifecycleState::Idle;
-                                    slot_cooldown_until_ns[active_slot] =
-                                        snap.ts_local_ns.0 + 15_000_000_000;
-                                    fifo_sim.state = SimulatedOrderState::Inactive;
-                                } else {
+                                if !toxic_sweep {
                                     fifo_sim.on_market_row(&row);
                                     if matches!(fifo_sim.state, SimulatedOrderState::FilledMaker { .. }) {
                                         let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
+                                        idx += 1;
+                                        continue;
                                     } else if matches!(
                                         fifo_sim.state,
                                         SimulatedOrderState::RejectedPostOnlyCross
                                     ) {
                                         fsm.state = OrderLifecycleState::Idle;
                                         fifo_sim.state = SimulatedOrderState::Inactive;
+                                        idx += 1;
+                                        continue;
                                     }
+                                }
+                                if toxic_sweep || fsm.check_resting_queue_abort(&snap) {
+                                    queue_aborts += 1;
+                                    fsm.state = OrderLifecycleState::Idle;
+                                    slot_cooldown_until_ns[active_slot] =
+                                        snap.ts_local_ns.0 + 15_000_000_000;
+                                    fifo_sim.state = SimulatedOrderState::Inactive;
                                 }
                             }
                             OrderLifecycleState::PositionOpenMakerExit { .. }

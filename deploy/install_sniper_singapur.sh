@@ -64,28 +64,29 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 EOF
 
+EXEC_MODE_FLAG="--live-capital"
+if [ "${1:-}" = "--paper-true" ]; then
+    EXEC_MODE_FLAG="--paper-true"
+fi
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Stage 36.2 Live Capital)
+Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Stage 36.3)
 After=vortex-tap.service
 Requires=vortex-tap.service
-
 [Service]
 Type=simple
 User=ubuntu
 WorkingDirectory=${VORTEX_DIR}
 EnvironmentFile=-${VORTEX_DIR}/.env
-ExecStart=${BIN_DIR}/vortex_exec --daemon --live-capital
+ExecStart=${BIN_DIR}/vortex_exec --daemon ${EXEC_MODE_FLAG}
 Restart=always
 RestartSec=2
 Nice=-15
 OOMScoreAdjust=-800
 LimitMEMLOCK=infinity
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
 sudo tee /usr/local/bin/vortex > /dev/null << 'VORTEX_CLI_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -160,7 +161,7 @@ sudo chmod +x /usr/local/bin/vortex
 sudo systemctl daemon-reload
 if [ "${1:-}" = "--no-start" ]; then
     sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
-    echo "[OK] VORTEX-L2 Stage 36.2 binaries installed and verified (Services kept in STOP mode)."
+    echo "[OK] VORTEX-L2 Stage 36.3 binaries installed and verified (Services kept in STOP mode)."
     exit 0
 fi
 sudo systemctl enable vortex-tap.service vortex-exec.service >/dev/null 2>&1 || true

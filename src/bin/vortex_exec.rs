@@ -199,7 +199,7 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 36.2 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Stage 36.3 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -619,9 +619,9 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
         ANSI_GREEN, ANSI_RESET
     );
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 STAGE 36.2 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
+        "🟢 [VORTEX-L2 STAGE 36.3 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
     } else {
-        "🟢 [VORTEX-L2 STAGE 36.2 — SHADOW MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟢 [VORTEX-L2 STAGE 36.3 — PAPER-TRUE LAB MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
     thread::spawn(move || {
@@ -1123,7 +1123,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
     let mut tracked_sym_on_startup: Option<&'static str> = None;
 
-    if saved_state_code == 2 || saved_state_code == 3 {
+    if (saved_state_code == 2 && live_client.is_some()) || saved_state_code == 3 {
         let slot_saved = (arena.exec_active_slot.load(Ordering::Acquire) as usize).min(APPROVED_SPECS.len() - 1);
         let sym_name = APPROVED_SPECS[slot_saved].symbol_id.name();
         let mut valid_to_restore = true;
@@ -1201,7 +1201,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 36.2 Stoikov L1 & Convex Ratchet & 5-Phase Anti-Zombie){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Stage 36.3 Stoikov L1 & Convex Ratchet & 5-Phase Anti-Zombie){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),
@@ -1355,10 +1355,11 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 Side::Bid => snap.factor_ofi.get() <= -0.10,
                                 Side::Ask => snap.factor_ofi.get() >= 0.10,
                             };
-
-                        let want_abort = toxic_sweep || fsm.check_resting_queue_abort(&snap);
+                        let paper_queue_filled =
+                            live_client.is_none() && (resting_queue_ahead.0 == 0 || (level_swept && !toxic_sweep));
+                        let want_abort =
+                            !paper_queue_filled && (toxic_sweep || fsm.check_resting_queue_abort(&snap));
                         let mut filled_on_exchange_during_abort = false;
-
                         if want_abort {
                             if let Some(ref client) = live_client {
                                 client.cancel_all_symbol_orders(snap.symbol_id.name());
@@ -1367,7 +1368,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 if real_filled {
                                     filled_on_exchange_during_abort = true;
                                     println!(
-                                        "{}🟢 [BYBIT V5 FILL-ON-ABORT RECOVERED] {} {:?} filled on exchange before cancel arrived (open size={}) — managing position!{}",
+                                        "{}  [BYBIT V5 FILL-ON-ABORT RECOVERED] {} {:?} filled on exchange before cancel arrived (open size={})   managing position!{}", 
                                         ANSI_GREEN,
                                         snap.symbol_id.name(),
                                         side,
@@ -1376,7 +1377,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     );
                                 }
                             }
-
                             if !filled_on_exchange_during_abort {
                                 fsm.state = OrderLifecycleState::Idle;
                                 slot_cooldown_until_ns[active_slot] =
@@ -1385,7 +1385,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 arena.exec_state_code.store(0, Ordering::Release);
                                 arena.exec_queue_ahead_lots.store(0, Ordering::Release);
                                 println!(
-                                    "{}🟠 [QUEUE ABORT] {} {:?} canceled before fill (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | BestAsk: {} | Entry: {} | 15s Slot Cooldown){}",
+                                    "{}  [QUEUE ABORT] {} {:?} canceled before fill (OFI: {:+.2} | TFI: {:+.2} | BestBid: {} | BestAsk: {} | Entry: {} | 15s Slot Cooldown){}", 
                                     ANSI_ORANGE,
                                     snap.symbol_id.name(),
                                     side,
@@ -1399,7 +1399,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 continue;
                             }
                         }
-
                         if filled_on_exchange_during_abort || level_swept || resting_queue_ahead.0 == 0 {
                             if !filled_on_exchange_during_abort {
                                 if let Some(ref client) = live_client {
@@ -1424,7 +1423,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         continue;
                                     }
                                     println!(
-                                        "{}  [BYBIT V5 REAL FILL CONFIRMED] {} {:?} size={}{}",
+                                        "{}  [BYBIT V5 REAL FILL CONFIRMED] {} {:?} size={}{}", 
                                         ANSI_GREEN,
                                         snap.symbol_id.name(),
                                         side,
