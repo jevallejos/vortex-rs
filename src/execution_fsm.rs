@@ -492,8 +492,7 @@ impl ExecutionFsm {
             ..
         } = self.state
         {
-            let learned_tp_floor = (self.learned_mfe_ewma_bps * 4).clamp(3_500, 6_500);
-            let capped_tp_bps = target_excursion.raw().max(learned_tp_floor).clamp(3_500, 6_500);
+            let capped_tp_bps = target_excursion.raw().clamp(3_500, 6_500);
             let tp_delta_ticks =
                 ((entry_price.0 * capped_tp_bps) / 1_000_000).max(2);
             let tp_maker_price = match side {
