@@ -724,7 +724,11 @@ impl ExecutionFsm {
             let elastic_decay_span_secs = (elastic_win_horizon_secs * 3) / 2;
             let elastic_zombie_ns =
                 (elastic_decay_span_secs * 1_100_000_000).clamp(90_000_000_000, 150_000_000_000);
-            let allowed_base_floor = if hold_elapsed >= elastic_zombie_ns && !strong_trend_continuation {
+            let adverse_regime = joint_adverse
+                || deep_joint_adverse
+                || flow_conviction <= -0.12
+                || (hold_elapsed >= elastic_zombie_ns && !strong_trend_continuation);
+            let allowed_base_floor = if adverse_regime {
                 zero_loss_scratch_floor
             } else {
                 structural_win_floor
@@ -771,7 +775,7 @@ impl ExecutionFsm {
                 && current_gross_bps.raw() >= elastic_harvest_floor;
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= elastic_scratch_ns
-                && current_gross_bps.raw() >= structural_win_floor
+                && current_gross_bps.raw() >= allowed_base_floor
                 && deep_joint_adverse;
             let struggling_rescue = !in_trend_free_ride_zone
                 && ((hold_elapsed >= elastic_struggle_ns
@@ -809,7 +813,7 @@ impl ExecutionFsm {
                 peak_gross_bps.raw() >= active_win_floor
                     && hold_elapsed >= impulse_immunity_ns
                     && flow_conviction <= -0.12
-                    && current_gross_bps.raw() >= structural_win_floor
+                    && current_gross_bps.raw() >= allowed_base_floor
                     && current_gross_bps.raw() <= convex_ratchet_floor
             };
             if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {
@@ -1251,7 +1255,12 @@ impl OnlineAdaptiveGovernor {
         }
         let d = Self::dir_idx(side);
         let en_1e4 = entry_ticks.saturating_mul(10_000);
-        if self.wave_anchor_px_1e4[slot_idx][d] <= 0 {
+        let prev_anc = self.wave_anchor_px_1e4[slot_idx][d];
+        let wider_origin = match side {
+            Side::Bid => en_1e4 < prev_anc,
+            Side::Ask => en_1e4 > prev_anc,
+        };
+        if prev_anc <= 0 || wider_origin {
             self.wave_anchor_px_1e4[slot_idx][d] = en_1e4;
         }
         self.wave_anchor_px_1e4[slot_idx][1 - d] = 0;
