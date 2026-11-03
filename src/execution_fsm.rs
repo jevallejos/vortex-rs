@@ -851,18 +851,6 @@ impl ExecutionFsm {
         }
     }
 
-    /// Elastic Maker evacuation clamp for aged/trapped positions (< 405 ScaledBps):
-    /// guarantees at least 360 ScaledBps (+3.60 bps gross = -0.40 bps net SCRATCH)
-    /// so passive exits never cross into LOSS (< -0.50 bps net) on BTC or ETH.
-    #[inline]
-    #[must_use]
-    pub const fn clamp_distressed_maker_evacuation_floor(
-        side: Side,
-        entry_price: PriceTicks,
-        candidate_exit: PriceTicks,
-    ) -> PriceTicks {
-        Self::clamp_defensive_zero_loss_floor(side, entry_price, candidate_exit)
-    }
 
     /// Clamps a standard zombie position to the 440 ScaledBps defensive zero-loss floor.
     #[inline]
@@ -1059,6 +1047,8 @@ pub struct OnlineAdaptiveGovernor {
     last_price_sample_ts_ns: [i64; 6],
     wave_anchor_px_1e4: [[i64; 2]; 6],
     wave_anchor_ts_ns: [[i64; 2]; 6],
+    wave_step_count: [[u32; 2]; 6],
+    last_sl_ts_ns: i64,
 }
 
 impl Default for OnlineAdaptiveGovernor {
@@ -1089,6 +1079,8 @@ impl OnlineAdaptiveGovernor {
             last_price_sample_ts_ns: [0; 6],
             wave_anchor_px_1e4: [[0; 2]; 6],
             wave_anchor_ts_ns: [[0; 2]; 6],
+            wave_step_count: [[0; 2]; 6],
+            last_sl_ts_ns: 0,
         }
     }
 
@@ -1119,6 +1111,7 @@ impl OnlineAdaptiveGovernor {
         }
         self.wave_anchor_px_1e4[slot_idx][1 - d] = 0;
         self.wave_anchor_ts_ns[slot_idx][1 - d] = 0;
+        self.wave_step_count[slot_idx][1 - d] = 0;
     }
 
     /// Updates 1Hz physical-clock fast (`20s`) and slow macro (`300s`) price EWMAs in `1e4` fixed-point scale.
@@ -1242,12 +1235,23 @@ impl OnlineAdaptiveGovernor {
             };
             if (self.win_streak[slot_idx][d] >= 2 && chased_bps > 2_500)
                 || (self.win_streak[slot_idx][d] >= 1 && chased_bps > 3_500)
+                || (slot_idx == 0 && self.wave_step_count[slot_idx][d] >= 2 && chased_bps > 2_500)
             {
                 return Some("VETO_WAVE_STAIRCASE_25BPS");
             }
         }
         if self.sl_streak[slot_idx][d] >= 1 && self.cum_net_bps_x100[slot_idx][d] <= -4_500 {
             return Some("VETO_DEEP_SCAR_DEBT_QUARANTINE");
+        }
+        let symbol_total_net =
+            self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
+        if slot_idx == 0
+            && self.global_dir_sl_streak[d] >= 1
+            && self.global_dir_sl_streak[1 - d] >= 1
+            && self.last_global_win_dir == ((1 - d) as u8)
+            && symbol_total_net <= -4_500
+        {
+            return Some("VETO_POST_SL_OPPOSITE_DOMINANCE");
         }
 
         if slot_idx > 0 {
@@ -1256,14 +1260,27 @@ impl OnlineAdaptiveGovernor {
             {
                 return Some("VETO_ALTCOIN_COUNTER_CASCADE");
             }
-            if self.global_dir_sl_streak[d] >= 1 && self.last_global_win_dir == ((1 - d) as u8) {
+            let fresh_opp_sl_whipsaw = self.global_dir_sl_streak[1 - d] == 1
+                && check_ts_ns.saturating_sub(self.last_sl_ts_ns) <= 60_000_000_000
+                && self.global_dir_debt_bps_x100[1 - d] <= -4_500
+                && self.global_dir_debt_bps_x100[1 - d] >= -6_500;
+            if (self.global_dir_sl_streak[d] >= 1 && self.last_global_win_dir == ((1 - d) as u8))
+                || fresh_opp_sl_whipsaw
+            {
                 return Some("VETO_POST_SL_OPPOSITE_DOMINANCE");
             }
-            let symbol_total_net =
-                self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
+            let chased_alt_bps = if anchor_1e4 > 0 && cur_1e4 > 0 {
+                match side {
+                    Side::Bid => ((cur_1e4 - anchor_1e4).saturating_mul(1_000_000)) / anchor_1e4,
+                    Side::Ask => ((anchor_1e4 - cur_1e4).saturating_mul(1_000_000)) / anchor_1e4,
+                }
+            } else {
+                0
+            };
             if symbol_total_net <= -2_500
                 && self.global_dir_debt_bps_x100[d] <= -10_000
-                && self.cum_net_bps_x100[slot_idx][d] <= 0
+                && (self.cum_net_bps_x100[slot_idx][d] <= 0
+                    || (self.global_dir_sl_streak[d] >= 3 && chased_alt_bps > 1_800))
             {
                 return Some("VETO_SYMBOL_AND_GLOBAL_DEBT_CONTAGION");
             }
@@ -1299,9 +1316,11 @@ impl OnlineAdaptiveGovernor {
             let s = self.sl_streak[slot_idx][d].saturating_add(1).min(4);
             self.sl_streak[slot_idx][d] = s;
             self.win_streak[slot_idx][d] = 0;
+            self.wave_step_count[slot_idx][d] = 0;
             self.global_dir_win_streak[d] = 0;
             self.wave_anchor_px_1e4[slot_idx][d] = 0;
             self.wave_anchor_ts_ns[slot_idx][d] = 0;
+            self.last_sl_ts_ns = ts_ns.0;
             let backoff_ns = 150_000_000_000_i64.saturating_mul(1_i64 << s.min(4));
             self.directional_cooldown_until_ns[slot_idx][d] = ts_ns.0.saturating_add(backoff_ns);
 
@@ -1311,6 +1330,7 @@ impl OnlineAdaptiveGovernor {
             self.global_dir_cooldown_until_ns[d] = ts_ns.0.saturating_add(global_pause_ns);
         } else if net_scaled_bps.raw() <= 0 {
             self.win_streak[slot_idx][d] = 0;
+            self.wave_step_count[slot_idx][d] = 0;
             self.global_dir_win_streak[d] = 0;
             let scratch_cooldown_ns = ts_ns.0.saturating_add(120_000_000_000);
             if scratch_cooldown_ns > self.directional_cooldown_until_ns[slot_idx][d] {
@@ -1319,6 +1339,7 @@ impl OnlineAdaptiveGovernor {
         } else if net_scaled_bps.raw() < 100 {
             // Honest SCRATCH (+0.01 to +0.99 bps net defensive rescue): never inflate win_streak,
             // and never wipe existing win_streak so VETO_WAVE_STAIRCASE_25BPS stays armed!
+            self.wave_step_count[slot_idx][d] = self.wave_step_count[slot_idx][d].saturating_add(1);
             self.last_global_win_dir = d as u8;
             let rescue_cooldown_ns = ts_ns.0.saturating_add(90_000_000_000);
             if rescue_cooldown_ns > self.directional_cooldown_until_ns[slot_idx][d] {
@@ -1328,6 +1349,7 @@ impl OnlineAdaptiveGovernor {
             let w = self.win_streak[slot_idx][d].saturating_add(1);
             self.win_streak[slot_idx][d] = w;
             self.win_streak[slot_idx][1 - d] = 0;
+            self.wave_step_count[slot_idx][d] = self.wave_step_count[slot_idx][d].saturating_add(1);
 
             let gw = self.global_dir_win_streak[d].saturating_add(1);
             self.global_dir_win_streak[d] = gw;

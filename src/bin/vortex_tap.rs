@@ -259,9 +259,9 @@ fn process_bybit_ws_frame(
             if snap.mark_price.0 > 0 && mid.0 > 0 {
                 let delta_ticks = (mid.0 - snap.mark_price.0).abs();
                 if delta_ticks > 0 {
-                    let prev_vol = snap.realized_vol_5m.raw().clamp(5_600, 6_800);
+                    let prev_vol = snap.realized_vol_5m.raw().clamp(4_200, 11_500);
                     let inst_bps = (delta_ticks.saturating_mul(1_000_000)) / mid.0.max(1);
-                    let target_vol = (5_800 + inst_bps.saturating_mul(18)).clamp(5_600, 6_800);
+                    let target_vol = (5_800 + inst_bps.saturating_mul(18)).clamp(4_200, 11_500);
                     snap.realized_vol_5m =
                         ScaledBps(((prev_vol * 96) + (target_vol * 4)) / 100);
                 }

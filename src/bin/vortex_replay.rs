@@ -377,9 +377,9 @@ fn replay_captured_live_parquet_segments() {
                                 if prev_mid_ticks[slot_idx] > 0 && mid_t > 0 {
                                     let dt = (mid_t - prev_mid_ticks[slot_idx]).abs();
                                     if dt > 0 {
-                                        let prev_v = learned_vol_5m_bps[slot_idx].clamp(5_600, 6_800);
+                                        let prev_v = learned_vol_5m_bps[slot_idx].clamp(4_200, 11_500);
                                         let inst_bps = (dt.saturating_mul(1_000_000)) / mid_t.max(1);
-                                        let imp = (5_800 + inst_bps.saturating_mul(18)).clamp(5_600, 6_800);
+                                        let imp = (5_800 + inst_bps.saturating_mul(18)).clamp(4_200, 11_500);
                                         learned_vol_5m_bps[slot_idx] =
                                             (prev_v * 96 + imp * 4) / 100;
                                     }
@@ -538,14 +538,8 @@ fn replay_captured_live_parquet_segments() {
                                                 summary.entry_price,
                                                 summary.exit_price,
                                             )
-                                        } else if summary.gross_scaled_bps.raw() >= 405 {
-                                            ExecutionFsm::clamp_defensive_zero_loss_floor(
-                                                summary.side,
-                                                summary.entry_price,
-                                                summary.exit_price,
-                                            )
                                         } else {
-                                            ExecutionFsm::clamp_distressed_maker_evacuation_floor(
+                                            ExecutionFsm::clamp_defensive_zero_loss_floor(
                                                 summary.side,
                                                 summary.entry_price,
                                                 summary.exit_price,
