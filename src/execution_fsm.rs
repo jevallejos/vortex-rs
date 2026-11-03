@@ -631,7 +631,8 @@ impl ExecutionFsm {
                 ((vol_5m / 10) + ((learned_mfe - 720) / 6)).clamp(580, 780);
             let adaptive_base_target =
                 ((elastic_vol_floor_bps * 55) + (learned_mfe.clamp(560, 920) * 45)) / 100;
-            let in_trend_free_ride_zone = peak_gross_bps.raw() > 800;
+            let elastic_free_ride_bps = (adaptive_base_target + (vol_5m / 45)).clamp(740, 860);
+            let in_trend_free_ride_zone = peak_gross_bps.raw() > elastic_free_ride_bps;
 
             self.last_peak_gross_bps = peak_gross_bps.raw();
             let (signed_ofi, signed_tfi) = match side {
@@ -716,23 +717,22 @@ impl ExecutionFsm {
             } else {
                 0
             };
+            let net_peak = (peak_gross_bps.raw() - fee_barrier_bps).max(0);
+            let half_sat_bps = ((elastic_vol_floor_bps * 22) + (learned_mfe * 22)) / 100;
+            let ret_permille = 350 + (410 * net_peak) / (net_peak + half_sat_bps.max(1));
+            let convex_ratchet_floor = (fee_barrier_bps
+                + (net_peak * ret_permille) / 1_000
+                - flow_conviction_bonus)
+                .max(active_win_floor);
             let mfe_ratchet_unwind = if in_trend_free_ride_zone {
-                let net_peak = (peak_gross_bps.raw() - fee_barrier_bps).max(0);
-                let half_sat_bps = ((elastic_vol_floor_bps * 22) + (learned_mfe * 22)) / 100;
-                let ret_permille =
-                    350 + (410 * net_peak) / (net_peak + half_sat_bps.max(1));
-                let convex_ratchet_floor = (fee_barrier_bps
-                    + (net_peak * ret_permille) / 1_000
-                    - flow_conviction_bonus)
-                    .max(600);
-                current_gross_bps.raw() >= 580
+                current_gross_bps.raw() >= active_win_floor
                     && current_gross_bps.raw() <= convex_ratchet_floor
             } else {
-                peak_gross_bps.raw() >= 580
-                    && hold_elapsed >= 25_000_000_000
+                peak_gross_bps.raw() >= elastic_vol_floor_bps
+                    && hold_elapsed >= impulse_immunity_ns
                     && flow_conviction <= -0.12
-                    && current_gross_bps.raw() >= 500
-                    && current_gross_bps.raw() <= (peak_gross_bps.raw() * 82) / 100
+                    && current_gross_bps.raw() >= zero_loss_scratch_floor
+                    && current_gross_bps.raw() <= convex_ratchet_floor
             };
             if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {
                 return Some(self.finalize_close(
