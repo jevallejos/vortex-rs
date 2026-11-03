@@ -492,9 +492,8 @@ impl ExecutionFsm {
             ..
         } = self.state
         {
-            let learned_tp_target = (self.learned_mfe_ewma_bps * 3).clamp(2_200, 6_500);
-            let blended_tp_bps = ((target_excursion.raw() * 65) + (learned_tp_target * 35)) / 100;
-            let capped_tp_bps = blended_tp_bps.clamp(2_400, 6_500);
+            let learned_tp_floor = (self.learned_mfe_ewma_bps * 4).clamp(3_500, 6_500);
+            let capped_tp_bps = target_excursion.raw().max(learned_tp_floor).clamp(3_500, 6_500);
             let tp_delta_ticks =
                 ((entry_price.0 * capped_tp_bps) / 1_000_000).max(2);
             let tp_maker_price = match side {
@@ -746,9 +745,10 @@ impl ExecutionFsm {
                 current_gross_bps.raw() >= 580
                     && current_gross_bps.raw() <= convex_ratchet_floor
             } else {
-                peak_gross_bps.raw() >= 680
-                    && ofi_reversed
-                    && current_gross_bps.raw() >= 560
+                peak_gross_bps.raw() >= 580
+                    && hold_elapsed >= 25_000_000_000
+                    && flow_conviction <= -0.12
+                    && current_gross_bps.raw() >= 500
                     && current_gross_bps.raw() <= (peak_gross_bps.raw() * 82) / 100
             };
             if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {
