@@ -371,7 +371,7 @@ impl ExecutionFsm {
         let vol_raw = snap.realized_vol_5m.raw().clamp(3_500, 12_500);
         let learned_raw = self.learned_mfe_ewma_bps.clamp(560, 1_600);
         let elastic_sl_bps =
-            ((vol_raw * 38) / 100 + (learned_raw * 8) / 100).clamp(2_400, 3_600);
+            ((vol_raw * 78) / 100 + (learned_raw * 6) / 100).clamp(4_600, 5_200);
         let sl_distance_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
@@ -698,25 +698,14 @@ impl ExecutionFsm {
                     || (elapsed_secs >= elastic_win_horizon_secs
                         && !strong_trend_continuation
                         && current_gross_bps.raw() >= elastic_harvest_floor));
-            let never_reached_green = peak_gross_bps.raw() < zero_loss_scratch_floor;
-            let trapped_breakeven_floor = if never_reached_green && elapsed_secs >= 105 {
-                let overtime = (elapsed_secs - 105).clamp(0, 75);
-                (fee_barrier_bps + 5 - (overtime * 3) / 5).clamp(360, fee_barrier_bps + 5)
-            } else {
-                fee_barrier_bps + 5
-            };
             let zombie_breakeven_escape = !in_trend_free_ride_zone
-                && ((hold_elapsed >= 95_000_000_000
-                    && never_reached_green
-                    && ofi_reversed
-                    && current_gross_bps.raw() >= trapped_breakeven_floor)
-                    || (hold_elapsed >= 120_000_000_000
-                        && ofi_reversed
-                        && current_gross_bps.raw() >= trapped_breakeven_floor));
+                && hold_elapsed >= 120_000_000_000
+                && ofi_reversed
+                && current_gross_bps.raw() >= zero_loss_scratch_floor;
             let stagnant_unwind = struggling_rescue
                 || zombie_breakeven_escape
                 || (hold_elapsed >= STAGNANT_PROFIT_HOLD_NS
-                    && current_gross_bps.raw() >= trapped_breakeven_floor);
+                    && current_gross_bps.raw() >= zero_loss_scratch_floor);
             let flow_conviction_bonus = if flow_conviction > 0.0 {
                 (flow_conviction * 140.0) as i64
             } else {
@@ -872,35 +861,7 @@ impl ExecutionFsm {
         entry_price: PriceTicks,
         candidate_exit: PriceTicks,
     ) -> PriceTicks {
-        let target_360bps_ticks = (entry_price.0.saturating_mul(360) + 999_999) / 1_000_000;
-        let min_scratch_delta_ticks = if target_360bps_ticks > 1 {
-            target_360bps_ticks
-        } else {
-            1
-        };
-        let floor_px = match side {
-            Side::Bid => PriceTicks(entry_price.0 + min_scratch_delta_ticks),
-            Side::Ask => {
-                let p = entry_price.0 - min_scratch_delta_ticks;
-                PriceTicks(if p > 1 { p } else { 1 })
-            }
-        };
-        match side {
-            Side::Bid => {
-                if candidate_exit.0 > floor_px.0 {
-                    candidate_exit
-                } else {
-                    floor_px
-                }
-            }
-            Side::Ask => {
-                if candidate_exit.0 > 0 && candidate_exit.0 < floor_px.0 {
-                    candidate_exit
-                } else {
-                    floor_px
-                }
-            }
-        }
+        Self::clamp_defensive_zero_loss_floor(side, entry_price, candidate_exit)
     }
 
     /// Clamps a standard zombie position to the 440 ScaledBps defensive zero-loss floor.
@@ -1437,22 +1398,13 @@ impl OnlineAdaptiveGovernor {
         let learned_edge = self.ewma_net_bps_x100[slot_idx][d].clamp(-200, 400);
         let self_vol = candidate_snap.realized_vol_5m.raw().max(3_500);
         let btc_vol = btc_leader_snap.realized_vol_5m.raw().max(3_500);
-        let min_trend_drift = ((((260 - learned_edge).max(80)) * self_vol) / 95_000).max(4);
+        let min_trend_drift = (((260 - learned_edge).max(60)) * self_vol) / 600_000;
         let max_self_ext = ((self_vol / 11) + (learned_edge / 4)).max(320);
         let max_btc_ext = ((btc_vol / 12) + (learned_edge / 5)).max(300);
-        if self.global_dir_sl_streak[d] >= 1 && self.last_global_win_dir == ((1 - d) as u8) {
-            return false;
-        }
-        if self.last_global_win_dir == ((1 - d) as u8)
-            && candidate_snap.ts_local_ns.0.saturating_sub(self.last_global_win_ts_ns)
-                < 90_000_000_000
-        {
-            return false;
-        }
         match side {
             Side::Bid => {
                 if self_drift_bps < min_trend_drift
-                    || !(min_trend_drift..=max_self_ext).contains(&self_ext_bps)
+                    || !(0..=max_self_ext).contains(&self_ext_bps)
                 {
                     return false;
                 }
@@ -1466,7 +1418,7 @@ impl OnlineAdaptiveGovernor {
             }
             Side::Ask => {
                 if self_drift_bps > -min_trend_drift
-                    || !(-max_self_ext..=-min_trend_drift).contains(&self_ext_bps)
+                    || !(-max_self_ext..=0).contains(&self_ext_bps)
                 {
                     return false;
                 }

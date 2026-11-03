@@ -291,6 +291,50 @@ fn replay_captured_live_parquet_segments() {
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
     let mut ledger = ParitySyncLedger::new(10_000_000_000);
+    if let Ok(shadow_file) = std::fs::File::open("data/vortex_shadow_trades.jsonl") {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(shadow_file);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
+                let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+                let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let net_scaled = (net_bps * 100.0).round() as i64;
+                let fee_scaled = if is_maker { 400 } else { 750 };
+                let gross_scaled = net_scaled + fee_scaled;
+                if is_maker && gross_scaled >= 440 {
+                    fsm.learned_mfe_ewma_bps = ((fsm.learned_mfe_ewma_bps * 80)
+                        + (gross_scaled.min(2_400) * 20))
+                        / 100;
+                    fsm.learned_mfe_ewma_bps = fsm.learned_mfe_ewma_bps.clamp(560, 1_600);
+                }
+                let slot_opt = match sym_str {
+                    "BTCUSDT" => Some(0),
+                    "ETHUSDT" => Some(1),
+                    "SOLUSDT" => Some(2),
+                    "AVAXUSDT" => Some(3),
+                    "TAOUSDT" => Some(4),
+                    "SUIUSDT" => Some(5),
+                    _ => None,
+                };
+                if let Some(s_idx) = slot_opt {
+                    let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                    let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
+                    adaptive_gov.observe_closed_trade(
+                        s_idx,
+                        s_side,
+                        ScaledBps(net_scaled),
+                        is_maker,
+                        TimestampNs(ts_saved),
+                    );
+                }
+            }
+        }
+    }
     let mut fifo_sim = FifoQueueSimulator::new();
     let mut btc_leader_snap = SymbolLobSnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
@@ -333,8 +377,9 @@ fn replay_captured_live_parquet_segments() {
                                 if prev_mid_ticks[slot_idx] > 0 && mid_t > 0 {
                                     let dt = (mid_t - prev_mid_ticks[slot_idx]).abs();
                                     if dt > 0 {
-                                        let prev_v = learned_vol_5m_bps[slot_idx].clamp(5_600, 7_800);
-                                        let imp = (5_600 + dt.saturating_mul(350)).clamp(5_600, 7_800);
+                                        let prev_v = learned_vol_5m_bps[slot_idx].clamp(5_600, 6_800);
+                                        let inst_bps = (dt.saturating_mul(1_000_000)) / mid_t.max(1);
+                                        let imp = (5_800 + inst_bps.saturating_mul(18)).clamp(5_600, 6_800);
                                         learned_vol_5m_bps[slot_idx] =
                                             (prev_v * 96 + imp * 4) / 100;
                                     }

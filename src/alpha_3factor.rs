@@ -181,16 +181,14 @@ impl OrthogonalFactorState {
             self.prev_bids = cur_bids;
             self.prev_asks = cur_asks;
 
-            // Continuous L2-clocked Hawkes decay on TFI accumulators so stale trade bursts fade:
+            // Continuous L2-clocked Hawkes decay on TFI accumulators and score:
             self.tfi_buy_accum *= 0.985;
             self.tfi_sell_accum *= 0.985;
             let tfi_total = self.tfi_buy_accum + self.tfi_sell_accum;
             if tfi_total <= 1e-6 {
                 self.last_tfi = BoundedScore::ZERO;
             } else {
-                self.last_tfi = BoundedScore::new_clamped(
-                    (self.tfi_buy_accum - self.tfi_sell_accum) / tfi_total,
-                );
+                self.last_tfi = BoundedScore::new_clamped(self.last_tfi.get() * 0.992);
             }
         }
 
