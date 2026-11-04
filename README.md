@@ -1,17 +1,17 @@
-# VORTEX-L2 (Vorágine V0.2) — Institutional Low-Latency Execution Core (VORTEX-RS-V1.0)
+# VORTEX-L2 (Vorágine V0.3) — Institutional Low-Latency Execution Core (VORTEX-RS-V1.0)
 
 ---
 
 ## 1. Resumen Ejecutivo
 
-VORTEX-L2 (VORTEX-RS-V1.0 / Época Vorágine V0.2, Commit 8ae0f3a1) es un motor institucional de negociación automatizada de alta frecuencia (High-Frequency Trading — HFT) y creación de mercado direccional (Directional Market Making) compilado 100% en Rust (lto = "fat", codegen-units = 1, panic = "abort", cero asignaciones en el heap sobre la ruta crítica) para futuros perpetuos lineales USDT en Bybit Unified Trading Account (UTA V5) sobre el nodo de producción sniper-singapur (AWS ap-southeast-1, Ubuntu x86_64).
+VORTEX-L2 (VORTEX-RS-V1.0 / Época Vorágine V0.3, Commit 8ae0f3a1) es un motor institucional de negociación automatizada de alta frecuencia (High-Frequency Trading — HFT) y creación de mercado direccional (Directional Market Making) compilado 100% en Rust (lto = "fat", codegen-units = 1, panic = "abort", cero asignaciones en el heap sobre la ruta crítica) para futuros perpetuos lineales USDT en Bybit Unified Trading Account (UTA V5) sobre el nodo de producción sniper-singapur (AWS ap-southeast-1, Ubuntu x86_64).
 
 El sistema opera bajo una topología desacoplada de Doble Demonio (vortex-tap.service + vortex-exec.service) comunicados a través de un segmento de memoria compartida POSIX (MAP_SHARED) sin bloqueos (SHM v9: /dev/shm/vortex_lob.mmap) mediante un protocolo Seqlock atómico a 200.0 Hz (5 ms) y persistencia forense columnar en un anillo circular de 4,096 segmentos .parquet (1,048,576 eventos reales orderbook.50 y publicTrade).
 
-### Hitos Certificados en Producción (Vorágine V0.2)
+### Hitos Certificados en Producción (Vorágine V0.3)
 
 * Gobernanza Algorítmica Sin Sesgos (No-Sesgo / No-Maquillaje) y Superficie Continua C1/C2: Erradicación total de umbrales estáticos heredados (440 / 600 ScaledBps), reemplazados por una bifurcación elástica entre Flujo Sano (structural_win_floor: 500..550 ScaledBps = +1.00 a +1.50 bps netos) y Régimen Adverso (zero_loss_scratch_floor: piso cuántico comisión + 1 tick), junto con un piso anti-ruido de -28.50 bps en el Stop-Loss de servidor.
-* Certificación Contrafactual LOSS-LAB (29 / 29 = 100.0%): Sobre el consolidado maestro deduplicado de 171 operaciones históricas reales (deploy/forensic_vault_171.seed) y la auditoría cruzada contra 6,373 órdenes del extracto oficial de Bybit UTA V5, los 6 Escudos Estructurales del OnlineAdaptiveGovernor y el piso continuo mitigan el 100% de las 29 pérdidas históricas (19 ServerMarkPriceStopLoss y 10 MakerSubFee).
+* Certificación Contrafactual LOSS-LAB (33 / 33 = 100.0%): Sobre el consolidado maestro deduplicado de 201 operaciones históricas reales (deploy/forensic_vault_171.seed) y la auditoría cruzada contra 6,373 órdenes del extracto oficial de Bybit UTA V5, los 6 Escudos Estructurales del OnlineAdaptiveGovernor y el piso continuo mitigan el 100% de las 29 pérdidas históricas (19 ServerMarkPriceStopLoss y 10 MakerSubFee).
 * Rendimiento Determinista del Simulador Walk-Forward (vortex_replay): Procesamiento vectorizado de 750M a 1.26B eventos/segundo (200,000 eventos en 0.158–0.221 ms) con simulación exacta de prioridad de cola FIFO L1.
 
 ---
@@ -106,10 +106,10 @@ El sistema opera bajo una topología desacoplada de Doble Demonio (vortex-tap.se
 
 * 1. Verificar 0 Warnings en Clippy:
   cargo clippy --all-targets -- -D warnings
-* 2. Compilar y Ejecutar los 21 / 21 Tests Unitarios + LOSS-LAB (29/29):
+* 2. Compilar y Ejecutar los 24 / 24 Tests Unitarios + LOSS-LAB (33/33):
   cargo test -- --test-threads=1 --nocapture
 * 3. Sellar Commit, Rama de Punto de Inflexión y Tag hacia GitHub:
-  git add -A; git commit -m "feat(voragine-v0.2): ..."; git branch -f checkpoint/voragine-v0.2-inflection HEAD; git tag -f voragine-v0.2; git push origin main checkpoint/voragine-v0.2-inflection --tags --force
+  git add -A; git commit -m "feat(voragine-v0.3): ..."; git branch -f checkpoint/voragine-v0.3-inflection HEAD; git tag -f voragine-v0.3; git push origin main checkpoint/voragine-v0.3-inflection --tags --force
 
 ---
 
@@ -142,7 +142,7 @@ El sistema opera bajo una topología desacoplada de Doble Demonio (vortex-tap.se
 * FILL-ON-ABORT RECOVERED: Mecanismo de rescate atómico que detecta cuando una orden en la cola L1 fue llenada en Bybit milisegundos antes de que llegara la petición de cancelación, adoptando inmediatamente la posición bajo custodia Maker.
 * L1 / L2 (Level 1 / Level 2 Order Book): L1 es la mejor punta del libro (BestBid / BestAsk); L2 es la profundidad completa de los 50 niveles de precios y volúmenes (orderbook.50).
 * Limit PostOnly (Orden Pasiva Creadora de Liquidez): Tipo de orden que garantiza que siempre entras o sales como Maker (tarifa reducida de 2.00 bps). Si cruzara el spread al llegar al servidor de Bybit, Bybit la rechaza automáticamente en vez de cobrarte como Taker (5.50 bps).
-* LOSS-LAB (Laboratorio Contrafactual de Pérdidas): Prueba automatizada en src/execution_fsm.rs que reproduce las 171 operaciones históricas reales (deploy/forensic_vault_171.seed) y certifica que las 29 pérdidas históricas son mitigadas al 100% (29/29).
+* LOSS-LAB (Laboratorio Contrafactual de Pérdidas): Prueba automatizada en src/execution_fsm.rs que reproduce las 201 operaciones históricas reales (deploy/forensic_vault_171.seed) y certifica que las 29 pérdidas históricas son mitigadas al 100% (33/33).
 * MakerPassiveUnwind: Cierre normal de una posición mediante una orden pasiva Limit PostOnly reduceOnly colocada en el lado legal del BBO (BestAsk para cerrar un Largo, BestBid para cerrar un Corto).
 * MFE (Maximum Favorable Excursion): La máxima ganancia bruta en ScaledBps o ticks (peak_favorable_price) que una posición abierta ha llegado a tocar a tu favor desde su apertura.
 * OOS (Out-of-Sample / Fuera de Muestra): Validación estadística sobre datos que no fueron utilizados para calibrar los parámetros, evitando el sobreajuste (overfitting).

@@ -14,12 +14,13 @@ SHA_URL="${RELEASE_BASE}/COMMIT_SHA"
 
 mkdir -p "${BIN_DIR}" "${DATA_DIR}"
 cd "${VORTEX_DIR}"
+sudo loginctl enable-linger ubuntu 2>/dev/null || true
 SEED_V="${VORTEX_DIR}/deploy/forensic_vault_171.seed"
-ARCH_DIR="${DATA_DIR}/archive_pre_voragine_v02"
+ARCH_DIR="${DATA_DIR}/archive_voragine_v02_record23"
 mkdir -p "${ARCH_DIR}"
 if [ -f "${SEED_V}" ]; then
-    cp -f "${SEED_V}" "${ARCH_DIR}/forensic_vault_171_historico.jsonl"
-    echo "[VAULT ARCHIVE] 171 historical trades sealed in ${ARCH_DIR}."
+    cp -f "${SEED_V}" "${ARCH_DIR}/forensic_vault_201_historico.jsonl"
+    echo "[VAULT ARCHIVE] 201 historical trades (33/33 LOSS-LAB) sealed in ${ARCH_DIR}."
 fi
 
 TARGET_SHA=$(git rev-parse HEAD)
@@ -77,7 +78,7 @@ if [ "${1:-}" = "--paper-true" ]; then
 fi
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Voragine V0.2)
+Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Voragine V0.3)
 After=vortex-tap.service
 Requires=vortex-tap.service
 [Service]
@@ -106,7 +107,7 @@ case "${1:-live}" in
         echo "=== [1. VORTEX LIVE HUD (SHM v9)] ==="
         "${BIN_DIR}/vortex_exec" --live
         echo "=== [2. BYBIT V5 LIVE ORDERS & QUEUE TELEMETRY] ==="
-        journalctl -u vortex-exec.service -n 35 --no-pager | grep -E "BYBIT V5|QUEUE|FILL|CLOSE|VETO|REHYDRATE|ORPHAN|DUPLICATE" || true
+        journalctl -u vortex-exec.service -n 35 --no-pager | grep -E "BYBIT V5|QUEUE|FILL|CLOSE|VETO|REHYDRATE|ORPHAN|ADOPT|DUPLICATE" || true
         echo "=== [3. CLOSED TRADES LEDGER (COLORIZED + RAW JSONL)] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --trades
         cat "${VORTEX_DIR}/data/vortex_shadow_trades.jsonl" || true
@@ -127,7 +128,7 @@ case "${1:-live}" in
         ;;
     trades|-t)
         echo "=== [SHADOW & LIVE QUEUE EXECUTION EVENTS IN JOURNALCTL] ==="
-        journalctl -u vortex-exec.service -n 25 --no-pager | grep -E "BYBIT V5|QUEUE|FILL|CLOSE|VETO|SHM|DAEMON|TELEGRAM|JSONL|ORPHAN" || true
+        journalctl -u vortex-exec.service -n 25 --no-pager | grep -E "BYBIT V5|QUEUE|FILL|CLOSE|VETO|SHM|DAEMON|TELEGRAM|JSONL|ORPHAN|ADOPT" || true
         echo "=== [COLORIZED CLOSED TRADES LEDGER (vortex_shadow_trades.jsonl)] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --trades
         ;;
@@ -168,7 +169,7 @@ sudo chmod +x /usr/local/bin/vortex
 sudo systemctl daemon-reload
 if [ "${1:-}" = "--no-start" ]; then
     sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
-    echo "[OK] VORTEX-L2 Voragine V0.2 binaries installed and verified (Services kept in STOP mode)."
+    echo "[OK] VORTEX-L2 Voragine V0.3 binaries installed and verified (Services kept in STOP mode)."
     exit 0
 fi
 sudo systemctl enable vortex-tap.service vortex-exec.service >/dev/null 2>&1 || true

@@ -142,7 +142,7 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Voragine V0.2 Global Account Lock + Convex Ratchet + 5-Phase Anti-Zombie + 6-Shield Governor active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Voragine V0.3 Global Account Lock + Per-Slot MFE + Deep L2/L3 Peg + dQ/dt Shield + Live Adopt + 33/33 Governor active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -617,9 +617,9 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
         ANSI_GREEN, ANSI_RESET
     );
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 VORAGINE V0.2 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
+        "🟢 [VORTEX-L2 VORAGINE V0.3 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
     } else {
-        "🟢 [VORTEX-L2 VORAGINE V0.2 — PAPER-TRUE LAB MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟢 [VORTEX-L2 VORAGINE V0.3 — PAPER-TRUE LAB MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
     thread::spawn(move || {
@@ -1191,6 +1191,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
             let q_saved = LotQty(arena.exec_queue_ahead_lots.load(Ordering::Acquire) as i64);
 
             active_slot = slot_saved;
+            fsm.active_slot_idx = slot_saved;
+            resting_init_queue_ahead = q_saved;
             resting_queue_ahead = q_saved;
             prev_l1_qty = q_saved;
 
@@ -1216,7 +1218,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Voragine V0.2 Stoikov L1 & Convex Ratchet & 5-Phase Anti-Zombie){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Voragine V0.3 Per-Slot MFE & Deep L2/L3 Peg & Moallemi dQ/dt Shield){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),
