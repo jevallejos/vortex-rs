@@ -142,7 +142,7 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Voragine V0.3 Global Account Lock + Per-Slot MFE + Deep L2/L3 Peg + dQ/dt Shield + Live Adopt + 33/33 Governor active.{}",
+            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Voragine V0.3 Global Account Lock + Per-Slot MFE + Deep L2/L3 Peg + dQ/dt Shield + Live Adopt + 36/36 Governor (Voragine V0.3.2) active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
@@ -1786,6 +1786,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 peak_favorable_price.0 as u64,
                                 Ordering::Release,
                             );
+                            if fsm.last_eff_sl_ticks.0 > 0 {
+                                arena.exec_sl_ticks.store(
+                                    fsm.last_eff_sl_ticks.0 as u64,
+                                    Ordering::Release,
+                                );
+                            }
                         }
                     }
                 }

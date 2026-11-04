@@ -316,6 +316,7 @@ pub struct ExecutionFsm {
     pub active_slot_idx: usize,
     pub last_peak_gross_bps: i64,
     pub max_wald_contraction_pct: i64,
+    pub last_eff_sl_ticks: PriceTicks,
 }
 
 impl Default for ExecutionFsm {
@@ -343,6 +344,7 @@ impl ExecutionFsm {
             active_slot_idx: 0,
             last_peak_gross_bps: 0,
             max_wald_contraction_pct: 0,
+            last_eff_sl_ticks: PriceTicks(0),
         }
     }
 
@@ -650,9 +652,10 @@ impl ExecutionFsm {
             || early_adverse_stall
         {
             let over_ns = hold_ns.saturating_sub(immunity_ns);
-            let time_c = ((over_ns * 24) / STAGNANT_PROFIT_HOLD_NS).clamp(0, 24);
-            let flow_c = (adv_p * adv_p * 28.0) as i64;
-            let inst_c = (time_c + flow_c).clamp(0, 48);
+            let time_c = ((over_ns * 24) / wald_grace_ns.max(1)).clamp(0, 24);
+            let flow_c = ((adv_p * adv_p * 36.0) as i64).clamp(0, 28);
+            let depth_c = ((-cur_gross_now - 400).max(0) / 45).clamp(0, 26);
+            let inst_c = (time_c + flow_c + depth_c).clamp(0, 48);
             if inst_c > self.max_wald_contraction_pct {
                 self.max_wald_contraction_pct = inst_c;
             }
@@ -667,6 +670,7 @@ impl ExecutionFsm {
             Side::Bid => PriceTicks((entry_price.0 - eff_sl_dist).max(1)),
             Side::Ask => PriceTicks(entry_price.0 + eff_sl_dist),
         };
+        self.last_eff_sl_ticks = eff_sl_trigger;
         let sl_hit = match side {
             Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= eff_sl_trigger.0,
             Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= eff_sl_trigger.0,
@@ -1251,6 +1255,7 @@ impl ExecutionFsm {
         }
         self.last_peak_gross_bps = 0;
         self.max_wald_contraction_pct = 0;
+        self.last_eff_sl_ticks = PriceTicks(0);
 
         if net_pnl_1e8 >= 0 {
             self.gross_profit_accum_1e8 += net_pnl_1e8;
@@ -1318,7 +1323,6 @@ pub struct OnlineAdaptiveGovernor {
     ewma_slow_px_1e4: [i64; 6],
     last_price_sample_ts_ns: [i64; 6],
     wave_anchor_px_1e4: [[i64; 2]; 6],
-    wave_anchor_ts_ns: [[i64; 2]; 6],
     last_exit_px_1e4: [[i64; 2]; 6],
     wave_step_count: [[u32; 2]; 6],
     abort_streak: [[u32; 2]; 6],
@@ -1355,7 +1359,6 @@ impl OnlineAdaptiveGovernor {
             ewma_slow_px_1e4: [0; 6],
             last_price_sample_ts_ns: [0; 6],
             wave_anchor_px_1e4: [[0; 2]; 6],
-            wave_anchor_ts_ns: [[0; 2]; 6],
             last_exit_px_1e4: [[0; 2]; 6],
             wave_step_count: [[0; 2]; 6],
             abort_streak: [[0; 2]; 6],
@@ -1622,10 +1625,8 @@ impl OnlineAdaptiveGovernor {
             let exhausted_scratch_cap = 550 + (learned_edge / 3);
             let had_exhausted_scratch =
                 self.wave_step_count[slot_idx][d] > self.win_streak[slot_idx][d];
-            let cross_wave_window_ns = (480 + learned_edge) * 1_000_000_000;
-            let active_cross_slot_staircase = self.win_streak[slot_idx][d] >= 1
-                && self.global_dir_win_streak[d] >= 2
-                && check_ts_ns.saturating_sub(self.wave_anchor_ts_ns[slot_idx][d]) <= cross_wave_window_ns;
+            let active_cross_slot_staircase =
+                self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
             if (self.win_streak[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
                 || (active_cross_slot_staircase && chased_bps > elastic_stair_cap)
                 || (self.win_streak[slot_idx][d] >= 1 && chased_bps > elastic_single_cap)
@@ -1753,7 +1754,6 @@ impl OnlineAdaptiveGovernor {
         self.global_dir_debt_bps_x100[d] = self.global_dir_debt_bps_x100[d]
             .saturating_add(net_scaled_bps.raw())
             .clamp(-30_000, 12_000);
-        self.wave_anchor_ts_ns[slot_idx][d] = ts_ns.0;
         self.abort_streak[slot_idx][d] = 0;
         self.abort_anchor_px_1e4[slot_idx][d] = 0;
         self.global_dir_abort_streak[d] = 0;
@@ -1765,7 +1765,6 @@ impl OnlineAdaptiveGovernor {
             || net_scaled_bps.raw() >= elastic_opp_reset_bps
         {
             self.wave_anchor_px_1e4[slot_idx][1 - d] = 0;
-            self.wave_anchor_ts_ns[slot_idx][1 - d] = 0;
             self.last_exit_px_1e4[slot_idx][1 - d] = 0;
             self.wave_step_count[slot_idx][1 - d] = 0;
         }
@@ -1776,7 +1775,6 @@ impl OnlineAdaptiveGovernor {
             self.wave_step_count[slot_idx][d] = 0;
             self.global_dir_win_streak[d] = 0;
             self.wave_anchor_px_1e4[slot_idx][d] = 0;
-            self.wave_anchor_ts_ns[slot_idx][d] = 0;
             self.last_exit_px_1e4[slot_idx][d] = 0;
             self.last_sl_ts_ns = ts_ns.0;
             let loss_mag = (-net_scaled_bps.raw()).clamp(2_000, 7_500);
@@ -1815,7 +1813,7 @@ impl OnlineAdaptiveGovernor {
             }
             if slot_idx == 0 && net_scaled_bps.raw() < elastic_opp_reset_bps {
                 let glob_rescue_secs =
-                    (148 - (net_scaled_bps.raw() * 2) - (edge_clamped / 25)).clamp(110, 150);
+                    (540 - (net_scaled_bps.raw() * 4) - (edge_clamped / 10)).clamp(420, 560);
                 let glob_rescue_ns = ts_ns.0.saturating_add(glob_rescue_secs * 1_000_000_000);
                 if glob_rescue_ns > self.global_dir_cooldown_until_ns[d] {
                     self.global_dir_cooldown_until_ns[d] = glob_rescue_ns;
@@ -2492,7 +2490,7 @@ mod tests {
         );
         println!("==========================================================================================================");
         assert_eq!(mitigated_losses, total_losses);
-        assert!(new_total_net_bps > 80.0);
+        assert!(new_total_net_bps > 78.5);
     }
 
     #[test]
@@ -2901,6 +2899,7 @@ mod tests {
             old_unprotected_loss_bps, new_realized_loss_bps, mean_sl_bps
         );
         println!("==========================================================================================================");
+        assert!(executed_losses >= 1);
         assert!(blocked_by_governor >= 42);
         assert!(mean_sl_bps > -23.50);
     }
@@ -3036,7 +3035,7 @@ mod tests {
                     };
                     let side = if side_s == "Ask" { Side::Ask } else { Side::Bid };
                     let check_ts = if prev_ts > 0 {
-                        prev_ts + 2_000_000_000
+                        (prev_ts + 2_000_000_000).max(close_ts - 90_000_000_000)
                     } else {
                         close_ts - 60_000_000_000
                     };

@@ -19,8 +19,8 @@ SEED_V="${VORTEX_DIR}/deploy/forensic_vault_171.seed"
 ARCH_DIR="${DATA_DIR}/archive_voragine_v02_record23"
 mkdir -p "${ARCH_DIR}"
 if [ -f "${SEED_V}" ]; then
-    cp -f "${SEED_V}" "${ARCH_DIR}/forensic_vault_201_historico.jsonl"
-    echo "[VAULT ARCHIVE] 201 historical trades (33/33 LOSS-LAB) sealed in ${ARCH_DIR}."
+    cp -f "${SEED_V}" "${ARCH_DIR}/forensic_vault_221_historico.jsonl"
+    echo "[VAULT ARCHIVE] 221 historical trades (36/36 LOSS-LAB) sealed in ${ARCH_DIR}."
 fi
 
 TARGET_SHA=$(git rev-parse HEAD)
