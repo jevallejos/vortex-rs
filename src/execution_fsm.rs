@@ -1585,7 +1585,12 @@ impl OnlineAdaptiveGovernor {
             };
             let r_edge = self.ewma_net_bps_x100[slot_idx][d];
             let l_edge = if r_edge < -100 { -100 } else if r_edge > 250 { 250 } else { r_edge };
-            let elastic_shelf_cap = 320 + (l_edge / 4);
+            let fee_rt_bps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
+            let elastic_shelf_cap = if self.win_streak[slot_idx][d] >= 1 {
+                ((fee_rt_bps * 3) / 2) + (l_edge / 2)
+            } else {
+                ((fee_rt_bps * 4) / 5) + (l_edge / 4)
+            };
             if beyond_exit_bps >= 0 && beyond_exit_bps <= elastic_shelf_cap {
                 return Some("VETO_WAVE_STAIRCASE_25BPS");
             }
@@ -3156,5 +3161,44 @@ mod tests {
         );
         assert_eq!(sl_count, 26);
         assert!(saved_bps > 780.0);
+    }
+
+    #[test]
+    fn test_real_par1_walkforward_eth_loss_and_shelf_veto() {
+        let mut gov = OnlineAdaptiveGovernor::new();
+        // PAR1 #1: ETHUSDT Bid 231755t -> 231872t (+1.04 bps WIN)
+        gov.seed_historical_price(1, Side::Bid, 231_755, 231_872);
+        gov.observe_closed_trade(
+            1,
+            Side::Bid,
+            ScaledBps(104),
+            true,
+            TimestampNs(1_793_800_000_000_000_000),
+        );
+        // PAR1 #2: BTCUSDT Bid 783812t -> 784159t (+0.42 bps SCRATCH)
+        gov.seed_historical_price(0, Side::Bid, 783_812, 784_159);
+        gov.observe_closed_trade(
+            0,
+            Side::Bid,
+            ScaledBps(42),
+            true,
+            TimestampNs(1_793_800_120_000_000_000),
+        );
+        // PAR1 #3: ETHUSDT Bid @ 231996t (+5.34 bps above 231872t) -> VETOED!
+        let par1_loss_veto = gov.audit_historical_entry_veto(
+            1,
+            Side::Bid,
+            231_996,
+            1_793_800_300_000_000_000,
+        );
+        assert_eq!(par1_loss_veto, Some("VETO_WAVE_STAIRCASE_25BPS"));
+        // PAR1 #7: ETHUSDT Ask @ 231494t (+4.33 bps WIN) -> AUTHORIZED!
+        let par1_win_ok = gov.audit_historical_entry_veto(
+            1,
+            Side::Ask,
+            231_494,
+            1_793_800_600_000_000_000,
+        );
+        assert_eq!(par1_win_ok, None);
     }
 }
