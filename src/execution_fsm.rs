@@ -1707,8 +1707,22 @@ impl OnlineAdaptiveGovernor {
         if slot_idx > 0 {
             let leader_opp_cascade = self.win_streak[0][1 - d] >= 2
                 && self.last_global_win_dir == ((1 - d) as u8);
+            let opp_anc_1e4 = self.wave_anchor_px_1e4[slot_idx][1 - d];
+            let opp_whipsaw_bps = if opp_anc_1e4 > 0 && cur_1e4 > 0 {
+                match side {
+                    Side::Bid => {
+                        ((cur_1e4 - opp_anc_1e4).saturating_mul(1_000_000)) / opp_anc_1e4
+                    }
+                    Side::Ask => {
+                        ((opp_anc_1e4 - cur_1e4).saturating_mul(1_000_000)) / opp_anc_1e4
+                    }
+                }
+            } else {
+                -1
+            };
             if (self.global_dir_win_streak[1 - d] >= 2 || leader_opp_cascade)
-                && check_ts_ns.saturating_sub(self.last_global_win_ts_ns) <= 900_000_000_000
+                && (check_ts_ns.saturating_sub(self.last_global_win_ts_ns) <= 900_000_000_000
+                    || opp_whipsaw_bps >= 0)
             {
                 return Some("VETO_ALTCOIN_COUNTER_CASCADE");
             }
@@ -1902,6 +1916,20 @@ impl OnlineAdaptiveGovernor {
             .is_some()
         {
             return false;
+        }
+        if slot_idx > 0 {
+            let btc_ticks = if btc_leader_snap.bids[0].price.0 > 0
+                && btc_leader_snap.asks[0].price.0 > 0
+            {
+                (btc_leader_snap.bids[0].price.0 + btc_leader_snap.asks[0].price.0) / 2
+            } else {
+                btc_leader_snap.mark_price.0
+            };
+            if self.audit_historical_entry_veto(0, side, btc_ticks, candidate_snap.ts_local_ns.0)
+                == Some("VETO_ALTCOIN_COUNTER_CASCADE")
+            {
+                return false;
+            }
         }
 
         let d = Self::dir_idx(side);
@@ -3231,6 +3259,14 @@ mod tests {
             1_793_801_000_000_000_000,
         );
         assert_eq!(par1_btc_whipsaw, Some("VETO_ALTCOIN_COUNTER_CASCADE"));
+        // PAR1 #5 Deflection: ETHUSDT Bid @ 231993t (+9.79 bps whipsaw above 231766t) -> VETOED!
+        let par1_eth_whipsaw = gov.audit_historical_entry_veto(
+            1,
+            Side::Bid,
+            231_993,
+            1_793_801_500_000_000_000,
+        );
+        assert_eq!(par1_eth_whipsaw, Some("VETO_ALTCOIN_COUNTER_CASCADE"));
         // PAR1 #6: BTCUSDT Bid @ 782991t (-3.13 bps discount below Ask anchor 783236t) -> AUTHORIZED!
         let par1_btc_discount_ok = gov.audit_historical_entry_veto(
             0,
