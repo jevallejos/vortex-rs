@@ -305,8 +305,7 @@ impl PairSpec {
             + (100 - p_taker) * ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0)
             / 100;
         let round_trip_cost = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0 + exit_fee_expected + tick_bps.0;
-        let required_3x = round_trip_cost * 3;
-        let effective_floor = required_3x;
+        let effective_floor = round_trip_cost * 3;
 
         if expected_excursion_scaled_bps.0 < effective_floor {
             return Err(VortexError::FrictionBarrierRejected {
@@ -357,6 +356,81 @@ impl PairSpec {
             }
         }
     }
+}
+
+/// ANSI terminal color and badge constants shared across CLI binaries.
+pub const ANSI_GREEN: &str = "\x1b[1;32m";
+pub const ANSI_ORANGE: &str = "\x1b[38;5;208m";
+pub const ANSI_RED: &str = "\x1b[1;31m";
+pub const ANSI_YELLOW: &str = "\x1b[1;33m";
+pub const ANSI_GRAY: &str = "\x1b[90m";
+pub const ANSI_RESET: &str = "\x1b[0m";
+
+/// Canonical PnL badge classifier (`WIN` >= +1.00 bps, `SCRATCH` in [-0.50, +1.00) bps, `LOSS` < -0.50 bps).
+#[inline]
+#[must_use]
+pub fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static str) {
+    if net_bps >= 1.00 {
+        (ANSI_GREEN, "\u{1F7E2}", "WIN")
+    } else if net_bps >= -0.50 {
+        (ANSI_ORANGE, "\u{1F7E0}", "SCRATCH")
+    } else {
+        (ANSI_RED, "\u{1F534}", "LOSS")
+    }
+}
+
+/// Canonical 6 approved institutional perpetual contracts (`Tick_bps <= 1.50 bps`).
+pub const APPROVED_SPECS: [PairSpec; 6] = [
+    PairSpec {
+        symbol_id: SymbolId(1),
+        tick_size_1e8: 10_000_000,
+        lot_step_1e8: 100_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(2),
+        tick_size_1e8: 1_000_000,
+        lot_step_1e8: 1_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(3),
+        tick_size_1e8: 1_000_000,
+        lot_step_1e8: 10_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(4),
+        tick_size_1e8: 100_000,
+        lot_step_1e8: 10_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(5),
+        tick_size_1e8: 1_000_000,
+        lot_step_1e8: 1_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(6),
+        tick_size_1e8: 10_000,
+        lot_step_1e8: 100_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+];
+
+/// Looks up `(slot_idx, PairSpec)` for an approved `SymbolId`.
+#[inline]
+#[must_use]
+pub const fn spec_for_symbol(sym: SymbolId) -> Option<(usize, PairSpec)> {
+    let mut i = 0;
+    while i < APPROVED_SPECS.len() {
+        if APPROVED_SPECS[i].symbol_id.0 == sym.0 {
+            return Some((i, APPROVED_SPECS[i]));
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]

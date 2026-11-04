@@ -18,7 +18,7 @@ use vortex_rs::execution_fsm::{
 };
 use vortex_rs::forensic_parquet::ParitySyncLedger;
 use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena};
-use vortex_rs::types::{BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
+use vortex_rs::types::{classify_pnl_badge, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs, ANSI_GRAY, ANSI_GREEN, ANSI_ORANGE, ANSI_RED, ANSI_RESET, ANSI_YELLOW, APPROVED_SPECS};
 
 pub const TOTAL_OOS_TRADES_GATE: usize = 520;
 
@@ -28,67 +28,10 @@ pub const OPTIMAL_LIVE_NOTIONAL_1E8: i64 = 1_250_000_000;
 /// Per-slot anti-chasing cooldown after an unfilled queue abort or close (15 seconds).
 pub const SLOT_ABORT_COOLDOWN_NS: i64 = 15_000_000_000;
 
-const ANSI_GREEN: &str = "\x1b[1;32m";
-const ANSI_ORANGE: &str = "\x1b[38;5;208m";
-const ANSI_RED: &str = "\x1b[1;31m";
-const ANSI_YELLOW: &str = "\x1b[1;33m";
-const ANSI_GRAY: &str = "\x1b[90m";
-const ANSI_RESET: &str = "\x1b[0m";
-
-const APPROVED_SPECS: [PairSpec; 6] = [
-    PairSpec {
-        symbol_id: SymbolId(1),
-        tick_size_1e8: 10_000_000,
-        lot_step_1e8: 100_000,
-        empirical_taker_exit_prob_pct: 20,
-    },
-    PairSpec {
-        symbol_id: SymbolId(2),
-        tick_size_1e8: 1_000_000,
-        lot_step_1e8: 1_000_000,
-        empirical_taker_exit_prob_pct: 20,
-    },
-    PairSpec {
-        symbol_id: SymbolId(3),
-        tick_size_1e8: 1_000_000,
-        lot_step_1e8: 10_000_000,
-        empirical_taker_exit_prob_pct: 20,
-    },
-    PairSpec {
-        symbol_id: SymbolId(4),
-        tick_size_1e8: 100_000,
-        lot_step_1e8: 10_000_000,
-        empirical_taker_exit_prob_pct: 20,
-    },
-    PairSpec {
-        symbol_id: SymbolId(5),
-        tick_size_1e8: 1_000_000,
-        lot_step_1e8: 1_000_000,
-        empirical_taker_exit_prob_pct: 20,
-    },
-    PairSpec {
-        symbol_id: SymbolId(6),
-        tick_size_1e8: 10_000,
-        lot_step_1e8: 100_000_000,
-        empirical_taker_exit_prob_pct: 20,
-    },
-];
-
 fn now_epoch_ns() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_nanos() as i64,
         Err(_) => 1_762_012_800_000_000_000,
-    }
-}
-
-#[inline]
-fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static str) {
-    if net_bps >= 1.00 {
-        (ANSI_GREEN, "\u{1F7E2}", "WIN")
-    } else if net_bps >= -0.50 {
-        (ANSI_ORANGE, "\u{1F7E0}", "SCRATCH")
-    } else {
-        (ANSI_RED, "\u{1F534}", "LOSS")
     }
 }
 
@@ -349,26 +292,75 @@ impl BybitV5LiveClient {
         (open, sz)
     }
 
-    /// Audits all 6 approved pairs on startup to ensure zero untracked orphan positions exist outside the active SHM slot.
-    fn audit_and_clean_untracked_orphans(&self, tracked_symbol: Option<&str>) {
+    /// Audits all 6 approved pairs on startup without EVER liquidating positions at Market:
+    /// cancels stale resting orders on idle symbols and adopts any active exchange position into Maker FSM custody.
+    fn adopt_or_clean_exchange_positions(
+        &self,
+        tracked_symbol: Option<&str>,
+        fsm: &mut ExecutionFsm,
+        arena: &VortexShmArena,
+        active_slot: &mut usize,
+        tg_tx: &Option<SyncSender<String>>,
+    ) {
         for spec in APPROVED_SPECS {
             let sym = spec.symbol_id.name();
             if Some(sym) == tracked_symbol {
                 continue;
             }
             self.cancel_all_symbol_orders(sym);
-            let (has_orphan, orphan_qty, orphan_side) = self.get_open_position_info(sym);
-            if has_orphan {
-                let close_side = if orphan_side == "Buy" { "Sell" } else { "Buy" };
-                println!(
-                    "{}🟠 [BYBIT V5 ORPHAN CLEANUP] Found untracked orphan position on {} (side={} size={}) — closing with reduceOnly{}",
-                    ANSI_ORANGE, sym, orphan_side, orphan_qty, ANSI_RESET
-                );
-                let close_body = format!(
-                    "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Market\",\"qty\":\"{}\",\"reduceOnly\":true,\"positionIdx\":0}}",
-                    sym, close_side, orphan_qty
-                );
-                let _ = self.post_v5("/v5/order/create", &close_body);
+        }
+        if tracked_symbol.is_none() {
+            if let Some((open_sym, open_qty, open_side_str, avg_px_str)) = self.get_any_account_open_position() {
+                for (slot_idx, spec) in APPROVED_SPECS.iter().enumerate() {
+                    if spec.symbol_id.name() == open_sym {
+                        if let Ok(entry_t) = spec.parse_price_ticks(&avg_px_str) {
+                            if entry_t.0 > 0 {
+                                let adopt_side = if open_side_str == "Sell" { Side::Ask } else { Side::Bid };
+                                let mfe_bps = fsm.slot_learned_mfe_bps(spec.symbol_id).clamp(600, 1_600);
+                                let tp_d = ((entry_t.0 * (mfe_bps * 6)) / 1_000_000).max(2);
+                                let sl_d = ((entry_t.0 * 3_800) / 1_000_000).max(4);
+                                let (tp_t, sl_t) = match adopt_side {
+                                    Side::Bid => (PriceTicks(entry_t.0 + tp_d), PriceTicks((entry_t.0 - sl_d).max(1))),
+                                    Side::Ask => (PriceTicks((entry_t.0 - tp_d).max(1)), PriceTicks(entry_t.0 + sl_d)),
+                                };
+                                let now_ns = TimestampNs(now_epoch_ns());
+                                *active_slot = slot_idx;
+                                fsm.active_slot_idx = slot_idx;
+                                fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+                                    side: adopt_side,
+                                    entry_price: entry_t,
+                                    peak_favorable_price: entry_t,
+                                    qty: LotQty(10),
+                                    tp_maker_price: tp_t,
+                                    sl_trigger_price: sl_t,
+                                    opened_ts: now_ns,
+                                };
+                                arena.exec_active_slot.store(slot_idx as u64, Ordering::Release);
+                                arena.exec_active_symbol.store(u64::from(spec.symbol_id.0), Ordering::Release);
+                                arena.exec_side.store(adopt_side as u64, Ordering::Release);
+                                arena.exec_entry_ticks.store(entry_t.0 as u64, Ordering::Release);
+                                arena.exec_peak_ticks.store(entry_t.0 as u64, Ordering::Release);
+                                arena.exec_tp_ticks.store(tp_t.0 as u64, Ordering::Release);
+                                arena.exec_sl_ticks.store(sl_t.0 as u64, Ordering::Release);
+                                arena.exec_resting_since_ns.store(now_ns.0 as u64, Ordering::Release);
+                                arena.exec_state_code.store(3, Ordering::Release);
+                                println!(
+                                    "{}🟢 [BYBIT V5 LIVE ADOPT] Adopted live exchange position on {} ({:?} size={} @ {}t) into Maker custody (zero market liquidation!){}",
+                                    ANSI_GREEN, open_sym, adopt_side, open_qty, entry_t.0, ANSI_RESET
+                                );
+                                if let Some(ref tx) = tg_tx {
+                                    let (ew, ef) = spec.format_price_usdt_parts(entry_t);
+                                    let msg = format!(
+                                        "🟢 [VORTEX-L2 LIVE POSITION ADOPTED]\nSymbol: {} ({:?}) | Size: {}\nAvg Entry: {}.{:04} USDT ({}t)\nStatus: Adopted into passive Maker custody (Zero Market Close!)",
+                                        open_sym, adopt_side, open_qty, ew, ef, entry_t.0
+                                    );
+                                    let _ = tx.try_send(msg);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -435,6 +427,7 @@ impl BybitV5LiveClient {
         arena: &VortexShmArena,
         active_slot: usize,
         spec: &PairSpec,
+        fsm: &ExecutionFsm,
         summary: &ClosedTradeSummary,
         last_pegged_price: &mut PriceTicks,
     ) -> Option<PriceTicks> {
@@ -518,16 +511,6 @@ impl BybitV5LiveClient {
                     return Some(sl_px);
                 }
             } else {
-                let mut raw_bbo_exit = profit_floor_price;
-                if let Ok(slot) = arena.slot(active_slot) {
-                    if let Ok(latest_snap) = slot.read_snapshot(4) {
-                        raw_bbo_exit = match open_side {
-                            Side::Bid if latest_snap.asks[0].price.0 > 0 => latest_snap.asks[0].price,
-                            Side::Ask if latest_snap.bids[0].price.0 > 0 => latest_snap.bids[0].price,
-                            _ => profit_floor_price,
-                        };
-                    }
-                }
                 let q_bps = ((defensive_floor_price.0 - entry_price.0)
                     .abs()
                     .saturating_mul(1_000_000))
@@ -536,12 +519,31 @@ impl BybitV5LiveClient {
                 let att_i64 = attempt as i64;
                 let relaxed_ref_bps =
                     ScaledBps(q_bps + (span_bps * (8 - att_i64)) / (8 + att_i64));
-                let peg_price = ExecutionFsm::clamp_continuous_maker_floor(
-                    open_side,
-                    entry_price,
-                    raw_bbo_exit,
-                    relaxed_ref_bps,
-                );
+                let peg_price = if let Ok(slot) = arena.slot(active_slot) {
+                    if let Ok(latest_snap) = slot.read_snapshot(4) {
+                        fsm.compute_elastic_deep_exit_peg(
+                            open_side,
+                            entry_price,
+                            &latest_snap,
+                            relaxed_ref_bps,
+                            attempt,
+                        )
+                    } else {
+                        ExecutionFsm::clamp_continuous_maker_floor(
+                            open_side,
+                            entry_price,
+                            profit_floor_price,
+                            relaxed_ref_bps,
+                        )
+                    }
+                } else {
+                    ExecutionFsm::clamp_continuous_maker_floor(
+                        open_side,
+                        entry_price,
+                        profit_floor_price,
+                        relaxed_ref_bps,
+                    )
+                };
                 if peg_price.0 != last_pegged_price.0 {
                     self.cancel_all_symbol_orders(symbol);
                     let (xw, xf) = spec.format_price_usdt_parts(peg_price);
@@ -698,21 +700,11 @@ fn rehydrate_shadow_ledger(
             let net_1e8 = gross_1e8 - fee_1e8;
 
             ledger.record_closed_trade(gross_1e8, fee_1e8);
+            fsm.observe_mfe_sample_for_slot(slot_opt.unwrap_or(0), gross_scaled_bps, is_maker);
             if is_maker {
                 fsm.maker_exits_count += 1;
-                let observed_mfe = gross_scaled_bps.min(2_400);
-                if observed_mfe > 400 {
-                    let surprise = (observed_mfe - fsm.learned_mfe_ewma_bps).abs();
-                    let alpha_pct = (18 + (surprise / 60)).clamp(18, 32);
-                    fsm.learned_mfe_ewma_bps = ((fsm.learned_mfe_ewma_bps * (100 - alpha_pct))
-                        + (observed_mfe * alpha_pct))
-                        / 100;
-                    fsm.learned_mfe_ewma_bps = fsm.learned_mfe_ewma_bps.clamp(560, 1_600);
-                }
             } else {
                 fsm.taker_sl_exits_count += 1;
-                fsm.learned_mfe_ewma_bps =
-                    (((fsm.learned_mfe_ewma_bps * 88) + (560 * 12)) / 100).clamp(560, 1_600);
             }
             if net_1e8 >= 0 {
                 fsm.gross_profit_accum_1e8 += net_1e8;
@@ -1124,6 +1116,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut ledger = ParitySyncLedger::new(5_096_000_000);
 
     let mut active_slot: usize = 0;
+    let mut resting_init_queue_ahead: LotQty = LotQty(0);
     let mut resting_queue_ahead: LotQty = LotQty(0);
     let mut prev_l1_qty: LotQty = LotQty(0);
     let mut prev_cum_trade_lots: LotQty = LotQty(0);
@@ -1219,7 +1212,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     if let Some(ref client) = live_client {
-        client.audit_and_clean_untracked_orphans(tracked_sym_on_startup);
+        client.adopt_or_clean_exchange_positions(tracked_sym_on_startup, &mut fsm, arena, &mut active_slot, &tg_tx);
     }
 
     println!(
@@ -1402,7 +1395,13 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             && (resting_queue_ahead.0 == 0 || clean_sweep_fill);
                         let want_abort = !paper_queue_filled
                             && !clean_sweep_fill
-                            && (toxic_sweep || fsm.check_resting_queue_abort(&snap));
+                            && (toxic_sweep
+                                || fsm.check_queue_depletion_velocity_abort(
+                                    &snap,
+                                    resting_init_queue_ahead,
+                                    resting_queue_ahead,
+                                )
+                                || fsm.check_resting_queue_abort(&snap));
                         let mut filled_on_exchange_during_abort = false;
                         if want_abort {
                             if let Some(ref client) = live_client {
@@ -1423,6 +1422,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             }
                             if !filled_on_exchange_during_abort {
                                 fsm.state = OrderLifecycleState::Idle;
+                                adaptive_gov.observe_queue_abort(
+                                    active_slot,
+                                    side,
+                                    entry_price.0,
+                                    snap.ts_local_ns,
+                                );
                                 slot_cooldown_until_ns[active_slot] =
                                     snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
                                 arena.exec_abort_count.fetch_add(1, Ordering::Release);
@@ -1589,6 +1594,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     arena,
                                     active_slot,
                                     &spec,
+                                    &saved_fsm,
                                     &summary,
                                     &mut last_pegged_exit_price,
                                 );
@@ -1809,6 +1815,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             Side::Bid => (snap.bids[0].qty, snap.cum_sell_trade_lots),
                             Side::Ask => (snap.asks[0].qty, snap.cum_buy_trade_lots),
                         };
+                        resting_init_queue_ahead = init_q;
                         resting_queue_ahead = init_q;
                         prev_l1_qty = init_q;
                         prev_cum_trade_lots = init_cum_trade;
