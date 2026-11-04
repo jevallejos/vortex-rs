@@ -543,11 +543,7 @@ impl ExecutionFsm {
             let depleted_ratio = ((init_q - cur_q) as f64) / (init_q as f64);
             let crit_depletion = (0.55 * vol_norm).clamp(0.45, 0.72);
             let signed_flow_impulse = signed_ofi + 0.50 * signed_tfi;
-            let tfi_not_supporting = signed_tfi <= (0.10 * vol_norm);
-            if depleted_ratio >= crit_depletion
-                && signed_flow_impulse <= (-0.05 * vol_norm)
-                && tfi_not_supporting
-            {
+            if depleted_ratio >= crit_depletion && signed_flow_impulse <= (-0.05 * vol_norm) {
                 self.state = OrderLifecycleState::Idle;
                 return true;
             }
@@ -1990,20 +1986,43 @@ impl OnlineAdaptiveGovernor {
         if self.price_sample_count[slot_idx] < 25 {
             return false;
         }
-        let min_trend_drift = ((((260 - learned_edge).max(60)) * self_vol) / 26_000).max(10);
-        let max_self_ext = ((self_vol / 22) + (learned_edge / 5)).clamp(240, 440);
-        let max_btc_ext = ((btc_vol / 22) + (learned_edge / 5)).clamp(240, 440);
+        if self.sl_streak[slot_idx][1 - d] >= 1 && self.last_sl_ts_ns > 0 {
+            let opp_debt_abs = (-self.cum_net_bps_x100[slot_idx][1 - d]).max(0);
+            let opp_sl_s = i64::from(self.sl_streak[slot_idx][1 - d].min(4));
+            let whip_secs = ((120 + (opp_debt_abs / 25)) * opp_sl_s).clamp(180, 600);
+            let whip_ns = whip_secs * 1_000_000_000;
+            if candidate_snap.ts_local_ns.0.saturating_sub(self.last_sl_ts_ns) < whip_ns {
+                return false;
+            }
+        }
+        let min_trend_drift = ((((320 - learned_edge).max(120)) * self_vol) / 20_000).max(35);
+        let min_btc_drift = (btc_vol / 250).max(20);
+        let max_self_ext = ((self_vol / 11) + (learned_edge / 3)).clamp(380, 850);
+        let max_btc_ext = ((btc_vol / 11) + (learned_edge / 3)).clamp(380, 850);
+        let leader_opp_wave_active = slot_idx > 0
+            && self.wave_step_count[0][1 - d] >= 1
+            && self.last_global_win_dir == ((1 - d) as u8);
+        let req_self_drift = if leader_opp_wave_active {
+            min_trend_drift * 2
+        } else {
+            min_trend_drift
+        };
+        let req_btc_drift = if leader_opp_wave_active {
+            min_btc_drift * 2
+        } else {
+            min_btc_drift
+        };
+        let slot_stair_locked =
+            self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
         match side {
             Side::Bid => {
-                if self_drift_bps < min_trend_drift
-                    || !(-20..=max_self_ext).contains(&self_ext_bps)
+                if self_drift_bps < req_self_drift
+                    || !(-15..=max_self_ext).contains(&self_ext_bps)
                 {
                     return false;
                 }
-                let slot_stair_locked =
-                    self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
                 if slot_idx > 0
-                    && (btc_drift_bps < 0
+                    && (btc_drift_bps < req_btc_drift
                         || !(0..=max_btc_ext).contains(&btc_ext_bps)
                         || slot_stair_locked)
                 {
@@ -2011,15 +2030,13 @@ impl OnlineAdaptiveGovernor {
                 }
             }
             Side::Ask => {
-                if self_drift_bps > -min_trend_drift
-                    || !(-max_self_ext..=20).contains(&self_ext_bps)
+                if self_drift_bps > -req_self_drift
+                    || !(-max_self_ext..=15).contains(&self_ext_bps)
                 {
                     return false;
                 }
-                let slot_stair_locked =
-                    self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
                 if slot_idx > 0
-                    && (btc_drift_bps > 0
+                    && (btc_drift_bps > -req_btc_drift
                         || !(-max_btc_ext..=0).contains(&btc_ext_bps)
                         || slot_stair_locked)
                 {
