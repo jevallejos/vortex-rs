@@ -1503,6 +1503,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         }
                                         client.cancel_all_symbol_orders(snap.symbol_id.name());
                                         fsm.state = OrderLifecycleState::Idle;
+                                        adaptive_gov.observe_queue_abort(
+                                            active_slot,
+                                            side,
+                                            entry_price.0,
+                                            snap.ts_local_ns,
+                                        );
                                         slot_cooldown_until_ns[active_slot] =
                                             snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
                                         arena.exec_abort_count.fetch_add(1, Ordering::Release);
