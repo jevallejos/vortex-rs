@@ -240,6 +240,37 @@ fn replay_captured_live_parquet_segments() {
     let evaluator = OrthogonalFactorState::new();
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
+    if let Ok(seed_file) = std::fs::File::open("deploy/forensic_vault_171.seed") {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(seed_file).lines().map_while(Result::ok) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                let net_s = (net_bps * 100.0).round() as i64;
+                let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
+                let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+                let ts_s = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let s_opt = match sym_str {
+                    "BTCUSDT" => Some(0),
+                    "ETHUSDT" => Some(1),
+                    "SOLUSDT" => Some(2),
+                    "AVAXUSDT" => Some(3),
+                    "TAOUSDT" => Some(4),
+                    "SUIUSDT" => Some(5),
+                    _ => None,
+                };
+                if let Some(si) = s_opt {
+                    let sd = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                    let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    adaptive_gov.seed_historical_price(si, sd, en_t, ex_t);
+                    adaptive_gov.observe_closed_trade(si, sd, ScaledBps(net_s), is_maker, TimestampNs(ts_s));
+                    let fee_s: i64 = if is_maker { 400 } else { 750 };
+                    fsm.observe_mfe_sample_for_slot(si, net_s + fee_s, is_maker);
+                }
+            }
+        }
+    }
     let mut ledger = ParitySyncLedger::new(10_000_000_000);
     let mut fifo_sim = FifoQueueSimulator::new();
     let mut btc_leader_snap = SymbolLobSnapshot::default();

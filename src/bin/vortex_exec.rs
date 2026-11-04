@@ -375,13 +375,6 @@ impl BybitV5LiveClient {
         gov_diag: (i64, u32, u32),
     ) -> bool {
         let symbol = spec.symbol_id.name();
-        if let Some((open_sym, existing_qty, open_side, _)) = self.get_any_account_open_position() {
-            println!(
-                "{}🟠 [BYBIT V5 GLOBAL ACCOUNT LOCK] Account already holds open position on {} ({} size={}) — blocking new entry on {}{}",
-                ANSI_ORANGE, open_sym, open_side, existing_qty, symbol, ANSI_RESET
-            );
-            return false;
-        }
         let (ew, ef) = spec.format_price_usdt_parts(entry_price);
         let (sw, sf) = spec.format_price_usdt_parts(sl_price);
         let bybit_side = match side {
@@ -646,16 +639,74 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
     Some(tx)
 }
 
+fn prewarm_governor_from_seed(
+    fsm: &mut ExecutionFsm,
+    adaptive_gov: &mut OnlineAdaptiveGovernor,
+) {
+    let seed_path = Path::new("deploy/forensic_vault_171.seed");
+    let file = match File::open(seed_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let reader = BufReader::new(file);
+    let mut seeded_count: u64 = 0;
+    for line in reader.lines().map_while(Result::ok) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+            let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+            let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+            let net_scaled_bps = (net_bps * 100.0).round() as i64;
+            let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
+            let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+            let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let slot_opt = match sym_str {
+                "BTCUSDT" => Some(0),
+                "ETHUSDT" => Some(1),
+                "SOLUSDT" => Some(2),
+                "AVAXUSDT" => Some(3),
+                "TAOUSDT" => Some(4),
+                "SUIUSDT" => Some(5),
+                _ => None,
+            };
+            if let Some(s_idx) = slot_opt {
+                let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
+                adaptive_gov.observe_closed_trade(
+                    s_idx,
+                    s_side,
+                    ScaledBps(net_scaled_bps),
+                    is_maker,
+                    TimestampNs(ts_saved),
+                );
+                let fee_s: i64 = if is_maker { 400 } else { 750 };
+                fsm.observe_mfe_sample_for_slot(s_idx, net_scaled_bps + fee_s, is_maker);
+                seeded_count += 1;
+            }
+        }
+    }
+    if seeded_count > 0 {
+        println!(
+            "{}🟢 [BRAIN PRE-WARM] Pre-warmed OnlineAdaptiveGovernor & Per-Slot MFE from {} historical seed trades (Session Counter: 0){}",
+            ANSI_GREEN, seeded_count, ANSI_RESET
+        );
+    }
+}
+
 fn rehydrate_shadow_ledger(
     ledger: &mut ParitySyncLedger,
     fsm: &mut ExecutionFsm,
     adaptive_gov: &mut OnlineAdaptiveGovernor,
     arena: &VortexShmArena,
 ) {
+    prewarm_governor_from_seed(fsm, adaptive_gov);
     let file_path = Path::new("data/vortex_shadow_trades.jsonl");
     let file = match File::open(file_path) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => {
+            arena.exec_closed_count.store(0, Ordering::Release);
+            return;
+        }
     };
     let reader = BufReader::new(file);
     let mut restored_count: u64 = 0;
@@ -1766,10 +1817,15 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             continue;
                         }
                         let spec = APPROVED_SPECS[active_slot];
-                        let post_only_crossed = match side {
-                            Side::Bid => snap.asks[0].price.0 > 0 && entry_price.0 >= snap.asks[0].price.0,
-                            Side::Ask => snap.bids[0].price.0 > 0 && entry_price.0 <= snap.bids[0].price.0,
+                        let l1_price_intact = match side {
+                            Side::Bid => snap.bids[0].price.0 == entry_price.0,
+                            Side::Ask => snap.asks[0].price.0 == entry_price.0,
                         };
+                        let post_only_crossed = !l1_price_intact
+                            || match side {
+                                Side::Bid => snap.asks[0].price.0 > 0 && entry_price.0 >= snap.asks[0].price.0,
+                                Side::Ask => snap.bids[0].price.0 > 0 && entry_price.0 <= snap.bids[0].price.0,
+                            };
                         let signal_still_valid = matches!(
                             evaluator.evaluate_entry_signal(&spec, &snap),
                             Ok(SignalVerdict::AuthorizeMakerEntry { side: s_now, .. }) if s_now == side
@@ -1812,16 +1868,17 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             }
                         }
 
-                        let _ = fsm.on_entry_order_resting(snap.ts_local_ns);
+                        let fresh_snap = slot.read_snapshot(4).unwrap_or(snap);
+                        let _ = fsm.on_entry_order_resting(fresh_snap.ts_local_ns);
                         let (init_q, init_cum_trade) = match side {
-                            Side::Bid => (snap.bids[0].qty, snap.cum_sell_trade_lots),
-                            Side::Ask => (snap.asks[0].qty, snap.cum_buy_trade_lots),
+                            Side::Bid => (fresh_snap.bids[0].qty, fresh_snap.cum_sell_trade_lots),
+                            Side::Ask => (fresh_snap.asks[0].qty, fresh_snap.cum_buy_trade_lots),
                         };
                         resting_init_queue_ahead = init_q;
                         resting_queue_ahead = init_q;
                         prev_l1_qty = init_q;
                         prev_cum_trade_lots = init_cum_trade;
-                        last_seen_seq[active_slot] = snap.sequence_id;
+                        last_seen_seq[active_slot] = fresh_snap.sequence_id;
 
                         arena.exec_state_code.store(2, Ordering::Release);
                         arena.exec_side.store(side as u64, Ordering::Release);
@@ -1829,7 +1886,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         arena.exec_peak_ticks.store(entry_price.0 as u64, Ordering::Release);
                         arena.exec_tp_ticks.store(0, Ordering::Release);
                         arena.exec_sl_ticks.store(sl_trigger_price.0 as u64, Ordering::Release);
-                        arena.exec_resting_since_ns.store(snap.ts_local_ns.0 as u64, Ordering::Release);
+                        arena.exec_resting_since_ns.store(fresh_snap.ts_local_ns.0 as u64, Ordering::Release);
                         arena.exec_queue_ahead_lots.store(resting_queue_ahead.0 as u64, Ordering::Release);
                         arena.exec_armed_count.fetch_add(1, Ordering::Release);
                         if live_client.is_none() {

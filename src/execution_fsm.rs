@@ -541,7 +541,7 @@ impl ExecutionFsm {
             let depleted_ratio = ((init_q - cur_q) as f64) / (init_q as f64);
             let crit_depletion = (0.55 * vol_norm).clamp(0.45, 0.72);
             let signed_flow_impulse = signed_ofi + 0.50 * signed_tfi;
-            if depleted_ratio >= crit_depletion && signed_flow_impulse <= (0.15 * vol_norm) {
+            if depleted_ratio >= crit_depletion && signed_flow_impulse <= (-0.05 * vol_norm) {
                 self.state = OrderLifecycleState::Idle;
                 return true;
             }
@@ -1410,6 +1410,15 @@ impl OnlineAdaptiveGovernor {
         self.abort_last_ts_ns[slot_idx][d] = ts_ns.0;
         self.abort_streak[slot_idx][1 - d] = 0;
         self.abort_anchor_px_1e4[slot_idx][1 - d] = 0;
+        if self.abort_streak[slot_idx][d] >= 2 {
+            let edge_c = self.ewma_net_bps_x100[slot_idx][d].clamp(-200, 400);
+            let streak_cap = i64::from(self.abort_streak[slot_idx][d].min(4));
+            let pause_secs = (45 * streak_cap - (edge_c / 20)).clamp(60, 150);
+            let cool_ns = ts_ns.0.saturating_add(pause_secs * 1_000_000_000);
+            if cool_ns > self.directional_cooldown_until_ns[slot_idx][d] {
+                self.directional_cooldown_until_ns[slot_idx][d] = cool_ns;
+            }
+        }
     }
 
     /// Updates 1Hz physical-clock fast (`20s`) and slow macro (`300s`) price EWMAs in `1e4` fixed-point scale.
@@ -1578,13 +1587,20 @@ impl OnlineAdaptiveGovernor {
         }
         let symbol_total_net =
             self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
-        if slot_idx == 0
-            && self.global_dir_sl_streak[d] >= 1
-            && self.global_dir_sl_streak[1 - d] >= 1
-            && self.last_global_win_dir == ((1 - d) as u8)
-            && symbol_total_net <= -4_500
-        {
-            return Some("VETO_POST_SL_OPPOSITE_DOMINANCE");
+        if slot_idx == 0 {
+            if self.global_dir_win_streak[1 - d] >= 2
+                && self.wave_step_count[0][1 - d] >= 1
+                && check_ts_ns.saturating_sub(self.last_global_win_ts_ns) <= 300_000_000_000
+            {
+                return Some("VETO_ALTCOIN_COUNTER_CASCADE");
+            }
+            if self.global_dir_sl_streak[d] >= 1
+                && self.global_dir_sl_streak[1 - d] >= 1
+                && self.last_global_win_dir == ((1 - d) as u8)
+                && symbol_total_net <= -4_500
+            {
+                return Some("VETO_POST_SL_OPPOSITE_DOMINANCE");
+            }
         }
 
         if slot_idx > 0 {
@@ -2241,7 +2257,7 @@ mod tests {
         let mut prev_close_ts_ns = 0_i64;
 
         println!("==========================================================================================================");
-        println!("[VORTEX LOSS-LAB & 201-TRADE COUNTERFACTUAL SIMULATOR] (deploy/forensic_vault_171.seed)");
+        println!("[VORTEX LOSS-LAB & 203-TRADE COUNTERFACTUAL SIMULATOR] (deploy/forensic_vault_171.seed)");
         println!("----------------------------------------------------------------------------------------------------------");
         println!(
             "{:<6} | {:<13} | {:<11} | {:>10} | {:<14} | SHIELD / MITIGATION MECHANISM",
@@ -2640,7 +2656,9 @@ mod tests {
         // 3. Verify Runaway Abort Exhaustion Guard blocks chasing after 2+ aborted entries:
         gov.observe_queue_abort(1, Side::Ask, 229_200, TimestampNs(2_000_000_000_000));
         gov.observe_queue_abort(1, Side::Ask, 228_950, TimestampNs(2_015_000_000_000));
-        let veto_chase = gov.audit_historical_entry_veto(1, Side::Ask, 228_600, 2_030_000_000_000);
+        let veto_cool = gov.audit_historical_entry_veto(1, Side::Ask, 228_950, 2_030_000_000_000);
+        assert_eq!(veto_cool, Some("VETO_SLOT_COOLDOWN"));
+        let veto_chase = gov.audit_historical_entry_veto(1, Side::Ask, 228_600, 2_110_000_000_000);
         assert_eq!(veto_chase, Some("VETO_RUNAWAY_ABORT_EXHAUSTION"));
     }
 }
