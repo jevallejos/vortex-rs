@@ -510,10 +510,10 @@ impl BybitV5LiveClient {
                     / entry_price.0.max(1);
                 let span_bps = (summary.gross_scaled_bps.raw() - q_bps).max(0);
                 let att_i64 = attempt as i64;
-                let relaxed_ref_bps = if summary.gross_scaled_bps.raw() < 560 {
+                let relaxed_ref_bps = if summary.gross_scaled_bps.raw() < 500 {
                     ScaledBps(q_bps)
                 } else {
-                    ScaledBps(q_bps + (span_bps * (8 - att_i64).max(0)) / (8 + att_i64))
+                    ScaledBps(q_bps + (span_bps * (12 - att_i64).max(0)) / (12 + att_i64))
                 };
                 let peg_price = if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(latest_snap) = slot.read_snapshot(4) {
@@ -696,7 +696,7 @@ fn prewarm_governor_prices_from_parquet(adaptive_gov: &mut OnlineAdaptiveGoverno
         }
     }
     paths.sort();
-    let start_idx = paths.len().saturating_sub(32);
+    let start_idx = paths.len().saturating_sub(512);
     for path in &paths[start_idx..] {
         if let Ok(b) = vortex_rs::forensic_parquet::ColumnarParquetBatch::read_from_file(path) {
             let mut idx = 0;

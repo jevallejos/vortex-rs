@@ -531,11 +531,25 @@ fn replay_captured_live_parquet_segments() {
                                 let saved_ledger = ledger;
                                 if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
                                     if summary.is_maker_exit {
+                                        let def_px =
+                                            ExecutionFsm::defensive_zero_loss_maker_exit_price(
+                                                summary.side,
+                                                summary.entry_price,
+                                            );
+                                        let q_bps = ((def_px.0 - summary.entry_price.0)
+                                            .abs()
+                                            .saturating_mul(1_000_000))
+                                            / summary.entry_price.0.max(1);
+                                        let ref_bps = if summary.gross_scaled_bps.raw() < 500 {
+                                            ScaledBps(q_bps)
+                                        } else {
+                                            summary.gross_scaled_bps
+                                        };
                                         let clamped_exit = saved_fsm.compute_elastic_deep_exit_peg(
                                             summary.side,
                                             summary.entry_price,
                                             &snap,
-                                            summary.gross_scaled_bps,
+                                            ref_bps,
                                             0,
                                         );
                                         fsm = saved_fsm;
