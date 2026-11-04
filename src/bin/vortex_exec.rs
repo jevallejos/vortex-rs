@@ -318,7 +318,7 @@ impl BybitV5LiveClient {
                                 let adopt_side = if open_side_str == "Sell" { Side::Ask } else { Side::Bid };
                                 let mfe_bps = fsm.slot_learned_mfe_bps(spec.symbol_id).clamp(600, 1_600);
                                 let tp_d = ((entry_t.0 * (mfe_bps * 6)) / 1_000_000).max(2);
-                                let sl_d = ((entry_t.0 * 3_800) / 1_000_000).max(4);
+                                let sl_d = ((entry_t.0 * 2_450) / 1_000_000).max(4);
                                 let (tp_t, sl_t) = match adopt_side {
                                     Side::Bid => (PriceTicks(entry_t.0 + tp_d), PriceTicks((entry_t.0 - sl_d).max(1))),
                                     Side::Ask => (PriceTicks((entry_t.0 - tp_d).max(1)), PriceTicks(entry_t.0 + sl_d)),
@@ -610,9 +610,9 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
         ANSI_GREEN, ANSI_RESET
     );
     let mode_banner = if live_capital_enabled {
-        "🟢 [VORTEX-L2 VORAGINE V0.3 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
+        "🟢 [VORTEX-L2 VORAGINE V0.3.2 — DUAL-SPEED ELASTIC FLOOR & SCAR-DEBT GOVERNOR]\nBybit UTA V5 Global Lock + Non-Abandoning Exit + Macro BTC Filter active."
     } else {
-        "🟢 [VORTEX-L2 VORAGINE V0.3 — PAPER-TRUE LAB MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
+        "🟢 [VORTEX-L2 VORAGINE V0.3.2 — PAPER-TRUE LAB MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
     let _ = tx.try_send(mode_banner.to_owned());
     thread::spawn(move || {
@@ -1255,7 +1255,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     println!(
-        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Voragine V0.3 Per-Slot MFE & Deep L2/L3 Peg & Moallemi dQ/dt Shield){}",
+        "{}🟢 [DAEMON 200.0 Hz] Attached to MAP_SHARED arena (SHM v{}: {}) | LiveCapital={} (Voragine V0.3.2 Per-Slot MFE & Deep L2/L3 Peg & Moallemi dQ/dt Shield){}",
         ANSI_GREEN,
         arena.version,
         shm_path.display(),

@@ -1669,9 +1669,23 @@ impl OnlineAdaptiveGovernor {
         let symbol_total_net =
             self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
         if slot_idx == 0 {
+            let opp_anc_1e4 = self.wave_anchor_px_1e4[0][1 - d];
+            let opp_whipsaw_bps = if opp_anc_1e4 > 0 && cur_1e4 > 0 {
+                match side {
+                    Side::Bid => {
+                        ((cur_1e4 - opp_anc_1e4).saturating_mul(1_000_000)) / opp_anc_1e4
+                    }
+                    Side::Ask => {
+                        ((opp_anc_1e4 - cur_1e4).saturating_mul(1_000_000)) / opp_anc_1e4
+                    }
+                }
+            } else {
+                -1
+            };
             if self.global_dir_win_streak[1 - d] >= 2
                 && self.wave_step_count[0][1 - d] >= 1
-                && check_ts_ns.saturating_sub(self.last_global_win_ts_ns) <= 300_000_000_000
+                && (check_ts_ns.saturating_sub(self.last_global_win_ts_ns) <= 300_000_000_000
+                    || opp_whipsaw_bps >= 0)
             {
                 return Some("VETO_ALTCOIN_COUNTER_CASCADE");
             }
@@ -3192,13 +3206,38 @@ mod tests {
             1_793_800_300_000_000_000,
         );
         assert_eq!(par1_loss_veto, Some("VETO_WAVE_STAIRCASE_25BPS"));
-        // PAR1 #7: ETHUSDT Ask @ 231494t (+4.33 bps WIN) -> AUTHORIZED!
-        let par1_win_ok = gov.audit_historical_entry_veto(
+        // PAR1 #3 & #4: ETHUSDT Ask (+3.98 bps WIN) + BTCUSDT Ask 783236t -> 782748t (+2.23 bps WIN)
+        gov.seed_historical_price(1, Side::Ask, 231_766, 231_581);
+        gov.observe_closed_trade(
             1,
             Side::Ask,
-            231_494,
-            1_793_800_600_000_000_000,
+            ScaledBps(398),
+            true,
+            TimestampNs(1_793_800_400_000_000_000),
         );
-        assert_eq!(par1_win_ok, None);
+        gov.seed_historical_price(0, Side::Ask, 783_236, 782_748);
+        gov.observe_closed_trade(
+            0,
+            Side::Ask,
+            ScaledBps(223),
+            true,
+            TimestampNs(1_793_800_550_000_000_000),
+        );
+        // PAR1 #5: BTCUSDT Bid @ 784051t (+10.41 bps whipsaw above Ask anchor 783236t) -> VETOED!
+        let par1_btc_whipsaw = gov.audit_historical_entry_veto(
+            0,
+            Side::Bid,
+            784_051,
+            1_793_801_000_000_000_000,
+        );
+        assert_eq!(par1_btc_whipsaw, Some("VETO_ALTCOIN_COUNTER_CASCADE"));
+        // PAR1 #6: BTCUSDT Bid @ 782991t (-3.13 bps discount below Ask anchor 783236t) -> AUTHORIZED!
+        let par1_btc_discount_ok = gov.audit_historical_entry_veto(
+            0,
+            Side::Bid,
+            782_991,
+            1_793_801_100_000_000_000,
+        );
+        assert_eq!(par1_btc_discount_ok, None);
     }
 }

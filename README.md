@@ -11,7 +11,7 @@ El sistema opera bajo una topología desacoplada de Doble Demonio (vortex-tap.se
 ### Hitos Certificados en Producción (Vorágine V0.3)
 
 * Gobernanza Algorítmica Sin Sesgos (No-Sesgo / No-Maquillaje) y Superficie Continua C1/C2: Erradicación total de umbrales estáticos heredados (440 / 600 ScaledBps), reemplazados por una bifurcación elástica entre Flujo Sano (structural_win_floor: 500..550 ScaledBps = +1.00 a +1.50 bps netos) y Régimen Adverso (zero_loss_scratch_floor: piso cuántico comisión + 1 tick), junto con un piso anti-ruido de -28.50 bps en el Stop-Loss de servidor.
-* Certificación Contrafactual LOSS-LAB (33 / 33 = 100.0%): Sobre el consolidado maestro deduplicado de 201 operaciones históricas reales (deploy/forensic_vault_171.seed) y la auditoría cruzada contra 6,373 órdenes del extracto oficial de Bybit UTA V5, los 6 Escudos Estructurales del OnlineAdaptiveGovernor y el piso continuo mitigan el 100% de las 29 pérdidas históricas (19 ServerMarkPriceStopLoss y 10 MakerSubFee).
+* Certificación Contrafactual LOSS-LAB (36 / 36 = 100.0%): Sobre el consolidado maestro deduplicado de 221 operaciones históricas reales (deploy/forensic_vault_171.seed) y la auditoría cruzada contra 6,373 órdenes del extracto oficial de Bybit UTA V5, los 6 Escudos Estructurales del OnlineAdaptiveGovernor y el piso continuo mitigan el 100% de las 29 pérdidas históricas (19 ServerMarkPriceStopLoss y 10 MakerSubFee).
 * Rendimiento Determinista del Simulador Walk-Forward (vortex_replay): Procesamiento vectorizado de 750M a 1.26B eventos/segundo (200,000 eventos en 0.158–0.221 ms) con simulación exacta de prioridad de cola FIFO L1.
 
 ---
@@ -106,7 +106,7 @@ El sistema opera bajo una topología desacoplada de Doble Demonio (vortex-tap.se
 
 * 1. Verificar 0 Warnings en Clippy:
   cargo clippy --all-targets -- -D warnings
-* 2. Compilar y Ejecutar los 24 / 24 Tests Unitarios + LOSS-LAB (33/33):
+* 2. Compilar y Ejecutar los 29 / 29 Tests Unitarios + LOSS-LAB (36/36):
   cargo test -- --test-threads=1 --nocapture
 * 3. Sellar Commit, Rama de Punto de Inflexión y Tag hacia GitHub:
   git add -A; git commit -m "feat(voragine-v0.3): ..."; git branch -f checkpoint/voragine-v0.3-inflection HEAD; git tag -f voragine-v0.3; git push origin main checkpoint/voragine-v0.3-inflection --tags --force
@@ -142,7 +142,7 @@ El sistema opera bajo una topología desacoplada de Doble Demonio (vortex-tap.se
 * FILL-ON-ABORT RECOVERED: Mecanismo de rescate atómico que detecta cuando una orden en la cola L1 fue llenada en Bybit milisegundos antes de que llegara la petición de cancelación, adoptando inmediatamente la posición bajo custodia Maker.
 * L1 / L2 (Level 1 / Level 2 Order Book): L1 es la mejor punta del libro (BestBid / BestAsk); L2 es la profundidad completa de los 50 niveles de precios y volúmenes (orderbook.50).
 * Limit PostOnly (Orden Pasiva Creadora de Liquidez): Tipo de orden que garantiza que siempre entras o sales como Maker (tarifa reducida de 2.00 bps). Si cruzara el spread al llegar al servidor de Bybit, Bybit la rechaza automáticamente en vez de cobrarte como Taker (5.50 bps).
-* LOSS-LAB (Laboratorio Contrafactual de Pérdidas): Prueba automatizada en src/execution_fsm.rs que reproduce las 201 operaciones históricas reales (deploy/forensic_vault_171.seed) y certifica que las 29 pérdidas históricas son mitigadas al 100% (33/33).
+* LOSS-LAB (Laboratorio Contrafactual de Pérdidas): Prueba automatizada en src/execution_fsm.rs que reproduce las 221 operaciones históricas reales (deploy/forensic_vault_171.seed) y certifica que las 29 pérdidas históricas son mitigadas al 100% (33/33).
 * MakerPassiveUnwind: Cierre normal de una posición mediante una orden pasiva Limit PostOnly reduceOnly colocada en el lado legal del BBO (BestAsk para cerrar un Largo, BestBid para cerrar un Corto).
 * MFE (Maximum Favorable Excursion): La máxima ganancia bruta en ScaledBps o ticks (peak_favorable_price) que una posición abierta ha llegado a tocar a tu favor desde su apertura.
 * OOS (Out-of-Sample / Fuera de Muestra): Validación estadística sobre datos que no fueron utilizados para calibrar los parámetros, evitando el sobreajuste (overfitting).

@@ -78,7 +78,7 @@ if [ "${1:-}" = "--paper-true" ]; then
 fi
 sudo tee /etc/systemd/system/vortex-exec.service > /dev/null <<EOF
 [Unit]
-Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Voragine V0.3)
+Description=VORTEX-L2 200Hz Seqlock Execution FSM Daemon (Voragine V0.3.2)
 After=vortex-tap.service
 Requires=vortex-tap.service
 [Service]
@@ -169,7 +169,7 @@ sudo chmod +x /usr/local/bin/vortex
 sudo systemctl daemon-reload
 if [ "${1:-}" = "--no-start" ]; then
     sudo systemctl stop vortex-exec.service vortex-tap.service 2>/dev/null || true
-    echo "[OK] VORTEX-L2 Voragine V0.3 binaries installed and verified (Services kept in STOP mode)."
+    echo "[OK] VORTEX-L2 Voragine V0.3.2 binaries installed and verified (Services kept in STOP mode)."
     exit 0
 fi
 sudo systemctl enable vortex-tap.service vortex-exec.service >/dev/null 2>&1 || true
