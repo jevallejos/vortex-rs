@@ -643,13 +643,16 @@ impl ExecutionFsm {
         let cur_gross_now =
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
-        let wald_contraction_pct = if hold_ns > wald_grace_ns
-            && (peak_gross_now < 650 || cur_gross_now < -800)
+        let early_adverse_stall =
+            hold_ns > immunity_ns && peak_gross_now < 550 && cur_gross_now < -600 && adv_p >= 0.18;
+        let wald_contraction_pct = if (hold_ns > wald_grace_ns
+            && (peak_gross_now < 650 || cur_gross_now < -800))
+            || early_adverse_stall
         {
-            let over_ns = hold_ns - wald_grace_ns;
-            let time_c = ((over_ns * 14) / STAGNANT_PROFIT_HOLD_NS).clamp(0, 14);
-            let flow_c = (adv_p * adv_p * 12.0) as i64;
-            let inst_c = (time_c + flow_c).clamp(0, 22);
+            let over_ns = hold_ns.saturating_sub(immunity_ns);
+            let time_c = ((over_ns * 16) / STAGNANT_PROFIT_HOLD_NS).clamp(0, 16);
+            let flow_c = (adv_p * adv_p * 16.0) as i64;
+            let inst_c = (time_c + flow_c).clamp(0, 26);
             if inst_c > self.max_wald_contraction_pct {
                 self.max_wald_contraction_pct = inst_c;
             }
@@ -797,8 +800,13 @@ impl ExecutionFsm {
                 || deep_joint_adverse
                 || flow_conviction <= -0.12
                 || (hold_elapsed >= elastic_zombie_ns && !strong_trend_continuation);
-            let allowed_base_floor = if adverse_regime {
+            let severe_adverse_regime =
+                deep_joint_adverse || (hold_elapsed >= elastic_zombie_ns && !strong_trend_continuation);
+            let mild_adverse_floor = (zero_loss_scratch_floor + structural_win_floor) / 2;
+            let allowed_base_floor = if severe_adverse_regime {
                 zero_loss_scratch_floor
+            } else if adverse_regime {
+                mild_adverse_floor
             } else {
                 structural_win_floor
             };
@@ -1574,7 +1582,12 @@ impl OnlineAdaptiveGovernor {
             let exhausted_scratch_cap = 550 + (learned_edge / 3);
             let had_exhausted_scratch =
                 self.wave_step_count[slot_idx][d] > self.win_streak[slot_idx][d];
+            let cross_wave_window_ns = (480 + learned_edge) * 1_000_000_000;
+            let active_cross_slot_staircase = self.win_streak[slot_idx][d] >= 1
+                && self.global_dir_win_streak[d] >= 2
+                && check_ts_ns.saturating_sub(self.wave_anchor_ts_ns[slot_idx][d]) <= cross_wave_window_ns;
             if (self.win_streak[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
+                || (active_cross_slot_staircase && chased_bps > elastic_stair_cap)
                 || (self.win_streak[slot_idx][d] >= 1 && chased_bps > elastic_single_cap)
                 || (self.wave_step_count[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
                 || (had_exhausted_scratch && chased_bps > exhausted_scratch_cap)
@@ -2265,7 +2278,7 @@ mod tests {
         let mut prev_close_ts_ns = 0_i64;
 
         println!("==========================================================================================================");
-        println!("[VORTEX LOSS-LAB & 203-TRADE COUNTERFACTUAL SIMULATOR] (deploy/forensic_vault_171.seed)");
+        println!("[VORTEX LOSS-LAB & 219-TRADE COUNTERFACTUAL SIMULATOR] (deploy/forensic_vault_171.seed)");
         println!("----------------------------------------------------------------------------------------------------------");
         println!(
             "{:<6} | {:<13} | {:<11} | {:>10} | {:<14} | SHIELD / MITIGATION MECHANISM",

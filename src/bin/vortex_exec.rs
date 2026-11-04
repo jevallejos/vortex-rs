@@ -511,7 +511,7 @@ impl BybitV5LiveClient {
                 let span_bps = (summary.gross_scaled_bps.raw() - q_bps).max(0);
                 let att_i64 = attempt as i64;
                 let relaxed_ref_bps =
-                    ScaledBps(q_bps + (span_bps * (8 - att_i64)) / (8 + att_i64));
+                    ScaledBps(q_bps + (span_bps * (12 - att_i64)) / (12 + att_i64));
                 let peg_price = if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(latest_snap) = slot.read_snapshot(4) {
                         fsm.compute_elastic_deep_exit_peg(
