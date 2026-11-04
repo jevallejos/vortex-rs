@@ -639,10 +639,7 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
     Some(tx)
 }
 
-fn prewarm_governor_from_seed(
-    fsm: &mut ExecutionFsm,
-    adaptive_gov: &mut OnlineAdaptiveGovernor,
-) {
+fn prewarm_mfe_from_seed(fsm: &mut ExecutionFsm) {
     let seed_path = Path::new("deploy/forensic_vault_171.seed");
     let file = match File::open(seed_path) {
         Ok(f) => f,
@@ -654,10 +651,11 @@ fn prewarm_governor_from_seed(
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
             let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
             let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+            if !is_maker || net_bps < 1.00 {
+                continue;
+            }
             let net_scaled_bps = (net_bps * 100.0).round() as i64;
             let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
-            let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
-            let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
             let slot_opt = match sym_str {
                 "BTCUSDT" => Some(0),
                 "ETHUSDT" => Some(1),
@@ -668,26 +666,14 @@ fn prewarm_governor_from_seed(
                 _ => None,
             };
             if let Some(s_idx) = slot_opt {
-                let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
-                let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
-                adaptive_gov.observe_closed_trade(
-                    s_idx,
-                    s_side,
-                    ScaledBps(net_scaled_bps),
-                    is_maker,
-                    TimestampNs(ts_saved),
-                );
-                let fee_s: i64 = if is_maker { 400 } else { 750 };
-                fsm.observe_mfe_sample_for_slot(s_idx, net_scaled_bps + fee_s, is_maker);
+                fsm.observe_mfe_sample_for_slot(s_idx, net_scaled_bps + 400, true);
                 seeded_count += 1;
             }
         }
     }
     if seeded_count > 0 {
         println!(
-            "{}🟢 [BRAIN PRE-WARM] Pre-warmed OnlineAdaptiveGovernor & Per-Slot MFE from {} historical seed trades (Session Counter: 0){}",
+            "{}🟢 [MFE PRE-WARM] Calibrated Per-Slot MFE from {} structural winning seed trades (Session Counter: 0){}",
             ANSI_GREEN, seeded_count, ANSI_RESET
         );
     }
@@ -699,7 +685,7 @@ fn rehydrate_shadow_ledger(
     adaptive_gov: &mut OnlineAdaptiveGovernor,
     arena: &VortexShmArena,
 ) {
-    prewarm_governor_from_seed(fsm, adaptive_gov);
+    prewarm_mfe_from_seed(fsm);
     let file_path = Path::new("data/vortex_shadow_trades.jsonl");
     let file = match File::open(file_path) {
         Ok(f) => f,

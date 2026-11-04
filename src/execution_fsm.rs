@@ -1719,6 +1719,14 @@ impl OnlineAdaptiveGovernor {
             if rescue_cooldown_ns > self.directional_cooldown_until_ns[slot_idx][d] {
                 self.directional_cooldown_until_ns[slot_idx][d] = rescue_cooldown_ns;
             }
+            if slot_idx == 0 && net_scaled_bps.raw() < elastic_opp_reset_bps {
+                let glob_rescue_secs =
+                    (148 - (net_scaled_bps.raw() * 2) - (edge_clamped / 25)).clamp(110, 150);
+                let glob_rescue_ns = ts_ns.0.saturating_add(glob_rescue_secs * 1_000_000_000);
+                if glob_rescue_ns > self.global_dir_cooldown_until_ns[d] {
+                    self.global_dir_cooldown_until_ns[d] = glob_rescue_ns;
+                }
+            }
         } else {
             let w = self.win_streak[slot_idx][d].saturating_add(1);
             self.win_streak[slot_idx][d] = w;
@@ -2654,11 +2662,12 @@ mod tests {
         assert_eq!(veto_t30, Some("VETO_WAVE_STAIRCASE_25BPS"));
 
         // 3. Verify Runaway Abort Exhaustion Guard blocks chasing after 2+ aborted entries:
-        gov.observe_queue_abort(1, Side::Ask, 229_200, TimestampNs(2_000_000_000_000));
-        gov.observe_queue_abort(1, Side::Ask, 228_950, TimestampNs(2_015_000_000_000));
-        let veto_cool = gov.audit_historical_entry_veto(1, Side::Ask, 228_950, 2_030_000_000_000);
+        let mut gov_chase = OnlineAdaptiveGovernor::new();
+        gov_chase.observe_queue_abort(1, Side::Ask, 229_200, TimestampNs(2_000_000_000_000));
+        gov_chase.observe_queue_abort(1, Side::Ask, 228_950, TimestampNs(2_015_000_000_000));
+        let veto_cool = gov_chase.audit_historical_entry_veto(1, Side::Ask, 228_950, 2_030_000_000_000);
         assert_eq!(veto_cool, Some("VETO_SLOT_COOLDOWN"));
-        let veto_chase = gov.audit_historical_entry_veto(1, Side::Ask, 228_600, 2_110_000_000_000);
+        let veto_chase = gov_chase.audit_historical_entry_veto(1, Side::Ask, 228_600, 2_110_000_000_000);
         assert_eq!(veto_chase, Some("VETO_RUNAWAY_ABORT_EXHAUSTION"));
     }
 }

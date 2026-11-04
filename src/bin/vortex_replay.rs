@@ -246,10 +246,11 @@ fn replay_captured_live_parquet_segments() {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                 let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
                 let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                if !is_maker || net_bps < 1.00 {
+                    continue;
+                }
                 let net_s = (net_bps * 100.0).round() as i64;
                 let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
-                let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
-                let ts_s = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let s_opt = match sym_str {
                     "BTCUSDT" => Some(0),
                     "ETHUSDT" => Some(1),
@@ -260,13 +261,7 @@ fn replay_captured_live_parquet_segments() {
                     _ => None,
                 };
                 if let Some(si) = s_opt {
-                    let sd = if side_str == "Ask" { Side::Ask } else { Side::Bid };
-                    let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                    let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                    adaptive_gov.seed_historical_price(si, sd, en_t, ex_t);
-                    adaptive_gov.observe_closed_trade(si, sd, ScaledBps(net_s), is_maker, TimestampNs(ts_s));
-                    let fee_s: i64 = if is_maker { 400 } else { 750 };
-                    fsm.observe_mfe_sample_for_slot(si, net_s + fee_s, is_maker);
+                    fsm.observe_mfe_sample_for_slot(si, net_s + 400, true);
                 }
             }
         }
