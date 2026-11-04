@@ -1444,7 +1444,7 @@ impl OnlineAdaptiveGovernor {
             self.directional_cooldown_until_ns[slot_idx][1 - d] = opp_whip_ns;
         }
         let elapsed_glob = ts_ns.0.saturating_sub(self.global_abort_last_ts_ns[d]);
-        if self.global_dir_abort_streak[d] == 0 || elapsed_glob > 180_000_000_000 {
+        if self.global_dir_abort_streak[d] == 0 || elapsed_glob > 360_000_000_000 {
             self.global_dir_abort_streak[d] = 1;
         } else {
             self.global_dir_abort_streak[d] =
@@ -1986,43 +1986,50 @@ impl OnlineAdaptiveGovernor {
         if self.price_sample_count[slot_idx] < 25 {
             return false;
         }
-        if self.sl_streak[slot_idx][1 - d] >= 1 && self.last_sl_ts_ns > 0 {
-            let opp_debt_abs = (-self.cum_net_bps_x100[slot_idx][1 - d]).max(0);
-            let opp_sl_s = i64::from(self.sl_streak[slot_idx][1 - d].min(4));
-            let whip_secs = ((120 + (opp_debt_abs / 25)) * opp_sl_s).clamp(180, 600);
-            let whip_ns = whip_secs * 1_000_000_000;
-            if candidate_snap.ts_local_ns.0.saturating_sub(self.last_sl_ts_ns) < whip_ns {
-                return false;
-            }
+        let sym_net_x100 = self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
+        let sym_debt_abs = (-sym_net_x100).max(0);
+        if self.global_dir_sl_streak[d] >= 1 && self.global_dir_win_streak[d] == 0 {
+            return false;
         }
-        let min_trend_drift = ((((320 - learned_edge).max(120)) * self_vol) / 20_000).max(35);
-        let min_btc_drift = (btc_vol / 250).max(20);
-        let max_self_ext = ((self_vol / 11) + (learned_edge / 3)).clamp(380, 850);
-        let max_btc_ext = ((btc_vol / 11) + (learned_edge / 3)).clamp(380, 850);
+        if self.sl_streak[slot_idx][1 - d] >= 1
+            && self.win_streak[slot_idx][d] == 0
+            && sym_debt_abs >= 1_500
+        {
+            return false;
+        }
+        let abort_pressure = i64::from(
+            (self.abort_streak[slot_idx][d] + self.global_dir_abort_streak[d]).min(6),
+        );
+        let base_drift = (((260 - learned_edge).max(60)) * self_vol) / 26_000;
+        let min_trend_drift =
+            (base_drift + (sym_debt_abs / 80) + (abort_pressure * 6)).max(12);
+        let min_btc_drift = (btc_vol / 300).max(12);
+        let max_self_ext = ((self_vol / 22) + (learned_edge / 5)
+            - (sym_debt_abs / 20)
+            - (abort_pressure * 25))
+            .clamp(180, 420);
+        let max_btc_ext = ((btc_vol / 22) + (learned_edge / 5)
+            - (sym_debt_abs / 20)
+            - (abort_pressure * 25))
+            .clamp(180, 420);
         let leader_opp_wave_active = slot_idx > 0
-            && self.wave_step_count[0][1 - d] >= 1
-            && self.last_global_win_dir == ((1 - d) as u8);
-        let req_self_drift = if leader_opp_wave_active {
-            min_trend_drift * 2
-        } else {
-            min_trend_drift
-        };
-        let req_btc_drift = if leader_opp_wave_active {
-            min_btc_drift * 2
-        } else {
-            min_btc_drift
-        };
+            && ((self.wave_step_count[0][1 - d] >= 1
+                && self.last_global_win_dir == ((1 - d) as u8))
+                || self.abort_streak[0][d] >= 1);
+        if leader_opp_wave_active {
+            return false;
+        }
         let slot_stair_locked =
             self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
         match side {
             Side::Bid => {
-                if self_drift_bps < req_self_drift
-                    || !(-15..=max_self_ext).contains(&self_ext_bps)
+                if self_drift_bps < min_trend_drift
+                    || !(-20..=max_self_ext).contains(&self_ext_bps)
                 {
                     return false;
                 }
                 if slot_idx > 0
-                    && (btc_drift_bps < req_btc_drift
+                    && (btc_drift_bps < min_btc_drift
                         || !(0..=max_btc_ext).contains(&btc_ext_bps)
                         || slot_stair_locked)
                 {
@@ -2030,13 +2037,13 @@ impl OnlineAdaptiveGovernor {
                 }
             }
             Side::Ask => {
-                if self_drift_bps > -req_self_drift
-                    || !(-max_self_ext..=15).contains(&self_ext_bps)
+                if self_drift_bps > -min_trend_drift
+                    || !(-max_self_ext..=20).contains(&self_ext_bps)
                 {
                     return false;
                 }
                 if slot_idx > 0
-                    && (btc_drift_bps > -req_btc_drift
+                    && (btc_drift_bps > -min_btc_drift
                         || !(-max_btc_ext..=0).contains(&btc_ext_bps)
                         || slot_stair_locked)
                 {
@@ -2097,15 +2104,15 @@ impl OnlineAdaptiveGovernor {
             };
             let btc_not_opposing = match side {
                 Side::Bid => {
-                    btc_leader_snap.factor_ofi.get() >= 0.05
-                        && btc_leader_snap.factor_tfi.get() >= 0.0
+                    btc_leader_snap.factor_ofi.get() >= 0.15
+                        && btc_leader_snap.factor_tfi.get() >= 0.10
                 }
                 Side::Ask => {
-                    btc_leader_snap.factor_ofi.get() <= -0.05
-                        && btc_leader_snap.factor_tfi.get() <= 0.0
+                    btc_leader_snap.factor_ofi.get() <= -0.15
+                        && btc_leader_snap.factor_tfi.get() <= -0.10
                 }
             };
-            let min_btc_align = 0.08 + 0.08 * sl_s + 0.45 * (debt_penalty + global_penalty);
+            let min_btc_align = 0.22 + 0.08 * sl_s + 0.45 * (debt_penalty + global_penalty);
             if !btc_not_opposing || signed_btc_alignment < min_btc_align {
                 return false;
             }
