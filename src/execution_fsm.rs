@@ -645,8 +645,12 @@ impl ExecutionFsm {
         let cur_gross_now =
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
-        let early_adverse_stall =
-            hold_ns > wald_grace_ns && peak_gross_now < 550 && cur_gross_now < -450 && adv_p >= 0.15;
+        let severe_adverse_collapse =
+            hold_ns >= STAGNANT_PROFIT_HOLD_NS || (adv_p >= 0.50 && cur_gross_now < -850);
+        let early_adverse_stall = hold_ns > wald_grace_ns
+            && peak_gross_now < 550
+            && cur_gross_now < -450
+            && adv_p >= 0.25;
         let wald_contraction_pct = if (hold_ns > wald_grace_ns
             && (peak_gross_now < 650 || cur_gross_now < -800))
             || early_adverse_stall
@@ -654,8 +658,13 @@ impl ExecutionFsm {
             let over_ns = hold_ns.saturating_sub(immunity_ns);
             let time_c = ((over_ns * 24) / wald_grace_ns.max(1)).clamp(0, 24);
             let flow_c = ((adv_p * adv_p * 36.0) as i64).clamp(0, 28);
-            let depth_c = ((-cur_gross_now - 400).max(0) / 45).clamp(0, 26);
-            let inst_c = (time_c + flow_c + depth_c).clamp(0, 48);
+            let depth_c = if severe_adverse_collapse {
+                ((-cur_gross_now - 400).max(0) / 45).clamp(0, 26)
+            } else {
+                0
+            };
+            let max_cap = if severe_adverse_collapse { 48 } else { 22 };
+            let inst_c = (time_c + flow_c + depth_c).clamp(0, max_cap);
             if inst_c > self.max_wald_contraction_pct {
                 self.max_wald_contraction_pct = inst_c;
             }
@@ -663,7 +672,8 @@ impl ExecutionFsm {
         } else {
             self.max_wald_contraction_pct
         };
-        let min_noise_sl_dist = ((entry_price.0 * 1_350) / 1_000_000).max(4);
+        let min_sl_floor_bps = if severe_adverse_collapse { 1_350 } else { 2_150 };
+        let min_noise_sl_dist = ((entry_price.0 * min_sl_floor_bps) / 1_000_000).max(4);
         let eff_sl_dist = ((base_sl_dist * (100 - wald_contraction_pct)) / 100)
             .max(min_noise_sl_dist);
         let eff_sl_trigger = match side {
@@ -804,13 +814,8 @@ impl ExecutionFsm {
                 || deep_joint_adverse
                 || flow_conviction <= -0.12
                 || (hold_elapsed >= elastic_zombie_ns && !strong_trend_continuation);
-            let severe_adverse_regime =
-                deep_joint_adverse || (hold_elapsed >= elastic_zombie_ns && !strong_trend_continuation);
-            let mild_adverse_floor = (zero_loss_scratch_floor + structural_win_floor) / 2;
-            let allowed_base_floor = if severe_adverse_regime {
+            let allowed_base_floor = if adverse_regime {
                 zero_loss_scratch_floor
-            } else if adverse_regime {
-                mild_adverse_floor
             } else {
                 structural_win_floor
             };
@@ -858,8 +863,8 @@ impl ExecutionFsm {
                 && current_gross_bps.raw() >= elastic_harvest_floor;
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= elastic_scratch_ns
-                && current_gross_bps.raw() >= allowed_base_floor
-                && deep_joint_adverse;
+                && current_gross_bps.raw() >= zero_loss_scratch_floor
+                && (joint_adverse || deep_joint_adverse || flow_conviction <= -0.15);
             let struggling_rescue = !in_trend_free_ride_zone
                 && ((hold_elapsed >= elastic_struggle_ns
                     && joint_adverse
@@ -1149,7 +1154,7 @@ impl ExecutionFsm {
         let vol_norm = ((vol_5m as f64) / 6_000.0).clamp(0.80, 1.30);
         let conv_threshold = 0.25 * vol_norm;
         let mut candidate_px = base_l1_px;
-        if attempt < 2 && flow_conv > conv_threshold {
+        if attempt < 2 && flow_conv > conv_threshold && reference_gross_bps.raw() >= 560 {
             let slot_mfe = self.slot_learned_mfe_bps(snap.symbol_id) as f64;
             let raw_bps = ((flow_conv - conv_threshold) * (slot_mfe / 3.0)) as i64;
             let att_i64 = attempt as i64;

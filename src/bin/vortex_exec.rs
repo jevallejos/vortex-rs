@@ -510,8 +510,11 @@ impl BybitV5LiveClient {
                     / entry_price.0.max(1);
                 let span_bps = (summary.gross_scaled_bps.raw() - q_bps).max(0);
                 let att_i64 = attempt as i64;
-                let relaxed_ref_bps =
-                    ScaledBps(q_bps + (span_bps * (12 - att_i64)) / (12 + att_i64));
+                let relaxed_ref_bps = if summary.gross_scaled_bps.raw() < 560 {
+                    ScaledBps(q_bps)
+                } else {
+                    ScaledBps(q_bps + (span_bps * (8 - att_i64).max(0)) / (8 + att_i64))
+                };
                 let peg_price = if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(latest_snap) = slot.read_snapshot(4) {
                         fsm.compute_elastic_deep_exit_peg(
@@ -679,6 +682,51 @@ fn prewarm_mfe_from_seed(fsm: &mut ExecutionFsm) {
     }
 }
 
+fn prewarm_governor_prices_from_parquet(adaptive_gov: &mut OnlineAdaptiveGovernor) {
+    let data_dir = Path::new("data");
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("parquet") {
+            paths.push(p);
+        }
+    }
+    paths.sort();
+    let start_idx = paths.len().saturating_sub(32);
+    for path in &paths[start_idx..] {
+        if let Ok(b) = vortex_rs::forensic_parquet::ColumnarParquetBatch::read_from_file(path) {
+            let mut idx = 0;
+            while idx < b.len() {
+                if let Some(row) = b.row_at(idx) {
+                    if let Some((s_idx, _)) = vortex_rs::types::spec_for_symbol(row.symbol_id) {
+                        let mut snap = SymbolLobSnapshot {
+                            symbol_id: row.symbol_id,
+                            ts_local_ns: row.ts_local_ns,
+                            mark_price: row.mark_price_ticks,
+                            realized_vol_5m: ScaledBps(6_000),
+                            ..SymbolLobSnapshot::default()
+                        };
+                        snap.bids[0] = BookLevel {
+                            price: row.best_bid_ticks,
+                            qty: row.best_bid_qty,
+                        };
+                        snap.asks[0] = BookLevel {
+                            price: row.best_ask_ticks,
+                            qty: row.best_ask_qty,
+                        };
+                        adaptive_gov.observe_market_price(s_idx, &snap);
+                    }
+                }
+                idx += 1;
+            }
+        }
+    }
+}
+
 fn rehydrate_shadow_ledger(
     ledger: &mut ParitySyncLedger,
     fsm: &mut ExecutionFsm,
@@ -686,6 +734,7 @@ fn rehydrate_shadow_ledger(
     arena: &VortexShmArena,
 ) {
     prewarm_mfe_from_seed(fsm);
+    prewarm_governor_prices_from_parquet(adaptive_gov);
     let file_path = Path::new("data/vortex_shadow_trades.jsonl");
     let file = match File::open(file_path) {
         Ok(f) => f,
