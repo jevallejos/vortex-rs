@@ -149,6 +149,10 @@ case "${1:-live}" in
         echo "=== [5. AI FORENSIC VAULT (data/vortex_ai_forensic_vault.jsonl)] ==="
         tail -n 15 "${VORTEX_DIR}/data/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
         ;;
+    baul|-b)
+        echo "=== [VORTEX FORENSIC VAULT V2 (38 METRICS)] ==="
+        cat "${VORTEX_DIR}/data/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
+        ;;
     oos|-o)
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec"
         ;;

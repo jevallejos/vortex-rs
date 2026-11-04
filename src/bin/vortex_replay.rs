@@ -540,7 +540,7 @@ fn replay_captured_live_parquet_segments() {
                                             .abs()
                                             .saturating_mul(1_000_000))
                                             / summary.entry_price.0.max(1);
-                                        let ref_bps = if summary.gross_scaled_bps.raw() < 500 {
+                                        let ref_bps = if summary.gross_scaled_bps.raw() < 650 {
                                             ScaledBps(q_bps)
                                         } else {
                                             summary.gross_scaled_bps

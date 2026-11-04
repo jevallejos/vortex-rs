@@ -28,6 +28,30 @@ pub const OPTIMAL_LIVE_NOTIONAL_1E8: i64 = 1_250_000_000;
 /// Per-slot anti-chasing cooldown after an unfilled queue abort or close (15 seconds).
 pub const SLOT_ABORT_COOLDOWN_NS: i64 = 15_000_000_000;
 
+#[derive(Copy, Clone, Debug, Default)]
+struct ForensicEntrySnapshot {
+    armed_ts_ns: i64,
+    opened_ts_ns: i64,
+    init_q_lots: i64,
+    abort_recovered: bool,
+    ofi_in_bps: i32,
+    tfi_in_bps: i32,
+    geom_in_bps: i32,
+    snr_in_bps: i64,
+    vol5m_in_bps: i64,
+    spread_in_ticks: i64,
+    btc_comp_in_bps: i64,
+    slot_mfe_bps: i64,
+    gov_ewma_bps: i64,
+    win_streak: u32,
+    sl_streak: u32,
+    wave_step: u32,
+    drift_bps: i64,
+    ext_bps: i64,
+    chased_bps: i64,
+    cum_slot_debt_bps: i64,
+}
+
 fn now_epoch_ns() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_nanos() as i64,
@@ -415,6 +439,7 @@ impl BybitV5LiveClient {
     /// - Preserves FIFO queue priority by only re-pegging the `Limit PostOnly reduceOnly` order when the BBO price changes.
     /// - Returns `true` ONLY when Bybit confirms `0.00` open position size.
     /// - If `force_market_if_unfilled` is true (e.g., on Stop-Loss), sweeps any remaining size with `Market reduceOnly`.
+    #[allow(clippy::too_many_arguments)]
     fn execute_verified_close_step(
         &self,
         arena: &VortexShmArena,
@@ -423,6 +448,7 @@ impl BybitV5LiveClient {
         fsm: &ExecutionFsm,
         summary: &ClosedTradeSummary,
         last_pegged_price: &mut PriceTicks,
+        exit_peg_attempts: &mut u32,
     ) -> Option<PriceTicks> {
         let symbol = spec.symbol_id.name();
         let open_side = summary.side;
@@ -510,10 +536,10 @@ impl BybitV5LiveClient {
                     / entry_price.0.max(1);
                 let span_bps = (summary.gross_scaled_bps.raw() - q_bps).max(0);
                 let att_i64 = attempt as i64;
-                let relaxed_ref_bps = if summary.gross_scaled_bps.raw() < 500 {
+                let relaxed_ref_bps = if summary.gross_scaled_bps.raw() < 650 {
                     ScaledBps(q_bps)
                 } else {
-                    ScaledBps(q_bps + (span_bps * (12 - att_i64).max(0)) / (12 + att_i64))
+                    ScaledBps(q_bps + (span_bps * (8 - att_i64).max(0)) / (8 + att_i64))
                 };
                 let peg_price = if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(latest_snap) = slot.read_snapshot(4) {
@@ -556,6 +582,7 @@ impl BybitV5LiveClient {
                     }
                 }
             }
+            *exit_peg_attempts = exit_peg_attempts.saturating_add(1);
             thread::sleep(Duration::from_millis(300));
             attempt += 1;
         }
@@ -696,7 +723,7 @@ fn prewarm_governor_prices_from_parquet(adaptive_gov: &mut OnlineAdaptiveGoverno
         }
     }
     paths.sort();
-    let start_idx = paths.len().saturating_sub(512);
+    let start_idx = paths.len().saturating_sub(32);
     for path in &paths[start_idx..] {
         if let Ok(b) = vortex_rs::forensic_parquet::ColumnarParquetBatch::read_from_file(path) {
             let mut idx = 0;
@@ -889,14 +916,20 @@ fn print_colorized_shadow_trades() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn append_shadow_trade_jsonl(
+#[allow(clippy::too_many_arguments)]
+fn format_forensic_vault_v2_json_line(
+    next_vault_id: u64,
+    ts_ns: i64,
     symbol: &str,
+    slot_idx: usize,
+    qty_str: &str,
     summary: &ClosedTradeSummary,
     ledger: &ParitySyncLedger,
     fsm: &ExecutionFsm,
-) {
-    let data_dir = Path::new("data");
-    let _ = std::fs::create_dir_all(data_dir);
+    entry_forensic: &ForensicEntrySnapshot,
+    exit_snap: &SymbolLobSnapshot,
+    exit_peg_attempts: u32,
+) -> String {
     let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
     let gross_bps = (summary.gross_scaled_bps.raw() as f64) / 100.0;
     let fee_bps = if summary.is_maker_exit { 4.00 } else { 7.50 };
@@ -915,50 +948,154 @@ fn append_shadow_trade_jsonl(
         )
         .0
     };
+    let pf_x100 = fsm.net_profit_factor_x100();
+    let armed_ts = if entry_forensic.armed_ts_ns > 0 {
+        entry_forensic.armed_ts_ns
+    } else if fsm.last_armed_ts.0 > 0 {
+        fsm.last_armed_ts.0
+    } else {
+        ts_ns
+    };
+    let opened_ts = if entry_forensic.opened_ts_ns > 0 {
+        entry_forensic.opened_ts_ns
+    } else if fsm.last_opened_ts.0 > 0 {
+        fsm.last_opened_ts.0
+    } else {
+        armed_ts
+    };
+    let queue_wait_ms = (opened_ts.saturating_sub(armed_ts).max(0)) / 1_000_000;
+    let hold_ms = (ts_ns.saturating_sub(opened_ts).max(0)) / 1_000_000;
+    let mfe_bps = (fsm.last_closed_mfe_bps as f64) / 100.0;
+    let mae_bps = (fsm.last_closed_mae_bps as f64) / 100.0;
+    let mfe_capture_pct = if fsm.last_closed_mfe_bps > 0 {
+        ((summary.gross_scaled_bps.raw() as f64) * 100.0) / (fsm.last_closed_mfe_bps as f64)
+    } else {
+        0.0
+    };
+    let ofi_in = f64::from(entry_forensic.ofi_in_bps) / 10_000.0;
+    let tfi_in = f64::from(entry_forensic.tfi_in_bps) / 10_000.0;
+    let geom_in = f64::from(entry_forensic.geom_in_bps) / 10_000.0;
+    let snr_in = (entry_forensic.snr_in_bps as f64) / 10_000.0;
+    let vol5m_in = (entry_forensic.vol5m_in_bps as f64) / 100.0;
+    let btc_comp_in = (entry_forensic.btc_comp_in_bps as f64) / 10_000.0;
+    let ofi_out = exit_snap.factor_ofi.get();
+    let tfi_out = exit_snap.factor_tfi.get();
+    let vol5m_out = (exit_snap.realized_vol_5m.raw() as f64) / 100.0;
+    let slot_mfe = (entry_forensic.slot_mfe_bps as f64) / 100.0;
+    let gov_ewma = (entry_forensic.gov_ewma_bps as f64) / 100.0;
+    let drift_bps = (entry_forensic.drift_bps as f64) / 100.0;
+    let ext_bps = (entry_forensic.ext_bps as f64) / 100.0;
+    let chased_bps = (entry_forensic.chased_bps as f64) / 100.0;
+    let cum_slot_debt = (entry_forensic.cum_slot_debt_bps as f64) / 100.0;
+    let p1 = format!(
+        "{{\"event\":\"TRADE_CLOSE\",\"trade_id\":{},\"armed_ts_ns\":{},\"opened_ts_ns\":{},",
+        next_vault_id, armed_ts, opened_ts
+    );
+    let p2 = format!(
+        "\"ts_ns\":{},\"queue_wait_ms\":{},\"hold_ms\":{},\"symbol\":\"{}\",\"slot_idx\":{},",
+        ts_ns, queue_wait_ms, hold_ms, symbol, slot_idx
+    );
+    let p3 = format!(
+        "\"side\":\"{:?}\",\"qty\":\"{}\",\"entry_ticks\":{},\"exit_ticks\":{},\"floor_ticks\":{},",
+        summary.side, qty_str, summary.entry_price.0, summary.exit_price.0, floor_ticks
+    );
+    let p4 = format!(
+        "\"gross_bps\":{:.2},\"fee_bps\":{:.2},\"net_bps\":{:.2},\"fee_drag_pct\":{:.1},",
+        gross_bps, fee_bps, net_bps, fee_drag_pct
+    );
+    let p5 = format!(
+        "\"pf_x100\":{},\"cum_net_pnl_1e8\":{},\"kind\":\"{:?}\",\"exit_sub_reason\":\"{}\",",
+        pf_x100, ledger.cumulative_net_pnl_1e8, summary.kind, fsm.last_exit_sub_reason.as_str()
+    );
+    let p6 = format!(
+        "\"maker_exit\":{},\"exit_peg_attempts\":{},\"wald_contraction_pct\":{},",
+        summary.is_maker_exit, exit_peg_attempts, fsm.last_closed_wald_pct
+    );
+    let p7 = format!(
+        "\"peak_ticks\":{},\"mfe_bps\":{:.2},\"worst_ticks\":{},\"mae_bps\":{:.2},",
+        fsm.last_closed_peak_ticks.0, mfe_bps, fsm.last_closed_worst_ticks.0, mae_bps
+    );
+    let p8 = format!(
+        "\"mfe_capture_pct\":{:.1},\"init_q_lots\":{},\"abort_recovered\":{},",
+        mfe_capture_pct, entry_forensic.init_q_lots, entry_forensic.abort_recovered
+    );
+    let p9 = format!(
+        "\"ofi_in\":{:+.2},\"tfi_in\":{:+.2},\"geom_in\":{:+.2},\"snr_in\":{:+.2},",
+        ofi_in, tfi_in, geom_in, snr_in
+    );
+    let p10 = format!(
+        "\"vol5m_in\":{:.2},\"spread_in\":{},\"btc_comp_in\":{:+.2},\"ofi_out\":{:+.2},",
+        vol5m_in, entry_forensic.spread_in_ticks, btc_comp_in, ofi_out
+    );
+    let p11 = format!(
+        "\"tfi_out\":{:+.2},\"vol5m_out\":{:.2},\"slot_mfe_bps\":{:.2},\"gov_ewma_bps\":{:+.2},",
+        tfi_out, vol5m_out, slot_mfe, gov_ewma
+    );
+    let p12 = format!(
+        "\"win_streak\":{},\"sl_streak\":{},\"wave_step\":{},\"drift_bps\":{:+.2},",
+        entry_forensic.win_streak, entry_forensic.sl_streak, entry_forensic.wave_step, drift_bps
+    );
+    let p13 = format!(
+        "\"ext_bps\":{:+.2},\"chased_bps\":{:+.2},\"cum_slot_debt_bps\":{:+.2}}}\n",
+        ext_bps, chased_bps, cum_slot_debt
+    );
+    format!(
+        "{}{}{}{}{}{}{}{}{}{}{}{}{}",
+        p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_shadow_trade_jsonl(
+    symbol: &str,
+    slot_idx: usize,
+    qty_str: &str,
+    summary: &ClosedTradeSummary,
+    ledger: &ParitySyncLedger,
+    fsm: &ExecutionFsm,
+    entry_forensic: &ForensicEntrySnapshot,
+    exit_snap: &SymbolLobSnapshot,
+    exit_peg_attempts: u32,
+) {
+    let data_dir = Path::new("data");
+    let _ = std::fs::create_dir_all(data_dir);
+    let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
     let ts_ns = now_epoch_ns();
     let pf_x100 = fsm.net_profit_factor_x100();
-
     let shadow_path = data_dir.join("vortex_shadow_trades.jsonl");
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(shadow_path) {
-        let line = format!(
-            "{{\"ts_ns\":{},\"symbol\":\"{}\",\"kind\":\"{:?}\",\"side\":\"{:?}\",\"entry_ticks\":{},\"exit_ticks\":{},\"net_bps\":{:.2},\"maker_exit\":{},\"total_trades\":{},\"pf_x100\":{},\"cum_net_pnl_1e8\":{}}}\n",
-            ts_ns,
-            symbol,
-            summary.kind,
-            summary.side,
-            summary.entry_price.0,
-            summary.exit_price.0,
-            net_bps,
-            summary.is_maker_exit,
-            ledger.closed_trades_count,
-            pf_x100,
-            ledger.cumulative_net_pnl_1e8
+        let s1 = format!(
+            "{{\"ts_ns\":{},\"symbol\":\"{}\",\"kind\":\"{:?}\",\"side\":\"{:?}\",",
+            ts_ns, symbol, summary.kind, summary.side
         );
+        let s2 = format!(
+            "\"entry_ticks\":{},\"exit_ticks\":{},\"net_bps\":{:.2},\"maker_exit\":{},",
+            summary.entry_price.0, summary.exit_price.0, net_bps, summary.is_maker_exit
+        );
+        let s3 = format!(
+            "\"total_trades\":{},\"pf_x100\":{},\"cum_net_pnl_1e8\":{}}}\n",
+            ledger.closed_trades_count, pf_x100, ledger.cumulative_net_pnl_1e8
+        );
+        let line = format!("{}{}{}", s1, s2, s3);
         let _ = f.write_all(line.as_bytes());
     }
-
     let vault_path = data_dir.join("vortex_ai_forensic_vault.jsonl");
     let next_vault_id = File::open(&vault_path)
         .map(|f| BufReader::new(f).lines().count() as u64 + 1)
         .unwrap_or(ledger.closed_trades_count);
     if let Ok(mut vf) = OpenOptions::new().create(true).append(true).open(vault_path) {
-        let vline = format!(
-            "{{\"event\":\"TRADE_CLOSE\",\"trade_id\":{},\"ts_ns\":{},\"symbol\":\"{}\",\"side\":\"{:?}\",\"kind\":\"{:?}\",\"maker_exit\":{},\"entry_ticks\":{},\"exit_ticks\":{},\"floor_ticks\":{},\"gross_bps\":{:.2},\"fee_bps\":{:.2},\"net_bps\":{:.2},\"fee_drag_pct\":{:.1},\"pf_x100\":{},\"cum_net_pnl_1e8\":{}}}\n",
+        let vline = format_forensic_vault_v2_json_line(
             next_vault_id,
             ts_ns,
             symbol,
-            summary.side,
-            summary.kind,
-            summary.is_maker_exit,
-            summary.entry_price.0,
-            summary.exit_price.0,
-            floor_ticks,
-            gross_bps,
-            fee_bps,
-            net_bps,
-            fee_drag_pct,
-            pf_x100,
-            ledger.cumulative_net_pnl_1e8
+            slot_idx,
+            qty_str,
+            summary,
+            ledger,
+            fsm,
+            entry_forensic,
+            exit_snap,
+            exit_peg_attempts,
         );
         let _ = vf.write_all(vline.as_bytes());
     }
@@ -1208,6 +1345,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut prev_cum_trade_lots: LotQty = LotQty(0);
     let mut last_seen_seq = [0_u64; 6];
     let mut last_pegged_exit_price = PriceTicks(0);
+    let mut exit_peg_attempts: u32 = 0;
+    let mut entry_forensic = ForensicEntrySnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
 
     rehydrate_shadow_ledger(&mut ledger, &mut fsm, &mut adaptive_gov, arena);
@@ -1383,11 +1522,52 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                     }
                     s += 1;
                 }
-                if let Some((b_slot, b_spec, b_snap, b_verdict, _)) = best_cand {
+                if let Some((b_slot, b_spec, b_snap, b_verdict, b_sc)) = best_cand {
                     if let Ok(true) =
                         fsm.try_arm_maker_entry(&b_spec, &b_snap, b_verdict, LotQty(10))
                     {
                         active_slot = b_slot;
+                        exit_peg_attempts = 0;
+                        if let OrderLifecycleState::PlacingEntryMaker {
+                            side: a_side,
+                            entry_price: a_px,
+                            submitted_ts: a_ts,
+                            ..
+                        } = fsm.state
+                        {
+                            let (ew_e, w_s, sl_s, w_st, dr_b, ex_b, ch_b, db_b) =
+                                adaptive_gov.extended_entry_diagnostics(
+                                    b_slot,
+                                    a_side,
+                                    &b_snap,
+                                    a_px.0,
+                                );
+                            let sp_t = b_snap.bbo_and_spread_ticks().map(|x| x.2).unwrap_or(1);
+                            let btc_c =
+                                OrthogonalFactorState::snr_composite_score(&btc_leader_snap);
+                            entry_forensic = ForensicEntrySnapshot {
+                                armed_ts_ns: a_ts.0,
+                                opened_ts_ns: 0,
+                                init_q_lots: 0,
+                                abort_recovered: false,
+                                ofi_in_bps: b_snap.factor_ofi.to_bps_i32(),
+                                tfi_in_bps: b_snap.factor_tfi.to_bps_i32(),
+                                geom_in_bps: b_snap.factor_geom.to_bps_i32(),
+                                snr_in_bps: (b_sc * 10_000.0) as i64,
+                                vol5m_in_bps: b_snap.realized_vol_5m.raw(),
+                                spread_in_ticks: sp_t,
+                                btc_comp_in_bps: (btc_c * 10_000.0) as i64,
+                                slot_mfe_bps: fsm.slot_learned_mfe_bps(b_spec.symbol_id),
+                                gov_ewma_bps: ew_e,
+                                win_streak: w_s,
+                                sl_streak: sl_s,
+                                wave_step: w_st,
+                                drift_bps: dr_b,
+                                ext_bps: ex_b,
+                                chased_bps: ch_b,
+                                cum_slot_debt_bps: db_b,
+                            };
+                        }
                         if let OrderLifecycleState::PlacingEntryMaker {
                             side: arm_side,
                             entry_price: arm_entry,
@@ -1580,6 +1760,9 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             }
                             let spec = APPROVED_SPECS[active_slot];
                             let eff_open_ts = snap.ts_local_ns;
+                            entry_forensic.opened_ts_ns = eff_open_ts.0;
+                            entry_forensic.init_q_lots = resting_init_queue_ahead.0;
+                            entry_forensic.abort_recovered = filled_on_exchange_during_abort;
                             fsm.state = OrderLifecycleState::RestingEntryQueue {
                                 side,
                                 entry_price,
@@ -1694,6 +1877,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     &saved_fsm,
                                     &summary,
                                     &mut last_pegged_exit_price,
+                                    &mut exit_peg_attempts,
                                 );
                             }
                             let realized_exit_price = match confirmed_exit_px {
@@ -1764,12 +1948,22 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             arena.exec_peak_ticks.store(0, Ordering::Release);
                             arena.exec_tp_ticks.store(0, Ordering::Release);
                             arena.exec_sl_ticks.store(0, Ordering::Release);
+                            let qty_s = compute_optimal_50usdt_wallet_qty_str(
+                                spec.symbol_id,
+                                adaptive_gov.is_in_scar_debt(active_slot, summary.side),
+                            );
                             append_shadow_trade_jsonl(
                                 snap.symbol_id.name(),
+                                active_slot,
+                                qty_s,
                                 &summary,
                                 &ledger,
                                 &fsm,
+                                &entry_forensic,
+                                &snap,
+                                exit_peg_attempts,
                             );
+                            exit_peg_attempts = 0;
 
                             let (en_w, en_f) = spec.format_price_usdt_parts(summary.entry_price);
                             let (ex_w, ex_f) = spec.format_price_usdt_parts(summary.exit_price);
@@ -2055,5 +2249,87 @@ mod tests {
             assert!(net_pnl_1e8 >= 5_760_000_000);
             assert_eq!(drift, 0);
         }
+    }
+
+    #[test]
+    fn test_forensic_vault_v2_json_serialization_and_6_pillars() {
+        let mut ledger = ParitySyncLedger::new(10_000_000_000);
+        let mut fsm = ExecutionFsm::new(1_250_000_000, 1_250_000_000);
+        fsm.last_armed_ts = TimestampNs(1_000_000_000);
+        fsm.last_opened_ts = TimestampNs(1_150_000_000);
+        fsm.worst_adverse_price = PriceTicks(799_800);
+        fsm.last_peak_gross_bps = 680;
+        fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+            side: Side::Bid,
+            entry_price: PriceTicks(800_000),
+            peak_favorable_price: PriceTicks(800_544),
+            qty: LotQty(10),
+            tp_maker_price: PriceTicks(803_600),
+            sl_trigger_price: PriceTicks(798_000),
+            opened_ts: TimestampNs(1_150_000_000),
+        };
+        let summary = fsm.finalize_close(
+            ClosedTradeKind::MakerPassiveUnwind,
+            Side::Bid,
+            PriceTicks(800_000),
+            PriceTicks(800_464),
+            TimestampNs(15_150_000_000),
+            &mut ledger,
+        );
+        let entry_f = ForensicEntrySnapshot {
+            armed_ts_ns: 1_000_000_000,
+            opened_ts_ns: 1_150_000_000,
+            init_q_lots: 1_240,
+            abort_recovered: false,
+            ofi_in_bps: 6_200,
+            tfi_in_bps: 7_400,
+            geom_in_bps: 3_100,
+            snr_in_bps: 5_850,
+            vol5m_in_bps: 6_000,
+            spread_in_ticks: 1,
+            btc_comp_in_bps: 5_850,
+            slot_mfe_bps: 780,
+            gov_ewma_bps: 215,
+            win_streak: 2,
+            sl_streak: 0,
+            wave_step: 2,
+            drift_bps: 42,
+            ext_bps: 185,
+            chased_bps: 95,
+            cum_slot_debt_bps: 450,
+        };
+        let exit_snap = SymbolLobSnapshot {
+            symbol_id: SymbolId(1),
+            realized_vol_5m: ScaledBps(6_100),
+            factor_ofi: BoundedScore::new_clamped(-0.18),
+            factor_tfi: BoundedScore::new_clamped(-0.22),
+            ..SymbolLobSnapshot::default()
+        };
+        let json_line = format_forensic_vault_v2_json_line(
+            1,
+            15_150_000_000,
+            "BTCUSDT",
+            0,
+            "0.001",
+            &summary,
+            &ledger,
+            &fsm,
+            &entry_f,
+            &exit_snap,
+            1,
+        );
+        println!("[FORENSIC VAULT V2 JSON SAMPLE] {}", json_line.trim());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_line).unwrap_or(serde_json::Value::Null);
+        assert_eq!(parsed.get("queue_wait_ms").and_then(|v| v.as_i64()), Some(150));
+        assert_eq!(parsed.get("hold_ms").and_then(|v| v.as_i64()), Some(14_000));
+        assert_eq!(
+            parsed.get("exit_sub_reason").and_then(|v| v.as_str()),
+            Some("FlowReversalUnwind")
+        );
+        assert_eq!(parsed.get("peak_ticks").and_then(|v| v.as_i64()), Some(800_544));
+        assert_eq!(parsed.get("worst_ticks").and_then(|v| v.as_i64()), Some(799_800));
+        assert_eq!(parsed.get("init_q_lots").and_then(|v| v.as_i64()), Some(1_240));
+        assert_eq!(parsed.get("win_streak").and_then(|v| v.as_u64()), Some(2));
     }
 }

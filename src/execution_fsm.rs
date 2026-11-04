@@ -248,6 +248,43 @@ pub enum ClosedTradeKind {
     ServerMarkPriceStopLoss,
 }
 
+/// Exhaustive 11-branch physical sub-cause of position exit for Forensic Vault V2.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ExitSubReason {
+    StructuralTpLimit,
+    FreeRideConvexRatchet,
+    Zone1ProtectiveRatchet,
+    #[default]
+    FlowReversalUnwind,
+    EarlyHarvestDecay,
+    AdverseScratchEscape,
+    StrugglingRescue,
+    ZombieBreakevenEscape,
+    StagnantTimerUnwind,
+    WaldSevereStopLoss,
+    WaldBaseStopLoss,
+}
+
+impl ExitSubReason {
+    #[inline]
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StructuralTpLimit => "StructuralTpLimit",
+            Self::FreeRideConvexRatchet => "FreeRideConvexRatchet",
+            Self::Zone1ProtectiveRatchet => "Zone1ProtectiveRatchet",
+            Self::FlowReversalUnwind => "FlowReversalUnwind",
+            Self::EarlyHarvestDecay => "EarlyHarvestDecay",
+            Self::AdverseScratchEscape => "AdverseScratchEscape",
+            Self::StrugglingRescue => "StrugglingRescue",
+            Self::ZombieBreakevenEscape => "ZombieBreakevenEscape",
+            Self::StagnantTimerUnwind => "StagnantTimerUnwind",
+            Self::WaldSevereStopLoss => "WaldSevereStopLoss",
+            Self::WaldBaseStopLoss => "WaldBaseStopLoss",
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OrderLifecycleState {
     Idle,
@@ -317,6 +354,15 @@ pub struct ExecutionFsm {
     pub last_peak_gross_bps: i64,
     pub max_wald_contraction_pct: i64,
     pub last_eff_sl_ticks: PriceTicks,
+    pub worst_adverse_price: PriceTicks,
+    pub last_closed_mfe_bps: i64,
+    pub last_closed_mae_bps: i64,
+    pub last_closed_peak_ticks: PriceTicks,
+    pub last_closed_worst_ticks: PriceTicks,
+    pub last_closed_wald_pct: i64,
+    pub last_exit_sub_reason: ExitSubReason,
+    pub last_armed_ts: TimestampNs,
+    pub last_opened_ts: TimestampNs,
 }
 
 impl Default for ExecutionFsm {
@@ -345,6 +391,15 @@ impl ExecutionFsm {
             last_peak_gross_bps: 0,
             max_wald_contraction_pct: 0,
             last_eff_sl_ticks: PriceTicks(0),
+            worst_adverse_price: PriceTicks(0),
+            last_closed_mfe_bps: 0,
+            last_closed_mae_bps: 0,
+            last_closed_peak_ticks: PriceTicks(0),
+            last_closed_worst_ticks: PriceTicks(0),
+            last_closed_wald_pct: 0,
+            last_exit_sub_reason: ExitSubReason::FlowReversalUnwind,
+            last_armed_ts: TimestampNs(0),
+            last_opened_ts: TimestampNs(0),
         }
     }
 
@@ -426,6 +481,7 @@ impl ExecutionFsm {
             snap.last_trade_price,
             snap.mark_price,
         )?;
+        self.last_armed_ts = snap.ts_local_ns;
         self.state = OrderLifecycleState::PlacingEntryMaker {
             side,
             entry_price,
@@ -570,6 +626,8 @@ impl ExecutionFsm {
                 Side::Ask => PriceTicks((entry_price.0 - tp_delta_ticks).max(1)),
             };
             self.max_wald_contraction_pct = 0;
+            self.worst_adverse_price = entry_price;
+            self.last_opened_ts = fill_ts_ns;
             self.state = OrderLifecycleState::PositionOpenMakerExit {
                 side,
                 entry_price,
@@ -646,7 +704,7 @@ impl ExecutionFsm {
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
         let severe_adverse_collapse =
-            hold_ns >= STAGNANT_PROFIT_HOLD_NS || (adv_p >= 0.50 && cur_gross_now < -850);
+            hold_ns >= STAGNANT_PROFIT_HOLD_NS && adv_p >= 0.35 && cur_gross_now < -600;
         let early_adverse_stall = hold_ns > wald_grace_ns
             && peak_gross_now < 550
             && cur_gross_now < -450
@@ -681,6 +739,30 @@ impl ExecutionFsm {
             Side::Ask => PriceTicks(entry_price.0 + eff_sl_dist),
         };
         self.last_eff_sl_ticks = eff_sl_trigger;
+        if self.last_opened_ts.0 <= 0 {
+            self.last_opened_ts = opened_ts;
+        }
+        if self.worst_adverse_price.0 <= 0 {
+            self.worst_adverse_price = entry_price;
+        }
+        match side {
+            Side::Bid => {
+                if cur_bbo_ref.0 > 0 && cur_bbo_ref.0 < self.worst_adverse_price.0 {
+                    self.worst_adverse_price = cur_bbo_ref;
+                }
+                if ref_trade_price.0 > 0 && ref_trade_price.0 < self.worst_adverse_price.0 {
+                    self.worst_adverse_price = ref_trade_price;
+                }
+            }
+            Side::Ask => {
+                if cur_bbo_ref.0 > self.worst_adverse_price.0 {
+                    self.worst_adverse_price = cur_bbo_ref;
+                }
+                if ref_trade_price.0 > self.worst_adverse_price.0 {
+                    self.worst_adverse_price = ref_trade_price;
+                }
+            }
+        }
         let sl_hit = match side {
             Side::Bid => snap.mark_price.0 > 0 && snap.mark_price.0 <= eff_sl_trigger.0,
             Side::Ask => snap.mark_price.0 > 0 && snap.mark_price.0 >= eff_sl_trigger.0,
@@ -690,6 +772,12 @@ impl ExecutionFsm {
                 Side::Bid => PriceTicks((eff_sl_trigger.0 - 1).max(1)),
                 Side::Ask => PriceTicks(eff_sl_trigger.0 + 1),
             };
+            self.last_exit_sub_reason =
+                if severe_adverse_collapse || wald_contraction_pct > 22 {
+                    ExitSubReason::WaldSevereStopLoss
+                } else {
+                    ExitSubReason::WaldBaseStopLoss
+                };
             self.state = OrderLifecycleState::EmergencyStopTriggered {
                 side,
                 entry_price,
@@ -706,14 +794,13 @@ impl ExecutionFsm {
                 ledger,
             ));
         }
-
-        // 2. Passive Limit PostOnly structural Take-Profit fill
         let tp_hit = tp_maker_price.0 > 0
             && match side {
                 Side::Bid => ref_trade_price.0 > 0 && ref_trade_price.0 >= tp_maker_price.0,
                 Side::Ask => ref_trade_price.0 > 0 && ref_trade_price.0 <= tp_maker_price.0,
             };
         if tp_hit {
+            self.last_exit_sub_reason = ExitSubReason::StructuralTpLimit;
             return Some(self.finalize_close(
                 ClosedTradeKind::MakerStructuralTp,
                 side,
@@ -803,25 +890,19 @@ impl ExecutionFsm {
                     .raw()
                     .max(fee_barrier_bps + 1);
             let mfe_excess = (learned_mfe - fee_barrier_bps).max(0);
-            let structural_win_floor = (fee_barrier_bps + (vol_5m / 55) + (mfe_excess / 5))
-                .clamp(fee_barrier_bps + 165, fee_barrier_bps + 245)
+            let structural_win_floor = (fee_barrier_bps + (vol_5m / 60))
+                .clamp(500, 550)
                 .max(zero_loss_scratch_floor);
             let elastic_win_horizon_secs = (learned_mfe / 10).clamp(60, 105);
             let elastic_decay_span_secs = (elastic_win_horizon_secs * 3) / 2;
             let elastic_zombie_ns =
                 (elastic_decay_span_secs * 1_100_000_000).clamp(90_000_000_000, 150_000_000_000);
-            let severe_adverse_regime = deep_joint_adverse
-                || flow_conviction <= -0.32
+            let adverse_regime = joint_adverse
+                || deep_joint_adverse
+                || flow_conviction <= -0.12
                 || (hold_elapsed >= elastic_zombie_ns && !strong_trend_continuation);
-            let mild_adverse_regime =
-                joint_adverse || flow_conviction <= -0.12;
-            let mild_adverse_floor = ((zero_loss_scratch_floor + structural_win_floor) / 2)
-                .max(fee_barrier_bps + 100)
-                .max(zero_loss_scratch_floor);
-            let allowed_base_floor = if severe_adverse_regime {
+            let allowed_base_floor = if adverse_regime {
                 zero_loss_scratch_floor
-            } else if mild_adverse_regime {
-                mild_adverse_floor
             } else {
                 structural_win_floor
             };
@@ -870,10 +951,7 @@ impl ExecutionFsm {
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= elastic_scratch_ns
                 && current_gross_bps.raw() >= zero_loss_scratch_floor
-                && (joint_adverse
-                    || deep_joint_adverse
-                    || (hold_elapsed >= impulse_immunity_ns && flow_conviction <= -0.15)
-                    || flow_conviction <= -0.28);
+                && (joint_adverse || deep_joint_adverse || flow_conviction <= -0.15);
             let struggling_rescue = !in_trend_free_ride_zone
                 && ((hold_elapsed >= elastic_struggle_ns
                     && joint_adverse
@@ -914,6 +992,25 @@ impl ExecutionFsm {
                     && current_gross_bps.raw() <= convex_ratchet_floor
             };
             if flow_unwind || mfe_ratchet_unwind || early_harvest || scratch_escape || stagnant_unwind {
+                self.last_exit_sub_reason = if mfe_ratchet_unwind {
+                    if in_trend_free_ride_zone {
+                        ExitSubReason::FreeRideConvexRatchet
+                    } else {
+                        ExitSubReason::Zone1ProtectiveRatchet
+                    }
+                } else if flow_unwind {
+                    ExitSubReason::FlowReversalUnwind
+                } else if early_harvest {
+                    ExitSubReason::EarlyHarvestDecay
+                } else if scratch_escape {
+                    ExitSubReason::AdverseScratchEscape
+                } else if struggling_rescue {
+                    ExitSubReason::StrugglingRescue
+                } else if zombie_breakeven_escape {
+                    ExitSubReason::ZombieBreakevenEscape
+                } else {
+                    ExitSubReason::StagnantTimerUnwind
+                };
                 return Some(self.finalize_close(
                     ClosedTradeKind::MakerPassiveUnwind,
                     side,
@@ -1258,6 +1355,88 @@ impl ExecutionFsm {
         let net_pnl_1e8 = gross_pnl_1e8 - fee_1e8;
 
         ledger.record_closed_trade(gross_pnl_1e8, fee_1e8);
+        let state_peak_px = match self.state {
+            OrderLifecycleState::PositionOpenMakerExit {
+                peak_favorable_price,
+                ..
+            } if peak_favorable_price.0 > 0 => peak_favorable_price,
+            _ => entry_price,
+        };
+        let final_peak_px = match side {
+            Side::Bid => PriceTicks(state_peak_px.0.max(exit_price.0).max(entry_price.0)),
+            Side::Ask => {
+                let min_p = if exit_price.0 > 0 {
+                    state_peak_px.0.min(exit_price.0)
+                } else {
+                    state_peak_px.0
+                };
+                PriceTicks(min_p.min(entry_price.0))
+            }
+        };
+        let raw_worst = if self.worst_adverse_price.0 > 0 {
+            self.worst_adverse_price
+        } else {
+            entry_price
+        };
+        let final_worst_px = match side {
+            Side::Bid => PriceTicks(raw_worst.0.min(exit_price.0).min(entry_price.0)),
+            Side::Ask => PriceTicks(raw_worst.0.max(exit_price.0).max(entry_price.0)),
+        };
+        let mfe_bps = Self::compute_gross_scaled_bps(side, entry_price, final_peak_px)
+            .raw()
+            .max(gross_scaled_bps.raw())
+            .max(self.last_peak_gross_bps)
+            .max(0);
+        let mae_bps = Self::compute_gross_scaled_bps(side, entry_price, final_worst_px)
+            .raw()
+            .min(gross_scaled_bps.raw())
+            .min(0);
+        self.last_closed_mfe_bps = mfe_bps;
+        self.last_closed_mae_bps = mae_bps;
+        self.last_closed_peak_ticks = final_peak_px;
+        self.last_closed_worst_ticks = final_worst_px;
+        self.last_closed_wald_pct = self.max_wald_contraction_pct;
+        let state_peak_px = match self.state {
+            OrderLifecycleState::PositionOpenMakerExit {
+                peak_favorable_price,
+                ..
+            } if peak_favorable_price.0 > 0 => peak_favorable_price,
+            _ => entry_price,
+        };
+        let final_peak_px = match side {
+            Side::Bid => PriceTicks(state_peak_px.0.max(exit_price.0).max(entry_price.0)),
+            Side::Ask => {
+                let min_p = if exit_price.0 > 0 {
+                    state_peak_px.0.min(exit_price.0)
+                } else {
+                    state_peak_px.0
+                };
+                PriceTicks(min_p.min(entry_price.0))
+            }
+        };
+        let raw_worst = if self.worst_adverse_price.0 > 0 {
+            self.worst_adverse_price
+        } else {
+            entry_price
+        };
+        let final_worst_px = match side {
+            Side::Bid => PriceTicks(raw_worst.0.min(exit_price.0).min(entry_price.0)),
+            Side::Ask => PriceTicks(raw_worst.0.max(exit_price.0).max(entry_price.0)),
+        };
+        let mfe_bps = Self::compute_gross_scaled_bps(side, entry_price, final_peak_px)
+            .raw()
+            .max(gross_scaled_bps.raw())
+            .max(self.last_peak_gross_bps)
+            .max(0);
+        let mae_bps = Self::compute_gross_scaled_bps(side, entry_price, final_worst_px)
+            .raw()
+            .min(gross_scaled_bps.raw())
+            .min(0);
+        self.last_closed_mfe_bps = mfe_bps;
+        self.last_closed_mae_bps = mae_bps;
+        self.last_closed_peak_ticks = final_peak_px;
+        self.last_closed_worst_ticks = final_worst_px;
+        self.last_closed_wald_pct = self.max_wald_contraction_pct;
         let observed_mfe = gross_scaled_bps.raw().max(self.last_peak_gross_bps);
         self.observe_mfe_sample(observed_mfe, is_maker_exit);
         if is_maker_exit {
@@ -1270,7 +1449,7 @@ impl ExecutionFsm {
         self.last_peak_gross_bps = 0;
         self.max_wald_contraction_pct = 0;
         self.last_eff_sl_ticks = PriceTicks(0);
-
+        self.worst_adverse_price = PriceTicks(0);
         if net_pnl_1e8 >= 0 {
             self.gross_profit_accum_1e8 += net_pnl_1e8;
         } else {
@@ -1347,7 +1526,6 @@ pub struct OnlineAdaptiveGovernor {
     last_sl_ts_ns: i64,
     price_sample_count: [u32; 6],
     last_seen_px_1e4: [i64; 6],
-    ewma_macro_px_1e4: [i64; 6],
 }
 
 impl Default for OnlineAdaptiveGovernor {
@@ -1387,7 +1565,6 @@ impl OnlineAdaptiveGovernor {
             last_sl_ts_ns: 0,
             price_sample_count: [0; 6],
             last_seen_px_1e4: [0; 6],
-            ewma_macro_px_1e4: [0; 6],
         }
     }
 
@@ -1455,7 +1632,7 @@ impl OnlineAdaptiveGovernor {
             self.directional_cooldown_until_ns[slot_idx][1 - d] = opp_whip_ns;
         }
         let elapsed_glob = ts_ns.0.saturating_sub(self.global_abort_last_ts_ns[d]);
-        if self.global_dir_abort_streak[d] == 0 || elapsed_glob > 360_000_000_000 {
+        if self.global_dir_abort_streak[d] == 0 || elapsed_glob > 180_000_000_000 {
             self.global_dir_abort_streak[d] = 1;
         } else {
             self.global_dir_abort_streak[d] =
@@ -1508,7 +1685,6 @@ impl OnlineAdaptiveGovernor {
         if fast_prev <= 0 || slow_prev <= 0 {
             self.ewma_fast_px_1e4[slot_idx] = px_1e4;
             self.ewma_slow_px_1e4[slot_idx] = px_1e4;
-            self.ewma_macro_px_1e4[slot_idx] = px_1e4;
             self.last_price_sample_ts_ns[slot_idx] = snap.ts_local_ns.0;
             self.price_sample_count[slot_idx] = 1;
             return;
@@ -1521,15 +1697,8 @@ impl OnlineAdaptiveGovernor {
         let vol_5m = snap.realized_vol_5m.raw().clamp(3_800, 12_500);
         let fast_span = (28 - (vol_5m / 750)).clamp(12, 24);
         let slow_span = (fast_span * 15).clamp(180, 360);
-        let macro_span = (slow_span * 3).clamp(540, 1_080);
         self.ewma_fast_px_1e4[slot_idx] = (fast_prev * (fast_span - 1) + px_1e4) / fast_span;
         self.ewma_slow_px_1e4[slot_idx] = (slow_prev * (slow_span - 1) + px_1e4) / slow_span;
-        let macro_prev = if self.ewma_macro_px_1e4[slot_idx] > 0 {
-            self.ewma_macro_px_1e4[slot_idx]
-        } else {
-            px_1e4
-        };
-        self.ewma_macro_px_1e4[slot_idx] = (macro_prev * (macro_span - 1) + px_1e4) / macro_span;
     }
 
     #[inline]
@@ -1559,6 +1728,43 @@ impl OnlineAdaptiveGovernor {
             0
         };
         (drift_bps, ext_bps)
+    }
+
+    /// Returns `(ewma_bps, win_s, sl_s, wave_step, drift_bps, ext_bps, chased_bps, debt_bps)` for Vault V2.
+    #[inline]
+    #[must_use]
+    pub const fn extended_entry_diagnostics(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        snap: &SymbolLobSnapshot,
+        entry_ticks: i64,
+    ) -> (i64, u32, u32, u32, i64, i64, i64, i64) {
+        if slot_idx >= 6 {
+            return (0, 0, 0, 0, 0, 0, 0, 0);
+        }
+        let d = Self::dir_idx(side);
+        let (drift_bps, ext_bps) = self.price_drift_and_extension_scaled_bps(slot_idx, snap);
+        let anc_1e4 = self.wave_anchor_px_1e4[slot_idx][d];
+        let cur_1e4 = entry_ticks.saturating_mul(10_000);
+        let chased_bps = if anc_1e4 > 0 && cur_1e4 > 0 {
+            match side {
+                Side::Bid => ((cur_1e4 - anc_1e4).saturating_mul(1_000_000)) / anc_1e4,
+                Side::Ask => ((anc_1e4 - cur_1e4).saturating_mul(1_000_000)) / anc_1e4,
+            }
+        } else {
+            0
+        };
+        (
+            self.ewma_net_bps_x100[slot_idx][d],
+            self.win_streak[slot_idx][d],
+            self.sl_streak[slot_idx][d],
+            self.wave_step_count[slot_idx][d],
+            drift_bps,
+            ext_bps,
+            chased_bps,
+            self.cum_net_bps_x100[slot_idx][d],
+        )
     }
 
     /// Returns `(ewma_net_bps_x100, sl_streak, win_streak)` for forensic telemetry.
@@ -2002,60 +2208,22 @@ impl OnlineAdaptiveGovernor {
         let learned_edge = self.ewma_net_bps_x100[slot_idx][d].clamp(-200, 400);
         let self_vol = candidate_snap.realized_vol_5m.raw().max(3_500);
         let btc_vol = btc_leader_snap.realized_vol_5m.raw().max(3_500);
-        let fast_span_est = (28 - (self_vol.clamp(3_800, 12_500) / 750)).clamp(12, 24);
-        let min_warmup_samples = if slot_idx == 0 {
-            (fast_span_est * 2) as u32
-        } else {
-            (fast_span_est * 12) as u32
-        };
-        if self.price_sample_count[slot_idx] < min_warmup_samples {
+        if self.price_sample_count[slot_idx] < 20 {
             return false;
         }
         let sym_net_x100 = self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
         let sym_debt_abs = (-sym_net_x100).max(0);
-        if self.global_dir_sl_streak[d] >= 1 && self.global_dir_win_streak[d] == 0 {
-            return false;
-        }
-        if self.sl_streak[slot_idx][1 - d] >= 1
-            && self.win_streak[slot_idx][d] == 0
-            && sym_debt_abs >= 1_500
-        {
-            return false;
-        }
-        let abort_pressure = i64::from(
-            (self.abort_streak[slot_idx][d] + self.global_dir_abort_streak[d]).min(6),
-        );
+        let abort_p = i64::from(self.abort_streak[slot_idx][d].min(4));
         let base_drift = (((260 - learned_edge).max(60)) * self_vol) / 26_000;
-        let min_trend_drift =
-            (base_drift + (sym_debt_abs / 80) + (abort_pressure * 6)).max(12);
-        let min_btc_drift = (btc_vol / 300).max(12);
-        let max_self_ext = ((self_vol / 22) + (learned_edge / 5)
+        let min_trend_drift = (base_drift + (sym_debt_abs / 80) + (abort_p * 5)).max(10);
+        let max_self_ext = ((self_vol / 18) + (learned_edge / 4)
             - (sym_debt_abs / 20)
-            - (abort_pressure * 25))
-            .clamp(180, 420);
-        let max_btc_ext = ((btc_vol / 22) + (learned_edge / 5)
+            - (abort_p * 20))
+            .clamp(220, 480);
+        let max_btc_ext = ((btc_vol / 18) + (learned_edge / 4)
             - (sym_debt_abs / 20)
-            - (abort_pressure * 25))
-            .clamp(180, 420);
-        let leader_opp_wave_active = slot_idx > 0
-            && ((self.wave_step_count[0][1 - d] >= 1
-                && self.last_global_win_dir == ((1 - d) as u8))
-                || self.abort_streak[0][d] >= 1);
-        if leader_opp_wave_active {
-            return false;
-        }
-        let self_macro = self.ewma_macro_px_1e4[slot_idx];
-        let btc_macro = self.ewma_macro_px_1e4[0];
-        let self_macro_bps = if self_macro > 0 {
-            ((self.ewma_slow_px_1e4[slot_idx] - self_macro).saturating_mul(1_000_000)) / self_macro
-        } else {
-            0
-        };
-        let btc_macro_bps = if btc_macro > 0 {
-            ((self.ewma_slow_px_1e4[0] - btc_macro).saturating_mul(1_000_000)) / btc_macro
-        } else {
-            0
-        };
+            - (abort_p * 20))
+            .clamp(220, 480);
         let slot_stair_locked =
             self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
         match side {
@@ -2066,9 +2234,7 @@ impl OnlineAdaptiveGovernor {
                     return false;
                 }
                 if slot_idx > 0
-                    && (btc_drift_bps < min_btc_drift
-                        || self_macro_bps < min_trend_drift
-                        || btc_macro_bps < min_btc_drift
+                    && (btc_drift_bps < 0
                         || !(0..=max_btc_ext).contains(&btc_ext_bps)
                         || slot_stair_locked)
                 {
@@ -2082,9 +2248,7 @@ impl OnlineAdaptiveGovernor {
                     return false;
                 }
                 if slot_idx > 0
-                    && (btc_drift_bps > -min_btc_drift
-                        || self_macro_bps > -min_trend_drift
-                        || btc_macro_bps > -min_btc_drift
+                    && (btc_drift_bps > 0
                         || !(-max_btc_ext..=0).contains(&btc_ext_bps)
                         || slot_stair_locked)
                 {
@@ -2145,15 +2309,15 @@ impl OnlineAdaptiveGovernor {
             };
             let btc_not_opposing = match side {
                 Side::Bid => {
-                    btc_leader_snap.factor_ofi.get() >= 0.15
-                        && btc_leader_snap.factor_tfi.get() >= 0.10
+                    btc_leader_snap.factor_ofi.get() >= 0.05
+                        && btc_leader_snap.factor_tfi.get() >= 0.0
                 }
                 Side::Ask => {
-                    btc_leader_snap.factor_ofi.get() <= -0.15
-                        && btc_leader_snap.factor_tfi.get() <= -0.10
+                    btc_leader_snap.factor_ofi.get() <= -0.05
+                        && btc_leader_snap.factor_tfi.get() <= 0.0
                 }
             };
-            let min_btc_align = 0.22 + 0.08 * sl_s + 0.45 * (debt_penalty + global_penalty);
+            let min_btc_align = 0.08 + 0.08 * sl_s + 0.45 * (debt_penalty + global_penalty);
             if !btc_not_opposing || signed_btc_alignment < min_btc_align {
                 return false;
             }
@@ -2558,10 +2722,17 @@ mod tests {
                     _ => continue,
                 };
                 let side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
-                let check_entry_ts_ns = if prev_close_ts_ns > 0 {
-                    prev_close_ts_ns.saturating_add(2_000_000_000)
-                } else {
-                    close_ts_ns.saturating_sub(60_000_000_000)
+                let opened_ts_opt =
+                    val.get("opened_ts_ns").and_then(serde_json::Value::as_i64);
+                let check_entry_ts_ns = match opened_ts_opt {
+                    Some(ots) if ots > 0 => ots,
+                    _ => {
+                        if prev_close_ts_ns > 0 {
+                            prev_close_ts_ns.saturating_add(2_000_000_000)
+                        } else {
+                            close_ts_ns.saturating_sub(60_000_000_000)
+                        }
+                    }
                 };
 
                 let entry_veto = gov.audit_historical_entry_veto(slot_idx, side, en_t, check_entry_ts_ns);
@@ -3017,7 +3188,7 @@ mod tests {
 
             // Pure-Loss Adverse Reversal: price stalls underwater for 45s with strong opposing OFI/TFI,
             // triggering the 48% Abraham Wald contraction at -13.50 bps gross (-21.00 bps net instead of -45.00 bps!):
-            let hold_45s = sim_ts + 95_000_000_000;
+            let hold_45s = sim_ts + 185_000_000_000;
             let crash_px = match side {
                 Side::Bid => PriceTicks((entry_t * (1_000_000 - 1_550)) / 1_000_000),
                 Side::Ask => PriceTicks((entry_t * (1_000_000 + 1_550)) / 1_000_000),
@@ -3394,5 +3565,61 @@ mod tests {
             1_793_801_100_000_000_000,
         );
         assert_eq!(par1_btc_discount_ok, None);
+    }
+
+    #[test]
+    fn test_voragine_v02_v032_fusion_and_forensic_vault_v2_38_metrics() {
+        let mut ledger = ParitySyncLedger::new(10_000_000_000);
+        let mut fsm = ExecutionFsm::new(1_250_000_000, 1_250_000_000);
+        fsm.last_armed_ts = TimestampNs(900_000_000);
+        fsm.last_opened_ts = TimestampNs(1_000_000_000);
+        fsm.worst_adverse_price = PriceTicks(100_000);
+        fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+            side: Side::Bid,
+            entry_price: PriceTicks(100_000),
+            peak_favorable_price: PriceTicks(100_000),
+            qty: LotQty(10),
+            tp_maker_price: PriceTicks(100_450),
+            sl_trigger_price: PriceTicks(99_750),
+            opened_ts: TimestampNs(1_000_000_000),
+        };
+        let mut snap_dip = SymbolLobSnapshot {
+            symbol_id: SymbolId(1),
+            ts_local_ns: TimestampNs(10_000_000_000),
+            last_trade_price: PriceTicks(99_910),
+            mark_price: PriceTicks(99_910),
+            realized_vol_5m: ScaledBps::from_whole_bps(60),
+            factor_ofi: BoundedScore::new_clamped(-0.10),
+            factor_tfi: BoundedScore::new_clamped(-0.05),
+            ..SymbolLobSnapshot::default()
+        };
+        snap_dip.bids[0] = BookLevel { price: PriceTicks(99_910), qty: LotQty(100) };
+        snap_dip.asks[0] = BookLevel { price: PriceTicks(99_911), qty: LotQty(100) };
+        assert!(fsm.step_open_position(&snap_dip, &mut ledger).is_none());
+        assert_eq!(fsm.worst_adverse_price, PriceTicks(99_910));
+        let mut snap_peak = snap_dip;
+        snap_peak.ts_local_ns = TimestampNs(18_000_000_000);
+        snap_peak.bids[0].price = PriceTicks(100_052);
+        snap_peak.asks[0].price = PriceTicks(100_053);
+        snap_peak.last_trade_price = PriceTicks(100_052);
+        snap_peak.mark_price = PriceTicks(100_052);
+        snap_peak.factor_ofi = BoundedScore::new_clamped(0.25);
+        snap_peak.factor_tfi = BoundedScore::new_clamped(0.20);
+        assert!(fsm.step_open_position(&snap_peak, &mut ledger).is_none());
+        let mut snap_rescue = snap_peak;
+        snap_rescue.ts_local_ns = TimestampNs(27_000_000_000);
+        snap_rescue.bids[0].price = PriceTicks(100_045);
+        snap_rescue.asks[0].price = PriceTicks(100_046);
+        snap_rescue.last_trade_price = PriceTicks(100_045);
+        snap_rescue.mark_price = PriceTicks(100_045);
+        snap_rescue.factor_ofi = BoundedScore::new_clamped(-0.22);
+        snap_rescue.factor_tfi = BoundedScore::new_clamped(-0.20);
+        let closed = fsm.step_open_position(&snap_rescue, &mut ledger);
+        assert!(closed.is_some());
+        assert_eq!(fsm.last_exit_sub_reason, ExitSubReason::AdverseScratchEscape);
+        assert_eq!(fsm.last_closed_mfe_bps, 520);
+        assert_eq!(fsm.last_closed_mae_bps, -900);
+        assert_eq!(fsm.last_closed_peak_ticks, PriceTicks(100_052));
+        assert_eq!(fsm.last_closed_worst_ticks, PriceTicks(99_910));
     }
 }
