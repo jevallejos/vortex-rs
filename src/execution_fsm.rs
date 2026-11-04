@@ -704,7 +704,7 @@ impl ExecutionFsm {
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
         let severe_adverse_collapse =
-            hold_ns >= STAGNANT_PROFIT_HOLD_NS && adv_p >= 0.35 && cur_gross_now < -600;
+            hold_ns >= STAGNANT_PROFIT_HOLD_NS && adv_p >= 0.70 && cur_gross_now < -1_200;
         let early_adverse_stall = hold_ns > wald_grace_ns
             && peak_gross_now < 550
             && cur_gross_now < -450
@@ -2211,19 +2211,27 @@ impl OnlineAdaptiveGovernor {
         if self.price_sample_count[slot_idx] < 20 {
             return false;
         }
+        if slot_idx > 0
+            && (self.abort_streak[0][d] >= 1
+                || self.win_streak[0][d] >= 1
+                || self.sl_streak[0][d] >= 1
+                || self.wave_step_count[0][1 - d] >= 1)
+        {
+            return false;
+        }
         let sym_net_x100 = self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
         let sym_debt_abs = (-sym_net_x100).max(0);
         let abort_p = i64::from(self.abort_streak[slot_idx][d].min(4));
         let base_drift = (((260 - learned_edge).max(60)) * self_vol) / 26_000;
         let min_trend_drift = (base_drift + (sym_debt_abs / 80) + (abort_p * 5)).max(10);
-        let max_self_ext = ((self_vol / 18) + (learned_edge / 4)
+        let max_self_ext = ((self_vol / 22) + (learned_edge / 5)
             - (sym_debt_abs / 20)
-            - (abort_p * 20))
-            .clamp(220, 480);
-        let max_btc_ext = ((btc_vol / 18) + (learned_edge / 4)
+            - (abort_p * 25))
+            .clamp(180, 400);
+        let max_btc_ext = ((btc_vol / 22) + (learned_edge / 5)
             - (sym_debt_abs / 20)
-            - (abort_p * 20))
-            .clamp(220, 480);
+            - (abort_p * 25))
+            .clamp(180, 400);
         let slot_stair_locked =
             self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
         match side {
