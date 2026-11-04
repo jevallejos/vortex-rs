@@ -1699,6 +1699,35 @@ impl OnlineAdaptiveGovernor {
         let slow_span = (fast_span * 15).clamp(180, 360);
         self.ewma_fast_px_1e4[slot_idx] = (fast_prev * (fast_span - 1) + px_1e4) / fast_span;
         self.ewma_slow_px_1e4[slot_idx] = (slow_prev * (slow_span - 1) + px_1e4) / slow_span;
+        let wave_reset_ns = (slow_span * 3) * 1_000_000_000;
+        let now_ns = snap.ts_local_ns.0;
+        let mut dir = 0;
+        while dir < 2 {
+            if self.abort_streak[slot_idx][dir] > 0
+                && now_ns > self.abort_last_ts_ns[slot_idx][dir]
+                && now_ns.saturating_sub(self.abort_last_ts_ns[slot_idx][dir]) > 180_000_000_000
+            {
+                self.abort_streak[slot_idx][dir] = 0;
+            }
+            let cd_end = self.directional_cooldown_until_ns[slot_idx][dir];
+            if self.sl_streak[slot_idx][dir] == 0
+                && cd_end > 0
+                && now_ns > cd_end
+                && now_ns.saturating_sub(cd_end) > wave_reset_ns
+            {
+                self.wave_anchor_px_1e4[slot_idx][dir] = 0;
+                self.last_exit_px_1e4[slot_idx][dir] = 0;
+                self.wave_step_count[slot_idx][dir] = 0;
+                self.win_streak[slot_idx][dir] = 0;
+            }
+            dir += 1;
+        }
+        if self.last_global_win_ts_ns > 0
+            && now_ns > self.last_global_win_ts_ns
+            && now_ns.saturating_sub(self.last_global_win_ts_ns) > wave_reset_ns
+        {
+            self.global_dir_win_streak = [0; 2];
+        }
     }
 
     #[inline]
@@ -2211,12 +2240,12 @@ impl OnlineAdaptiveGovernor {
         if self.price_sample_count[slot_idx] < 20 {
             return false;
         }
-        if slot_idx > 0
-            && (self.abort_streak[0][d] >= 1
-                || self.win_streak[0][d] >= 1
-                || self.sl_streak[0][d] >= 1
-                || self.wave_step_count[0][1 - d] >= 1)
-        {
+        let now_ts = candidate_snap.ts_local_ns.0;
+        let btc_recent_abort = self.abort_streak[0][d] >= 1
+            && now_ts.saturating_sub(self.abort_last_ts_ns[0][d]) <= 60_000_000_000;
+        let btc_in_cooldown = now_ts < self.directional_cooldown_until_ns[0][d]
+            || now_ts < self.directional_cooldown_until_ns[0][1 - d];
+        if slot_idx > 0 && (btc_recent_abort || btc_in_cooldown) {
             return false;
         }
         let sym_net_x100 = self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
@@ -3629,5 +3658,41 @@ mod tests {
         assert_eq!(fsm.last_closed_mae_bps, -900);
         assert_eq!(fsm.last_closed_peak_ticks, PriceTicks(100_052));
         assert_eq!(fsm.last_closed_worst_ticks, PriceTicks(99_910));
+    }
+
+    #[test]
+    fn test_stale_wave_anchor_and_altcoin_subordination_auto_expire_after_horizon() {
+        let mut gov = OnlineAdaptiveGovernor::new();
+        let t_trade2 = 1_000_000_000_000_i64;
+        gov.seed_historical_price(0, Side::Ask, 805_742, 805_364);
+        gov.observe_closed_trade(0, Side::Ask, ScaledBps(69), true, TimestampNs(t_trade2));
+        let t_trade5 = 2_000_000_000_000_i64;
+        gov.seed_historical_price(0, Side::Bid, 800_779, 801_101);
+        gov.observe_closed_trade(0, Side::Bid, ScaledBps(2), true, TimestampNs(t_trade5));
+        assert!(
+            gov.audit_historical_entry_veto(0, Side::Bid, 805_095, t_trade5 + 150_000_000_000)
+                .is_some()
+        );
+        let t_live_base = t_trade5 + 1_500_000_000_000;
+        let mut i = 0;
+        while i < 25 {
+            let ts = TimestampNs(t_live_base + i * 1_100_000_000);
+            let mut btc_s = SymbolLobSnapshot {
+                symbol_id: SymbolId(1),
+                ts_local_ns: ts,
+                realized_vol_5m: ScaledBps(6_000),
+                factor_ofi: BoundedScore::new_clamped(-0.20),
+                factor_tfi: BoundedScore::new_clamped(-0.25),
+                factor_geom: BoundedScore::new_clamped(-0.30),
+                ..SymbolLobSnapshot::default()
+            };
+            btc_s.bids[0] = BookLevel { price: PriceTicks(805_095 - i), qty: LotQty(500) };
+            btc_s.asks[0] = BookLevel { price: PriceTicks(805_096 - i), qty: LotQty(500) };
+            gov.observe_market_price(0, &btc_s);
+            i += 1;
+        }
+        let t_now = t_live_base + 30_000_000_000;
+        assert_eq!(gov.audit_historical_entry_veto(0, Side::Bid, 805_095, t_now), None);
+        assert_eq!(gov.wave_step_count[0][0], 0);
     }
 }
