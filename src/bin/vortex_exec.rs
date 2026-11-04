@@ -1020,23 +1020,23 @@ fn format_forensic_vault_v2_json_line(
         mfe_capture_pct, entry_forensic.init_q_lots, entry_forensic.abort_recovered
     );
     let p9 = format!(
-        "\"ofi_in\":{:+.2},\"tfi_in\":{:+.2},\"geom_in\":{:+.2},\"snr_in\":{:+.2},",
+        "\"ofi_in\":{:.2},\"tfi_in\":{:.2},\"geom_in\":{:.2},\"snr_in\":{:.2},",
         ofi_in, tfi_in, geom_in, snr_in
     );
     let p10 = format!(
-        "\"vol5m_in\":{:.2},\"spread_in\":{},\"btc_comp_in\":{:+.2},\"ofi_out\":{:+.2},",
+        "\"vol5m_in\":{:.2},\"spread_in\":{},\"btc_comp_in\":{:.2},\"ofi_out\":{:.2},",
         vol5m_in, entry_forensic.spread_in_ticks, btc_comp_in, ofi_out
     );
     let p11 = format!(
-        "\"tfi_out\":{:+.2},\"vol5m_out\":{:.2},\"slot_mfe_bps\":{:.2},\"gov_ewma_bps\":{:+.2},",
+        "\"tfi_out\":{:.2},\"vol5m_out\":{:.2},\"slot_mfe_bps\":{:.2},\"gov_ewma_bps\":{:.2},",
         tfi_out, vol5m_out, slot_mfe, gov_ewma
     );
     let p12 = format!(
-        "\"win_streak\":{},\"sl_streak\":{},\"wave_step\":{},\"drift_bps\":{:+.2},",
+        "\"win_streak\":{},\"sl_streak\":{},\"wave_step\":{},\"drift_bps\":{:.2},",
         entry_forensic.win_streak, entry_forensic.sl_streak, entry_forensic.wave_step, drift_bps
     );
     let p13 = format!(
-        "\"ext_bps\":{:+.2},\"chased_bps\":{:+.2},\"cum_slot_debt_bps\":{:+.2}}}\n",
+        "\"ext_bps\":{:.2},\"chased_bps\":{:.2},\"cum_slot_debt_bps\":{:.2}}}\n",
         ext_bps, chased_bps, cum_slot_debt
     );
     format!(
