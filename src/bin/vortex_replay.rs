@@ -436,9 +436,10 @@ fn replay_captured_live_parquet_segments() {
                                     let max_q_permille = 720 + ((tfi_exc * 100.0) as i64).min(60);
                                     let queue_wall_blocked =
                                         own_q > 12_000 || (own_q * 1_000) / tot_q > max_q_permille;
+                                    let min_l1_q = spec.min_resting_l1_lots(entry_price, snap.realized_vol_5m);
                                     if post_only_crossed
                                         || !signal_still_valid
-                                        || own_q < 15
+                                        || own_q < min_l1_q
                                         || queue_wall_blocked
                                     {
                                         fsm.state = OrderLifecycleState::Idle;

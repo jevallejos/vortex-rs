@@ -356,6 +356,42 @@ impl PairSpec {
             }
         }
     }
+
+    /// Scale-invariant minimum L1 queue depth in `LotQty` required to avoid paper-thin top-of-book traps.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::manual_clamp)]
+    pub const fn min_resting_l1_lots(
+        &self,
+        entry_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+    ) -> i64 {
+        if entry_price.0 <= 0 || self.tick_size_1e8 <= 0 || self.lot_step_1e8 <= 0 {
+            return 15;
+        }
+        let vol_raw = realized_vol_5m.raw();
+        let vol_clamped = if vol_raw < 4_000 {
+            4_000
+        } else if vol_raw > 10_000 {
+            10_000
+        } else {
+            vol_raw
+        };
+        let min_notional_1e4 = (vol_clamped as i128) * 420;
+        let lot_usdt_1e4 = ((entry_price.0 as i128)
+            * (self.tick_size_1e8 as i128)
+            * (self.lot_step_1e8 as i128))
+            / 1_000_000_000_000;
+        let denom = if lot_usdt_1e4 > 1 { lot_usdt_1e4 } else { 1 };
+        let raw_lots = ((min_notional_1e4 + denom - 1) / denom) as i64;
+        if raw_lots < 15 {
+            15
+        } else if raw_lots > 350 {
+            350
+        } else {
+            raw_lots
+        }
+    }
 }
 
 /// ANSI terminal color and badge constants shared across CLI binaries.
