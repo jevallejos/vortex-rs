@@ -543,7 +543,11 @@ impl ExecutionFsm {
             let depleted_ratio = ((init_q - cur_q) as f64) / (init_q as f64);
             let crit_depletion = (0.55 * vol_norm).clamp(0.45, 0.72);
             let signed_flow_impulse = signed_ofi + 0.50 * signed_tfi;
-            if depleted_ratio >= crit_depletion && signed_flow_impulse <= (-0.05 * vol_norm) {
+            let tfi_not_supporting = signed_tfi <= (0.10 * vol_norm);
+            if depleted_ratio >= crit_depletion
+                && signed_flow_impulse <= (-0.05 * vol_norm)
+                && tfi_not_supporting
+            {
                 self.state = OrderLifecycleState::Idle;
                 return true;
             }
@@ -1334,6 +1338,7 @@ pub struct OnlineAdaptiveGovernor {
     abort_anchor_px_1e4: [[i64; 2]; 6],
     abort_last_ts_ns: [[i64; 2]; 6],
     global_dir_abort_streak: [u32; 2],
+    global_abort_last_ts_ns: [i64; 2],
     last_sl_ts_ns: i64,
     price_sample_count: [u32; 6],
     last_seen_px_1e4: [i64; 6],
@@ -1372,6 +1377,7 @@ impl OnlineAdaptiveGovernor {
             abort_anchor_px_1e4: [[0; 2]; 6],
             abort_last_ts_ns: [[0; 2]; 6],
             global_dir_abort_streak: [0; 2],
+            global_abort_last_ts_ns: [0; 2],
             last_sl_ts_ns: 0,
             price_sample_count: [0; 6],
             last_seen_px_1e4: [0; 6],
@@ -1441,7 +1447,14 @@ impl OnlineAdaptiveGovernor {
         if opp_whip_ns > self.directional_cooldown_until_ns[slot_idx][1 - d] {
             self.directional_cooldown_until_ns[slot_idx][1 - d] = opp_whip_ns;
         }
-        self.global_dir_abort_streak[d] = self.global_dir_abort_streak[d].saturating_add(1);
+        let elapsed_glob = ts_ns.0.saturating_sub(self.global_abort_last_ts_ns[d]);
+        if self.global_dir_abort_streak[d] == 0 || elapsed_glob > 180_000_000_000 {
+            self.global_dir_abort_streak[d] = 1;
+        } else {
+            self.global_dir_abort_streak[d] =
+                self.global_dir_abort_streak[d].saturating_add(1);
+        }
+        self.global_abort_last_ts_ns[d] = ts_ns.0;
         self.global_dir_abort_streak[1 - d] = 0;
         let edge_c = self.ewma_net_bps_x100[slot_idx][d].clamp(-200, 400);
         if self.abort_streak[slot_idx][d] >= 2 {
@@ -1987,10 +2000,12 @@ impl OnlineAdaptiveGovernor {
                 {
                     return false;
                 }
+                let slot_stair_locked =
+                    self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
                 if slot_idx > 0
                     && (btc_drift_bps < 0
                         || !(0..=max_btc_ext).contains(&btc_ext_bps)
-                        || self.global_dir_win_streak[d] >= 2)
+                        || slot_stair_locked)
                 {
                     return false;
                 }
@@ -2001,10 +2016,12 @@ impl OnlineAdaptiveGovernor {
                 {
                     return false;
                 }
+                let slot_stair_locked =
+                    self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
                 if slot_idx > 0
                     && (btc_drift_bps > 0
                         || !(-max_btc_ext..=0).contains(&btc_ext_bps)
-                        || self.global_dir_win_streak[d] >= 2)
+                        || slot_stair_locked)
                 {
                     return false;
                 }

@@ -1543,9 +1543,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         client.get_open_position_size(snap.symbol_id.name());
                                     if !real_filled {
                                         if !level_swept {
-                                            resting_queue_ahead = LotQty(1);
+                                            if resting_queue_ahead.0 <= 0 {
+                                                resting_queue_ahead =
+                                                    LotQty((cur_l1_qty / 2).max(25));
+                                            }
                                             arena.exec_queue_ahead_lots.store(
-                                                1,
+                                                resting_queue_ahead.0 as u64,
                                                 Ordering::Release,
                                             );
                                             continue;
