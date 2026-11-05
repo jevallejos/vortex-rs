@@ -290,34 +290,43 @@ fn replay_captured_live_parquet_segments() {
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
     let mut shadow_history: Vec<(i64, usize, Side, i64, i64, i64, bool)> = Vec::new();
     let mut shadow_cursor: usize = 0;
-    if let Ok(sf) = std::fs::File::open("data/vault/vortex_shadow_trades.jsonl") {
-        use std::io::{BufRead, BufReader};
-        for line in BufReader::new(sf).lines().map_while(Result::ok) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                let net_bps = val.get("net_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let is_mkr = val.get("maker_exit").and_then(|v| v.as_bool()).unwrap_or(true);
-                let sym_s = val.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-                let side_s = val.get("side").and_then(|v| v.as_str()).unwrap_or("Bid");
-                let ts_s = val.get("ts_ns").and_then(|v| v.as_i64()).unwrap_or(0);
-                let en_t = val.get("entry_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
-                let ex_t = val.get("exit_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
-                let slot_opt = match sym_s {
-                    "BTCUSDT" => Some(0),
-                    "ETHUSDT" => Some(1),
-                    "SOLUSDT" => Some(2),
-                    "AVAXUSDT" => Some(3),
-                    "TAOUSDT" => Some(4),
-                    "SUIUSDT" => Some(5),
-                    _ => None,
-                };
-                if let Some(s_i) = slot_opt {
-                    let s_side = if side_s == "Ask" { Side::Ask } else { Side::Bid };
-                    let net_sc = (net_bps * 100.0).round() as i64;
-                    shadow_history.push((ts_s, s_i, s_side, en_t, ex_t, net_sc, is_mkr));
+    for hist_path in [
+        "data/vault/vortex_governor_scar_memory.jsonl",
+        "data/vault/vortex_shadow_trades.jsonl",
+    ] {
+        if let Ok(sf) = std::fs::File::open(hist_path) {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(sf).lines().map_while(Result::ok) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let ts_s = val.get("ts_ns").and_then(|v| v.as_i64()).unwrap_or(0);
+                    if ts_s > 0 && shadow_history.iter().any(|x| x.0 == ts_s) {
+                        continue;
+                    }
+                    let net_bps = val.get("net_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let is_mkr = val.get("maker_exit").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let sym_s = val.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                    let side_s = val.get("side").and_then(|v| v.as_str()).unwrap_or("Bid");
+                    let en_t = val.get("entry_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let ex_t = val.get("exit_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let slot_opt = match sym_s {
+                        "BTCUSDT" => Some(0),
+                        "ETHUSDT" => Some(1),
+                        "SOLUSDT" => Some(2),
+                        "AVAXUSDT" => Some(3),
+                        "TAOUSDT" => Some(4),
+                        "SUIUSDT" => Some(5),
+                        _ => None,
+                    };
+                    if let Some(s_i) = slot_opt {
+                        let s_side = if side_s == "Ask" { Side::Ask } else { Side::Bid };
+                        let net_sc = (net_bps * 100.0).round() as i64;
+                        shadow_history.push((ts_s, s_i, s_side, en_t, ex_t, net_sc, is_mkr));
+                    }
                 }
             }
         }
     }
+    shadow_history.sort_by_key(|x| x.0);
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
     if let Ok(seed_file) = std::fs::File::open("deploy/forensic_vault_171.seed") {
         use std::io::{BufRead, BufReader};

@@ -5,3 +5,6 @@
 *.parquet
 .env
 data/*.jsonl
+data/vault/*.jsonl
+data/vault/*.lock
+*.csv

@@ -12,7 +12,8 @@ RELEASE_BASE="https://github.com/jevallejos/vortex-rs/releases/download/latest-l
 RELEASE_URL="${RELEASE_BASE}/vortex-linux-x86_64.tar.gz"
 SHA_URL="${RELEASE_BASE}/COMMIT_SHA"
 
-mkdir -p "${BIN_DIR}" "${DATA_DIR}"
+mkdir -p "${BIN_DIR}" "${DATA_DIR}" "${DATA_DIR}/vault" "${DATA_DIR}/lakehouse_par1"
+rm -f "${DATA_DIR}/vault/HALTED_ON_LOSS.lock"
 cd "${VORTEX_DIR}"
 sudo loginctl enable-linger ubuntu 2>/dev/null || true
 SEED_V="${VORTEX_DIR}/deploy/forensic_vault_171.seed"
@@ -87,7 +88,7 @@ User=ubuntu
 WorkingDirectory=${VORTEX_DIR}
 EnvironmentFile=-${VORTEX_DIR}/.env
 ExecStart=${BIN_DIR}/vortex_exec --daemon ${EXEC_MODE_FLAG}
-Restart=always
+Restart=on-failure
 RestartSec=2
 Nice=-15
 OOMScoreAdjust=-800
@@ -114,6 +115,8 @@ case "${1:-live}" in
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay"
         echo "=== [5. AI FORENSIC VAULT (data/vault/vortex_ai_forensic_vault.jsonl)] ==="
         tail -n 15 "${VORTEX_DIR}/data/vault/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
+        echo "=== [6. RED LOSS FORENSIC BOX (data/vault/vortex_red_loss_box.jsonl)] ==="
+        cat "${VORTEX_DIR}/data/vault/vortex_red_loss_box.jsonl" 2>/dev/null || echo "  (0 Red Losses recorded in data/vault/vortex_red_loss_box.jsonl)"
         ;;
     live|-l)
         "${BIN_DIR}/vortex_exec" --live
@@ -147,6 +150,8 @@ case "${1:-live}" in
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay"
         echo "=== [5. AI FORENSIC VAULT (data/vault/vortex_ai_forensic_vault.jsonl)] ==="
         tail -n 15 "${VORTEX_DIR}/data/vault/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
+        echo "=== [6. RED LOSS FORENSIC BOX (data/vault/vortex_red_loss_box.jsonl)] ==="
+        cat "${VORTEX_DIR}/data/vault/vortex_red_loss_box.jsonl" 2>/dev/null || echo "  (0 Red Losses recorded in data/vault/vortex_red_loss_box.jsonl)"
         ;;
     baul|-b)
         echo "=== [VORTEX FORENSIC VAULT V2 (38 METRICS)] ==="

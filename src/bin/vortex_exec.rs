@@ -258,6 +258,7 @@ impl BybitV5LiveClient {
         let output = Command::new("curl")
             .args([
                 "-sS",
+                "--tcp-nodelay",
                 "--max-time",
                 "4",
                 "-X",
@@ -293,6 +294,7 @@ impl BybitV5LiveClient {
         let output = Command::new("curl")
             .args([
                 "-sS",
+                "--tcp-nodelay",
                 "--max-time",
                 "4",
                 "-X",
@@ -788,7 +790,7 @@ fn prewarm_mfe_from_seed(fsm: &mut ExecutionFsm) {
 }
 
 fn prewarm_governor_prices_from_parquet(adaptive_gov: &mut OnlineAdaptiveGovernor) {
-    let data_dir = Path::new("data/vault");
+    let data_dir = Path::new("data");
     let entries = match std::fs::read_dir(data_dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -840,15 +842,6 @@ fn rehydrate_shadow_ledger(
 ) {
     prewarm_mfe_from_seed(fsm);
     prewarm_governor_prices_from_parquet(adaptive_gov);
-    let file_path = Path::new("data/vault/vortex_shadow_trades.jsonl");
-    let file = match File::open(file_path) {
-        Ok(f) => f,
-        Err(_) => {
-            arena.exec_closed_count.store(0, Ordering::Release);
-            return;
-        }
-    };
-    let reader = BufReader::new(file);
     let mut restored_count: u64 = 0;
     let mut seen_gov_ts: Vec<i64> = Vec::new();
     if let Ok(sf) = File::open("data/vault/vortex_governor_scar_memory.jsonl") {
@@ -887,7 +880,15 @@ fn rehydrate_shadow_ledger(
             }
         }
     }
-
+    let file_path = Path::new("data/vault/vortex_shadow_trades.jsonl");
+    let file = match File::open(file_path) {
+        Ok(f) => f,
+        Err(_) => {
+            arena.exec_closed_count.store(0, Ordering::Release);
+            return;
+        }
+    };
+    let reader = BufReader::new(file);
     for line in reader.lines().map_while(Result::ok) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
             let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
@@ -1188,7 +1189,7 @@ fn print_colorized_shadow_trades() -> ExitCode {
         Ok(f) => f,
         Err(_) => {
             let mut sections = vec![vec![String::from(
-                "(No closed trades yet in data/vortex_shadow_trades.jsonl)",
+                "(No closed trades yet in data/vault/vortex_shadow_trades.jsonl)",
             )]];
             sections.extend(build_consolidated_executive_sections(
                 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -1654,12 +1655,21 @@ fn format_red_loss_forensic_box_json_line(
     let d_abs = entry_forensic.drift_bps.abs();
     let e_abs = entry_forensic.ext_bps.abs();
     let kin_accel_net_bps = ((d_abs - e_abs) as f64) / 100.0;
-    let mfe_est = 400 + entry_forensic.gov_ewma_bps.clamp(80, 260);
-    let kin_energy_in_bps = ((d_abs - e_abs + (d_abs - mfe_est / 2).max(0)) as f64) / 100.0;
-    let req_kin_in_bps = (((mfe_est / 5)
-        + ((160 - entry_forensic.gov_ewma_bps).max(0) / 2)
-        + ((entry_forensic.vol5m_in_bps - 9_500).max(0) / 200))
-        .clamp(115, 360) as f64)
+    let l_edge_c = entry_forensic.gov_ewma_bps.clamp(-200, 400);
+    let mfe_est = 400 + l_edge_c.clamp(80, 260);
+    let climax_cap = (200 + l_edge_c.max(0) - ((entry_forensic.vol5m_in_bps - 10_000).max(0) / 60)).clamp(175, 360);
+    let ext_head = (climax_cap - e_abs).max(0);
+    let climax_p = (e_abs - climax_cap).max(0) * 15;
+    let abs_tfi_in = (f64::from(entry_forensic.tfi_in_bps).abs()) / 10_000.0;
+    let abs_ofi_in = (f64::from(entry_forensic.ofi_in_bps).abs()) / 10_000.0;
+    let l2_abs_p = (((abs_tfi_in - abs_ofi_in - 0.35).max(0.0)) * 180.0) as i64;
+    let kin_energy_in_bps = ((d_abs - e_abs + (d_abs - mfe_est / 2).max(0).min(ext_head)) as f64) / 100.0;
+    let req_kin_in_bps = ((((mfe_est * 19) / 100)
+        + ((160 - l_edge_c).max(0) / 2)
+        + ((entry_forensic.vol5m_in_bps - 9_500).max(0) / 200)
+        + l2_abs_p
+        + climax_p)
+        .clamp(112, 520) as f64)
         / 100.0;
     let bleed_rate_bps_s = ((summary.gross_scaled_bps.raw() as f64) / 100.0) / hold_s.max(0.1);
     let mae_to_mfe_ratio = (mae_raw.abs() as f64) / (mfe_raw.max(1) as f64);
@@ -2047,12 +2057,14 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     );
 
     let mut last_price_seq = [0_u64; 6];
+    let mut cached_snaps = [SymbolLobSnapshot::default(); 6];
     loop {
         thread::sleep(Duration::from_millis(5));
         let mut p_slot = 0;
         while p_slot < APPROVED_SPECS.len() {
             if let Ok(sl_ref) = arena.slot(p_slot) {
-                if let Ok(p_snap) = sl_ref.read_snapshot(2) {
+                if let Ok(p_snap) = sl_ref.read_snapshot(4) {
+                    cached_snaps[p_slot] = p_snap;
                     if p_snap.sequence_id != last_price_seq[p_slot] {
                         last_price_seq[p_slot] = p_snap.sequence_id;
                         adaptive_gov.observe_market_price(p_slot, &p_snap);
@@ -2067,10 +2079,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 arena.exec_state_code.store(0, Ordering::Release);
                 arena.exec_queue_ahead_lots.store(0, Ordering::Release);
 
-                let btc_leader_snap = arena
-                    .slot(0)
-                    .and_then(|s0| s0.read_snapshot(4))
-                    .unwrap_or_default();
+                let btc_leader_snap = cached_snaps[0];
 
                 let mut best_cand: Option<(
                     usize,
@@ -2082,8 +2091,9 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 let mut s = 0;
                 while s < APPROVED_SPECS.len() {
                     let spec = APPROVED_SPECS[s];
-                    if let Ok(slot) = arena.slot(s) {
-                        if let Ok(snap) = slot.read_snapshot(4) {
+                    let snap = cached_snaps[s];
+                    if snap.sequence_id > 0 {
+                        {
                             if snap.sequence_id == last_seen_seq[s] {
                                 s += 1;
                                 continue;

@@ -374,7 +374,6 @@ fn flush_parquet_batch(batch: &mut ColumnarParquetBatch, parquet_seq: &mut u64) 
         return;
     }
     let data_dir = Path::new("data");
-    let _ = std::fs::create_dir_all(data_dir);
     *parquet_seq = parquet_seq.wrapping_add(1);
     let file_path = data_dir.join(format!("vortex_l2_segment_{:06}.parquet", *parquet_seq));
     if let Ok(checksum) = batch.write_to_file(&file_path) {
@@ -389,7 +388,6 @@ fn flush_parquet_batch(batch: &mut ColumnarParquetBatch, parquet_seq: &mut u64) 
         let expired_seq = *parquet_seq - MAX_PARQUET_RING_FILES;
         let expired_path = data_dir.join(format!("vortex_l2_segment_{:06}.parquet", expired_seq));
         let lake_dir = data_dir.join("lakehouse_par1");
-        let _ = std::fs::create_dir_all(&lake_dir);
         let lake_path = lake_dir.join(format!("vortex_l2_segment_{:06}.parquet", expired_seq));
         if std::fs::rename(&expired_path, &lake_path).is_err() {
             let _ = std::fs::remove_file(&expired_path);
@@ -423,6 +421,7 @@ fn run_live_bybit_ws_loop(
     }
 
     let subscribe_payload = r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","publicTrade.BTCUSDT","orderbook.50.ETHUSDT","publicTrade.ETHUSDT","orderbook.50.SOLUSDT","publicTrade.SOLUSDT","orderbook.50.AVAXUSDT","publicTrade.AVAXUSDT","orderbook.50.TAOUSDT","publicTrade.TAOUSDT","orderbook.50.SUIUSDT","publicTrade.SUIUSDT"]}"#;
+    let _ = std::fs::create_dir_all("data/lakehouse_par1");
     let mut parquet_seq: u64 = discover_max_parquet_seq();
     println!(
         "[PAR1 APPEND-ONLY] Resuming columnar segment sequence from #{:06} (Ring Cap: {})",

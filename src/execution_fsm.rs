@@ -2903,7 +2903,7 @@ mod tests {
         use std::io::{BufRead, BufReader};
         use std::path::Path;
 
-        let vault_path = Path::new("data/vortex_ai_forensic_vault.jsonl");
+        let vault_path = Path::new("data/vault/vortex_ai_forensic_vault.jsonl");
         let seed_path = Path::new("deploy/forensic_vault_171.seed");
         let file = match File::open(seed_path).or_else(|_| File::open(vault_path)) {
             Ok(f) => f,
