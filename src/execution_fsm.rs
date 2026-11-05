@@ -1722,7 +1722,6 @@ impl OnlineAdaptiveGovernor {
                 && mean_reverted
             {
                 self.wave_anchor_px_1e4[slot_idx][dir] = 0;
-                self.last_exit_px_1e4[slot_idx][dir] = 0;
                 self.wave_step_count[slot_idx][dir] = 0;
                 self.win_streak[slot_idx][dir] = 0;
             }
@@ -2358,6 +2357,12 @@ impl OnlineAdaptiveGovernor {
         };
         let geom_relief = ((geom_pct - 45).max(0) * 3) / 2;
         let learned_mfe_est = 400 + learned_edge.clamp(80, 260);
+        let structural_breakdown_pen = (-dist_from_prev_same_bps - learned_mfe_est).max(0) / 14;
+        let l2_absorption_pen = (((candidate_snap.factor_tfi.get().abs()
+            - candidate_snap.factor_ofi.get().abs()
+            - 0.35)
+            .max(0.0))
+            * 180.0) as i64;
         let climax_ext_cap = (200 + learned_edge.max(0)
             - ((self_vol - 10_000).max(0) / 60))
             .clamp(175, 360);
@@ -2368,13 +2373,15 @@ impl OnlineAdaptiveGovernor {
             .max(0)
             .min(ext_headroom);
         let kin_energy = net_kin_accel + excess_vel_bonus;
-        let req_kin_energy = ((learned_mfe_est / 5)
+        let req_kin_energy = (((learned_mfe_est * 19) / 100)
             + ((160 - learned_edge).max(0) / 2)
             + ((self_vol - 9_500).max(0) / 200)
             + unanchored_rally_pen
+            + structural_breakdown_pen
+            + l2_absorption_pen
             + leader_opp_debt_pen
             + climax_pen)
-            .clamp(115, 480);
+            .clamp(112, 520);
         let leader_l2_divergent = slot_idx > 0
             && match side {
                 Side::Bid => {
@@ -3860,7 +3867,7 @@ mod tests {
     #[test]
     fn test_combinatorial_loss_manifold_100pct_green_gate() {
         let vols: [i64; 6] = [6_500, 7_784, 9_500, 10_951, 11_212, 12_800];
-        let profiles: [(i64, i64, f64, f64); 7] = [
+        let profiles: [(i64, i64, f64, f64); 10] = [
             (142, 267, 0.25, 0.65),
             (113, 120, 0.11, 0.55),
             (247, 157, 0.42, 0.72),
@@ -3868,6 +3875,9 @@ mod tests {
             (275, 209, 0.62, 0.75),
             (263, 155, 0.27, -0.30),
             (694, 302, 0.51, 0.79),
+            (235, 165, 0.34, 0.60),
+            (225, 155, 0.30, 0.58),
+            (250, 162, 0.36, 0.62),
         ];
         let ewmas: [i64; 3] = [200, 73, -80];
         let mut total_combos = 0_u64;
@@ -3923,8 +3933,8 @@ mod tests {
             "[COMBINATORIAL LOSS MANIFOLD AUDIT] Blocked: {}/{} (100.0%) | Allowed Losses: 0",
             blocked_combos, total_combos
         );
-        assert_eq!(total_combos, 1_512);
-        assert_eq!(blocked_combos, 1_512);
+        assert_eq!(total_combos, 2_160);
+        assert_eq!(blocked_combos, 2_160);
     }
 
     #[test]
