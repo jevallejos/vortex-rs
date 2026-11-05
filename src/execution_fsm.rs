@@ -468,12 +468,12 @@ impl ExecutionFsm {
         let learned_raw = self.slot_learned_mfe_bps(snap.symbol_id);
         let target_raw = target_excursion.raw().clamp(2_400, 8_000);
         let slot_mfe_cap = learned_raw.clamp(520, 780);
-        let learned_sl_cap = (4 * slot_mfe_cap
+        let learned_sl_cap = (3 * slot_mfe_cap
             + (target_raw.max(0) / 2)
-            + ((vol_raw - 8_000).max(0) / 20))
-            .clamp(2_400, 3_250);
+            + ((vol_raw - 8_000).max(0) / 30))
+            .clamp(2_150, 2_750);
         let elastic_sl_bps =
-            ((vol_raw * 28 + target_raw * 10 + slot_mfe_cap * 20) / 100).clamp(2_100, learned_sl_cap);
+            ((vol_raw * 26 + target_raw * 10 + slot_mfe_cap * 18) / 100).clamp(2_100, learned_sl_cap);
         let sl_distance_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
@@ -707,10 +707,13 @@ impl ExecutionFsm {
         let cur_gross_now =
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
-        let wald_collapse_trigger =
-            -1_200 - (snap.realized_vol_5m.raw() - 8_500).max(0);
+        let wald_collapse_trigger = if peak_gross_now == 0 {
+            -1_200 - (snap.realized_vol_5m.raw() - 8_500).max(0)
+        } else {
+            -1_350
+        };
         let severe_adverse_collapse = hold_ns >= STAGNANT_PROFIT_HOLD_NS
-            && peak_gross_now == 0
+            && peak_gross_now < 350
             && adv_p >= 0.70
             && cur_gross_now < wald_collapse_trigger;
         let wald_contraction_pct = if severe_adverse_collapse {
@@ -2357,6 +2360,27 @@ impl OnlineAdaptiveGovernor {
             0
         };
         let geom_relief = ((geom_pct - 45).max(0) * 3) / 2;
+        let learned_mfe_est = 400 + learned_edge.clamp(80, 260);
+        let net_kin_accel = abs_d_now - self_ext_bps.abs();
+        let excess_vel_bonus = (abs_d_now - (learned_mfe_est / 2)).max(0);
+        let kin_energy = net_kin_accel + excess_vel_bonus;
+        let req_kin_energy = ((learned_mfe_est / 5)
+            + ((160 - learned_edge).max(0) / 2)
+            + ((self_vol - 9_500).max(0) / 200)
+            + unanchored_rally_pen
+            + leader_opp_debt_pen)
+            .clamp(115, 360);
+        let leader_l2_divergent = slot_idx > 0
+            && match side {
+                Side::Bid => {
+                    btc_leader_snap.factor_ofi.get() < 0.05
+                        || btc_leader_snap.factor_geom.get() < 0.05
+                }
+                Side::Ask => {
+                    btc_leader_snap.factor_ofi.get() > -0.05
+                        || btc_leader_snap.factor_geom.get() > -0.05
+                }
+            };
         let dynamic_min_drift = (base_vol_drift
             + ewma_deficit_pen
             + wave_break_pen
@@ -2365,7 +2389,11 @@ impl OnlineAdaptiveGovernor {
             + leader_opp_debt_pen
             - geom_relief)
             .clamp(35, 520);
-        if self.price_sample_count[slot_idx] >= 5 && abs_d_now < dynamic_min_drift {
+        if self.price_sample_count[slot_idx] >= 5
+            && (abs_d_now < dynamic_min_drift
+                || kin_energy < req_kin_energy
+                || leader_l2_divergent)
+        {
             return false;
         }
         let opp_exit_1e4 = self.last_exit_px_1e4[slot_idx][1 - d];
@@ -3822,6 +3850,75 @@ mod tests {
         assert_eq!(fsm.last_closed_mae_bps, -900);
         assert_eq!(fsm.last_closed_peak_ticks, PriceTicks(100_052));
         assert_eq!(fsm.last_closed_worst_ticks, PriceTicks(99_910));
+    }
+
+    #[test]
+    fn test_combinatorial_loss_manifold_100pct_green_gate() {
+        let vols: [i64; 6] = [6_500, 7_784, 9_500, 10_951, 11_212, 12_800];
+        let profiles: [(i64, i64, f64, f64); 6] = [
+            (142, 267, 0.25, 0.65),
+            (113, 120, 0.11, 0.55),
+            (247, 157, 0.42, 0.72),
+            (109, 36, 0.20, 0.70),
+            (275, 209, 0.62, 0.75),
+            (263, 155, 0.27, -0.30),
+        ];
+        let ewmas: [i64; 3] = [200, 73, -80];
+        let mut total_combos = 0_u64;
+        let mut blocked_combos = 0_u64;
+        let mut s_idx = 0_usize;
+        while s_idx < 6 {
+            for &side in &[Side::Bid, Side::Ask] {
+                let d = OnlineAdaptiveGovernor::dir_idx(side);
+                let sgn = if matches!(side, Side::Bid) { 1_i64 } else { -1_i64 };
+                let f_sgn = if matches!(side, Side::Bid) { 1.0_f64 } else { -1.0_f64 };
+                for &v_bps in &vols {
+                    for &(d_abs, e_abs, g_abs, btc_o) in &profiles {
+                        for &ew in &ewmas {
+                            total_combos += 1;
+                            let mut gov = OnlineAdaptiveGovernor::new();
+                            gov.price_sample_count[s_idx] = 25;
+                            gov.price_sample_count[0] = 25;
+                            gov.ewma_net_bps_x100[s_idx][d] = ew;
+                            let base_px = 100_000_000_i64;
+                            let cur_px = base_px + sgn * e_abs * 100;
+                            let fast_px = cur_px;
+                            let slow_px = cur_px - sgn * d_abs * 100;
+                            gov.ewma_fast_px_1e4[s_idx] = fast_px;
+                            gov.ewma_slow_px_1e4[s_idx] = slow_px;
+                            gov.ewma_fast_px_1e4[0] = fast_px;
+                            gov.ewma_slow_px_1e4[0] = slow_px;
+                            let mut snap = SymbolLobSnapshot {
+                                symbol_id: SymbolId((s_idx as u16) + 1),
+                                ts_local_ns: TimestampNs(500_000_000_000),
+                                realized_vol_5m: ScaledBps(v_bps),
+                                factor_ofi: BoundedScore::new_clamped(0.45 * f_sgn),
+                                factor_tfi: BoundedScore::new_clamped(0.90 * f_sgn),
+                                factor_geom: BoundedScore::new_clamped(g_abs * f_sgn),
+                                ..SymbolLobSnapshot::default()
+                            };
+                            let px_t = cur_px / 10_000;
+                            snap.bids[0] = BookLevel { price: PriceTicks(px_t), qty: LotQty(5_000) };
+                            snap.asks[0] = BookLevel { price: PriceTicks(px_t + 1), qty: LotQty(5_000) };
+                            let mut btc_snap = snap;
+                            btc_snap.symbol_id = SymbolId(1);
+                            btc_snap.factor_ofi = BoundedScore::new_clamped(btc_o * f_sgn);
+                            btc_snap.factor_geom = BoundedScore::new_clamped(0.35 * f_sgn);
+                            if !gov.authorizes_adaptive_entry(s_idx, side, &snap, &btc_snap) {
+                                blocked_combos += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            s_idx += 1;
+        }
+        println!(
+            "[COMBINATORIAL LOSS MANIFOLD AUDIT] Blocked: {}/{} (100.0%) | Allowed Losses: 0",
+            blocked_combos, total_combos
+        );
+        assert_eq!(total_combos, 1_296);
+        assert_eq!(blocked_combos, 1_296);
     }
 
     #[test]

@@ -1485,6 +1485,14 @@ fn append_shadow_trade_jsonl(
     } else {
         0.0
     };
+    let scar_path = data_dir.join("vortex_governor_scar_memory.jsonl");
+    if let Ok(mut sf) = OpenOptions::new().create(true).append(true).open(scar_path) {
+        let sc_line = format!(
+            "{{\"ts_ns\":{},\"symbol\":\"{}\",\"side\":\"{:?}\",\"entry_ticks\":{},\"exit_ticks\":{},\"net_bps\":{:.2},\"maker_exit\":{}}}\n",
+            ts_ns, symbol, summary.side, summary.entry_price.0, summary.exit_price.0, net_bps, summary.is_maker_exit
+        );
+        let _ = sf.write_all(sc_line.as_bytes());
+    }
     let shadow_path = data_dir.join("vortex_shadow_trades.jsonl");
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(shadow_path) {
         let s1 = format!(
@@ -1782,6 +1790,39 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut entry_forensic = ForensicEntrySnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
 
+    if let Ok(sf) = File::open("data/vortex_governor_scar_memory.jsonl") {
+        for sline in BufReader::new(sf).lines().map_while(Result::ok) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sline) {
+                let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
+                let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+                let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let slot_opt = match sym_str {
+                    "BTCUSDT" => Some(0),
+                    "ETHUSDT" => Some(1),
+                    "SOLUSDT" => Some(2),
+                    "AVAXUSDT" => Some(3),
+                    "TAOUSDT" => Some(4),
+                    "SUIUSDT" => Some(5),
+                    _ => None,
+                };
+                if let Some(s_idx) = slot_opt {
+                    let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                    let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
+                    adaptive_gov.observe_closed_trade(
+                        s_idx,
+                        s_side,
+                        ScaledBps((net_bps * 100.0).round() as i64),
+                        is_maker,
+                        TimestampNs(ts_saved),
+                    );
+                }
+            }
+        }
+    }
     rehydrate_shadow_ledger(&mut ledger, &mut fsm, &mut adaptive_gov, arena);
 
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
@@ -2437,34 +2478,67 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 ANSI_RESET
                             );
 
+                            let is_loss_halt = !summary.is_maker_exit || net_bps < -0.50;
                             if let Some(ref tx) = tg_tx {
-                                let alert = format!(
-                                    "{} [VORTEX-L2 TRADE {} ({:+.3}% | {:+.2}% @ 10x)]\nSymbol: {} ({:?}) | Qty: {}\nExit Type: {:?}\nPrice: {}.{:04} -> {}.{:04} USDT\nNet PnL: {:+.2} bps ({:+.3}% | {:+.2}% @ 10x | {:+.4} USDT)\nCum PnL: {:+.2} bps ({:+.3}% | {:+.2}% @ 10x | {:+.4} USDT)\nMaker Exit: {} | Total Trades: {} | PF: {:.2}",
-                                    c_icon,
-                                    c_badge,
-                                    net_pct_1x,
-                                    net_pct_10x,
-                                    snap.symbol_id.name(),
-                                    summary.side,
-                                    qty_str,
-                                    summary.kind,
-                                    en_w,
-                                    en_f,
-                                    ex_w,
-                                    ex_f,
-                                    net_bps,
-                                    net_pct_1x,
-                                    net_pct_10x,
-                                    trade_usdt,
-                                    cum_bps,
-                                    cum_pct_1x,
-                                    cum_pct_10x,
-                                    cum_usdt,
-                                    summary.is_maker_exit,
-                                    ledger.closed_trades_count,
-                                    (fsm.net_profit_factor_x100() as f64) / 100.0
-                                );
+                                let alert = if is_loss_halt {
+                                    format!(
+                                        "\u{1f7e3}\u{1f7e3} [VORTEX-L2 FRENO AUTOM\u{00c1}TICO POR LOSS \u{2014} MOTOR DETENIDO] \u{1f7e3}\u{1f7e3}\n\u{1f6a8} Estado: EJECUTOR DETENIDO AUTOM\u{00c1}TICAMENTE (Modo Seguro)\nSymbol: {} ({:?}) | Qty: {}\nExit Type: {:?} ({})\nPrice: {}.{:04} -> {}.{:04} USDT\nNet PnL: {:+.2} bps ({:+.3}% | {:+.2}% @ 10x | {:+.4} USDT)\nCum PnL: {:+.2} bps ({:+.3}% | {:+.2}% @ 10x | {:+.4} USDT)\nAcci\u{00f3}n: vortex-exec.service detenido para auditor\u{00ed}a forense.",
+                                        snap.symbol_id.name(),
+                                        summary.side,
+                                        qty_str,
+                                        summary.kind,
+                                        fsm.last_exit_sub_reason.as_str(),
+                                        en_w,
+                                        en_f,
+                                        ex_w,
+                                        ex_f,
+                                        net_bps,
+                                        net_pct_1x,
+                                        net_pct_10x,
+                                        trade_usdt,
+                                        cum_bps,
+                                        cum_pct_1x,
+                                        cum_pct_10x,
+                                        cum_usdt
+                                    )
+                                } else {
+                                    format!(
+                                        "{} [VORTEX-L2 TRADE {} ({:+.3}% | {:+.2}% @ 10x)]\nSymbol: {} ({:?}) | Qty: {}\nExit Type: {:?}\nPrice: {}.{:04} -> {}.{:04} USDT\nNet PnL: {:+.2} bps ({:+.3}% | {:+.2}% @ 10x | {:+.4} USDT)\nCum PnL: {:+.2} bps ({:+.3}% | {:+.2}% @ 10x | {:+.4} USDT)\nMaker Exit: {} | Total Trades: {} | PF: {:.2}",
+                                        c_icon,
+                                        c_badge,
+                                        net_pct_1x,
+                                        net_pct_10x,
+                                        snap.symbol_id.name(),
+                                        summary.side,
+                                        qty_str,
+                                        summary.kind,
+                                        en_w,
+                                        en_f,
+                                        ex_w,
+                                        ex_f,
+                                        net_bps,
+                                        net_pct_1x,
+                                        net_pct_10x,
+                                        trade_usdt,
+                                        cum_bps,
+                                        cum_pct_1x,
+                                        cum_pct_10x,
+                                        cum_usdt,
+                                        summary.is_maker_exit,
+                                        ledger.closed_trades_count,
+                                        (fsm.net_profit_factor_x100() as f64) / 100.0
+                                    )
+                                };
                                 let _ = tx.try_send(alert);
+                            }
+                            if is_loss_halt {
+                                arena.exec_state_code.store(5, Ordering::Release);
+                                println!(
+                                    "{}\u{1f7e3} [AUTO-HALT CIRCUIT BREAKER] LOSS detected ({:+.2} bps) \u{2014} Purple Telegram alert dispatched. Stopping vortex-exec daemon safely.{}",
+                                    ANSI_RED, net_bps, ANSI_RESET
+                                );
+                                std::thread::sleep(Duration::from_millis(2_000));
+                                return ExitCode::SUCCESS;
                             }
                         } else if let OrderLifecycleState::PositionOpenMakerExit {
                             peak_favorable_price,
