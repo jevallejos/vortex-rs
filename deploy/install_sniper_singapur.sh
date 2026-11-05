@@ -153,6 +153,12 @@ case "${1:-live}" in
         echo "=== [VORTEX FORENSIC VAULT V2 (38 METRICS)] ==="
         cat "${VORTEX_DIR}/data/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
         ;;
+    timemachine|-tm)
+        cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay" --timemachine
+        ;;
+    stats|-st)
+        cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay" --stats
+        ;;
     oos|-o)
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec"
         ;;
@@ -163,7 +169,7 @@ case "${1:-live}" in
         "${BIN_DIR}/vortex_exec"
         ;;
     *)
-        echo "Usage: vortex {360|live|-f|follow|trades|status|logs|audit|replay|baul|oos|all}"
+        echo "Usage: vortex {360|live|-f|follow|trades|status|logs|audit|replay|baul|timemachine|stats|oos|all}"
         exit 1
         ;;
 esac

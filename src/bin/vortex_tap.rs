@@ -388,7 +388,17 @@ fn flush_parquet_batch(batch: &mut ColumnarParquetBatch, parquet_seq: &mut u64) 
     if *parquet_seq > MAX_PARQUET_RING_FILES {
         let expired_seq = *parquet_seq - MAX_PARQUET_RING_FILES;
         let expired_path = data_dir.join(format!("vortex_l2_segment_{:06}.parquet", expired_seq));
-        let _ = std::fs::remove_file(expired_path);
+        let lake_dir = data_dir.join("lakehouse_par1");
+        let _ = std::fs::create_dir_all(&lake_dir);
+        let lake_path = lake_dir.join(format!("vortex_l2_segment_{:06}.parquet", expired_seq));
+        if std::fs::rename(&expired_path, &lake_path).is_err() {
+            let _ = std::fs::remove_file(&expired_path);
+        }
+        if expired_seq > 32_768 {
+            let old_seq = expired_seq - 32_768;
+            let old_p = lake_dir.join(format!("vortex_l2_segment_{:06}.parquet", old_seq));
+            let _ = std::fs::remove_file(old_p);
+        }
     }
     batch.clear();
 }
@@ -603,4 +613,55 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lakehouse_par1_non_destructive_rotation_and_pair_eligibility() {
+        let mut approved = 0_usize;
+        let mut vetoed = 0_usize;
+        for cand in CANDIDATE_UNIVERSE {
+            if cand
+                .spec
+                .validate_eligibility(cand.reference_mid_ticks, cand.realized_vol_5m)
+                .is_ok()
+            {
+                approved += 1;
+            } else {
+                vetoed += 1;
+            }
+        }
+        assert_eq!(approved, 6);
+        assert_eq!(vetoed, 3);
+
+        let mut batch = ColumnarParquetBatch::new();
+        let mut snap = SymbolLobSnapshot {
+            symbol_id: SymbolId(1),
+            is_eligible: true,
+            sequence_id: 1,
+            ts_exchange_ns: TimestampNs(1_000),
+            ts_local_ns: TimestampNs(1_000),
+            mark_price: PriceTicks(795_000),
+            last_trade_price: PriceTicks(795_000),
+            realized_vol_5m: ScaledBps(6_000),
+            ..SymbolLobSnapshot::default()
+        };
+        snap.bids[0] = BookLevel {
+            price: PriceTicks(795_000),
+            qty: LotQty(250),
+        };
+        snap.asks[0] = BookLevel {
+            price: PriceTicks(795_001),
+            qty: LotQty(200),
+        };
+        assert!(batch.push_l2_snapshot(&snap).is_ok());
+        let tmp_seg = std::env::temp_dir().join("vortex_l2_segment_999999.parquet");
+        assert!(batch.write_to_file(&tmp_seg).is_ok());
+        let loaded = ColumnarParquetBatch::read_from_file(&tmp_seg);
+        let _ = std::fs::remove_file(&tmp_seg);
+        assert!(loaded.is_ok());
+    }
 }

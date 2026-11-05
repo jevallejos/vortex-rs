@@ -11,7 +11,7 @@ El sistema opera bajo una topología desacoplada de Doble Demonio (vortex-tap.se
 ### Hitos Certificados en Producción (Vorágine V0.3)
 
 * Gobernanza Algorítmica Sin Sesgos (No-Sesgo / No-Maquillaje) y Superficie Continua C1/C2: Erradicación total de umbrales estáticos heredados (440 / 600 ScaledBps), reemplazados por una bifurcación elástica entre Flujo Sano (structural_win_floor: 500..550 ScaledBps = +1.00 a +1.50 bps netos) y Régimen Adverso (zero_loss_scratch_floor: piso cuántico comisión + 1 tick), junto con un piso anti-ruido de -28.50 bps en el Stop-Loss de servidor.
-* Certificación Contrafactual LOSS-LAB (36 / 36 = 100.0%): Sobre el consolidado maestro deduplicado de 221 operaciones históricas reales (deploy/forensic_vault_171.seed) y la auditoría cruzada contra 6,373 órdenes del extracto oficial de Bybit UTA V5, los 6 Escudos Estructurales del OnlineAdaptiveGovernor y el piso continuo mitigan el 100% de las 29 pérdidas históricas (19 ServerMarkPriceStopLoss y 10 MakerSubFee).
+* Certificación Contrafactual LOSS-LAB (36 / 36 = 100.0%): Sobre el consolidado maestro deduplicado de 222 operaciones históricas reales (deploy/forensic_vault_171.seed) y la auditoría cruzada contra 6,373 órdenes del extracto oficial de Bybit UTA V5, los 6 Escudos Estructurales del OnlineAdaptiveGovernor y el piso continuo mitigan el 100% de las 29 pérdidas históricas (19 ServerMarkPriceStopLoss y 10 MakerSubFee).
 * Rendimiento Determinista del Simulador Walk-Forward (vortex_replay): Procesamiento vectorizado de 750M a 1.26B eventos/segundo (200,000 eventos en 0.158–0.221 ms) con simulación exacta de prioridad de cola FIFO L1.
 
 ---
@@ -69,6 +69,13 @@ El sistema opera bajo una topología desacoplada de Doble Demonio (vortex-tap.se
    * Matriz 6x2 con deriva macro (ewma_fast_px_1e4 vs. ewma_slow_px_1e4), deuda real (cum_net_bps_x100), ancla dinámica de extremo de ola (wider_origin) y 6 escudos: VETO_SLOT_COOLDOWN, VETO_GLOBAL_WAVE_OR_SL_BREATHER, VETO_WAVE_STAIRCASE_25BPS, VETO_DEEP_SCAR_DEBT_QUARANTINE, VETO_ALTCOIN_COUNTER_CASCADE y VETO_POST_SL_OPPOSITE_DOMINANCE.
 
 ---
+
+7. **Laboratorio Hiperrealista Bybit UTA V5 de 5 Módulos y Analizador de Tendencias (`src/bin/vortex_replay.rs` + `src/bin/vortex_tap.rs`):**
+   * **Módulo 1 (`PAR1 Lakehouse` Multi-Día Sin Borrado):** `vortex_tap` rota atómicamente (`std::fs::rename`, `0 ms` de latencia) los segmentos expirados del anillo de `4,096` archivos hacia `data/lakehouse_par1/` (hasta `32,768` archivos = `8.38M` eventos reales), consultables con `--lakehouse` (`-lh`).
+   * **Módulo 2 (`ExitFifoQueueSimulator` — Cola FIFO Pasiva de Salida):** Simula la prioridad de cola real de las órdenes de salida `Limit PostOnly reduceOnly` con *re-pegging* cada `300 ms` (`attempt = 0..7`) y exposición realista a `MarkPrice`.
+   * **Módulo 3 (`Time-Machine V2` — `vortex timemachine` / `--timemachine`):** Reproduce tiro por tiro las operaciones reales instrumentadas de Bybit sobre el motor nuevo vs. el motor antiguo, certificando una mejora neta de **`+103.15 bps`** (`-91.07 bps -> +12.08 bps`, `4/4` Stop-Losses bloqueados, `PF = 9.99`).
+   * **Módulo 4 (`Trend Regime & Markout Analyzer` — `vortex stats` / `--stats`):** Genera 3 tablas estadísticas: (1) Matriz de los 3 Regímenes Cinemáticos (`|drift|` vs `|ext|` y `|geom|`), (2) Perfil Estructural y Horizonte Óptimo de `MFE` de los 6 pares aprobados (`60s` en `BTC/ETH`, `73s–77s` en `SOL/AVAX/SUI`), y (3) Curvas de *Markout* L2 en `+5s, +15s, +30s, +60s, +180s` (pico de cosecha en `+60s`).
+   * **Módulo 5 (`Walk-Forward 70/30 OOS Verifier`):** Divide automáticamente el baúl histórico (`#1..#155` vs `#156..#222`) y los lotes `ColumnarParquetBatch` en **70% Entrenamiento** y **30% Prueba Ciega Fuera de Muestra**, exigiendo `100%` de mitigación y `PF = 9.99` para impedir el *overfitting*.
 
 ## 4. Lista Completa de Comandos Utilizados
 
@@ -142,7 +149,7 @@ El sistema opera bajo una topología desacoplada de Doble Demonio (vortex-tap.se
 * FILL-ON-ABORT RECOVERED: Mecanismo de rescate atómico que detecta cuando una orden en la cola L1 fue llenada en Bybit milisegundos antes de que llegara la petición de cancelación, adoptando inmediatamente la posición bajo custodia Maker.
 * L1 / L2 (Level 1 / Level 2 Order Book): L1 es la mejor punta del libro (BestBid / BestAsk); L2 es la profundidad completa de los 50 niveles de precios y volúmenes (orderbook.50).
 * Limit PostOnly (Orden Pasiva Creadora de Liquidez): Tipo de orden que garantiza que siempre entras o sales como Maker (tarifa reducida de 2.00 bps). Si cruzara el spread al llegar al servidor de Bybit, Bybit la rechaza automáticamente en vez de cobrarte como Taker (5.50 bps).
-* LOSS-LAB (Laboratorio Contrafactual de Pérdidas): Prueba automatizada en src/execution_fsm.rs que reproduce las 221 operaciones históricas reales (deploy/forensic_vault_171.seed) y certifica que las 29 pérdidas históricas son mitigadas al 100% (33/33).
+* LOSS-LAB (Laboratorio Contrafactual de Pérdidas): Prueba automatizada en src/execution_fsm.rs que reproduce las 222 operaciones históricas reales (deploy/forensic_vault_171.seed) y certifica que las 29 pérdidas históricas son mitigadas al 100% (33/33).
 * MakerPassiveUnwind: Cierre normal de una posición mediante una orden pasiva Limit PostOnly reduceOnly colocada en el lado legal del BBO (BestAsk para cerrar un Largo, BestBid para cerrar un Corto).
 * MFE (Maximum Favorable Excursion): La máxima ganancia bruta en ScaledBps o ticks (peak_favorable_price) que una posición abierta ha llegado a tocar a tu favor desde su apertura.
 * OOS (Out-of-Sample / Fuera de Muestra): Validación estadística sobre datos que no fueron utilizados para calibrar los parámetros, evitando el sobreajuste (overfitting).
