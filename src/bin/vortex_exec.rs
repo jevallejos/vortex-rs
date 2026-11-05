@@ -839,6 +839,53 @@ fn rehydrate_shadow_ledger(
         ANSI_RESET
     );
 }
+fn compute_vol_scaled_severe_wald_floor(vol_raw: i64) -> i64 {
+    (1_350 + ((vol_raw - 6_200).max(0) / 4)).clamp(1_350, 2_450)
+}
+
+fn print_oos_forensic_vault_v2_audit() {
+    let low_sl = compute_vol_scaled_severe_wald_floor(5_500);
+    let mid_sl = compute_vol_scaled_severe_wald_floor(8_500);
+    let high_sl = compute_vol_scaled_severe_wald_floor(11_500);
+    println!(
+        "  \u{1f7e2} -> Elastic Wald Floor Audit : LowVol(55bps)=-{:.2} | MidVol(85bps)=-{:.2} | HighVol(115bps)=-{:.2} bps",
+        (low_sl as f64) / 100.0,
+        (mid_sl as f64) / 100.0,
+        (high_sl as f64) / 100.0
+    );
+    if let Ok(vf) = File::open("data/vortex_ai_forensic_vault.jsonl") {
+        let mut v2_cnt = 0_u64;
+        let mut mfe_sum = 0.0_f64;
+        let mut mae_sum = 0.0_f64;
+        let mut cap_sum = 0.0_f64;
+        let mut cap_cnt = 0_u64;
+        for line in BufReader::new(vf).lines().map_while(Result::ok) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(mfe) = val.get("mfe_bps").and_then(|v| v.as_f64()) {
+                    let mae = val.get("mae_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let cap = val.get("mfe_capture_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    v2_cnt += 1;
+                    mfe_sum += mfe;
+                    mae_sum += mae;
+                    if cap > 0.0 {
+                        cap_sum += cap;
+                        cap_cnt += 1;
+                    }
+                }
+            }
+        }
+        if v2_cnt > 0 {
+            let mean_mfe = mfe_sum / (v2_cnt as f64);
+            let mean_mae = mae_sum / (v2_cnt as f64);
+            let mean_cap = if cap_cnt > 0 { cap_sum / (cap_cnt as f64) } else { 0.0 };
+            println!(
+                "  \u{1f7e2} -> Live Vault V2 Telemetry  : {} V2 Trades | Mean MFE: {:+.2} bps | Mean MAE: {:+.2} bps | MFE Capture: {:.1}%",
+                v2_cnt, mean_mfe, mean_mae, mean_cap
+            );
+        }
+    }
+}
+
 fn print_colorized_shadow_trades() -> ExitCode {
     let file_path = Path::new("data/vortex_shadow_trades.jsonl");
     let file = match File::open(file_path) {
@@ -1264,6 +1311,9 @@ pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
 
     let pf_x100 = fsm.net_profit_factor_x100();
     let maker_ratio_bps = fsm.maker_exit_ratio_bps();
+    if std::env::args().len() <= 1 {
+        print_oos_forensic_vault_v2_audit();
+    }
 
     if ledger.closed_trades_count < 500 || pf_x100 < 135 || maker_ratio_bps < 8_000 {
         return Err(8);

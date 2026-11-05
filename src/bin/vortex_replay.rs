@@ -239,6 +239,41 @@ fn replay_captured_live_parquet_segments() {
 
     let evaluator = OrthogonalFactorState::new();
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
+    if let Ok(sf) = std::fs::File::open("data/vortex_shadow_trades.jsonl") {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(sf).lines().map_while(Result::ok) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                let net_bps = val.get("net_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let is_mkr = val.get("maker_exit").and_then(|v| v.as_bool()).unwrap_or(true);
+                let sym_s = val.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                let side_s = val.get("side").and_then(|v| v.as_str()).unwrap_or("Bid");
+                let ts_s = val.get("ts_ns").and_then(|v| v.as_i64()).unwrap_or(0);
+                let en_t = val.get("entry_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
+                let ex_t = val.get("exit_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
+                let slot_opt = match sym_s {
+                    "BTCUSDT" => Some(0),
+                    "ETHUSDT" => Some(1),
+                    "SOLUSDT" => Some(2),
+                    "AVAXUSDT" => Some(3),
+                    "TAOUSDT" => Some(4),
+                    "SUIUSDT" => Some(5),
+                    _ => None,
+                };
+                if let Some(s_i) = slot_opt {
+                    let s_side = if side_s == "Ask" { Side::Ask } else { Side::Bid };
+                    let net_sc = (net_bps * 100.0).round() as i64;
+                    adaptive_gov.seed_historical_price(s_i, s_side, en_t, ex_t);
+                    adaptive_gov.observe_closed_trade(
+                        s_i,
+                        s_side,
+                        ScaledBps(net_sc),
+                        is_mkr,
+                        TimestampNs(ts_s),
+                    );
+                }
+            }
+        }
+    }
     let mut fsm = ExecutionFsm::new(10_000_000_000, 2_500_000_000);
     if let Ok(seed_file) = std::fs::File::open("deploy/forensic_vault_171.seed") {
         use std::io::{BufRead, BufReader};
@@ -602,6 +637,23 @@ fn replay_captured_live_parquet_segments() {
     }
     let pf_x100 = fsm.net_profit_factor_x100();
     let maker_ratio_bps = fsm.maker_exit_ratio_bps();
+    if let OrderLifecycleState::PositionOpenMakerExit {
+        side: open_s,
+        entry_price: open_en,
+        peak_favorable_price: open_pk,
+        sl_trigger_price: open_sl,
+        ..
+    } = fsm.state
+    {
+        println!(
+            "  \u{1f7e1} [IN-FLIGHT PAR1 POSITION] {:<8} {:?} | Entry: {}t | Peak: {}t | SL: {}t (Open at #4096 end)",
+            active_sym.name(),
+            open_s,
+            open_en.0,
+            open_pk.0,
+            open_sl.0
+        );
+    }
     println!(
         "  -> Live PAR1 Archives Verified: {} files | {} total events ({} L2 / {} Trades)",
         verified_files, total_live_rows, total_l2_events, total_trade_prints

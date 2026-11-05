@@ -2285,6 +2285,9 @@ impl OnlineAdaptiveGovernor {
         let abort_p = i64::from(self.abort_streak[slot_idx][d].min(4));
         let _ = sym_debt_abs;
         let sym_debt_abs = (-self.cum_net_bps_x100[slot_idx][d]).max(0);
+        if self.sl_streak[slot_idx][d] >= 1 && (sym_debt_abs >= 1_800 || learned_edge <= -150) {
+            return false;
+        }
         let base_drift = (((300 - learned_edge).max(110)) * self_vol) / 20_000;
         let min_trend_drift = (base_drift + (sym_debt_abs / 80) + (abort_p * 8)).max(32);
         let max_self_ext = ((self_vol / 22) + (learned_edge / 5)
