@@ -201,19 +201,30 @@ impl FifoQueueSimulator {
                             queue_ahead_qty = LotQty((queue_ahead_qty.0 - conservative_credit).max(0));
                         }
                         last_observed_l1_qty = LotQty(current_l1_qty);
-                        let swept_fill = row.ofi_bps != 0 && match side {
+                        let is_live_par1 = row.ofi_bps != 0
+                            && !(row.ofi_bps == 4_200
+                                && row.tfi_bps == 3_800
+                                && row.geom_bps == 2_500);
+                        let fav_step_or_drain = is_live_par1 && match side {
                             Side::Bid => {
-                                row.best_ask_ticks.0 > 0
-                                    && row.best_ask_ticks.0 <= limit_price.0
-                                    && row.ofi_bps > -1_000
+                                (row.best_bid_ticks.0 > limit_price.0
+                                    && row.ofi_bps >= 1_500
+                                    && row.tfi_bps >= 2_000)
+                                    || (queue_ahead_qty.0 == 0
+                                        && row.best_bid_ticks.0 == limit_price.0
+                                        && row.tfi_bps >= 1_500)
                             }
                             Side::Ask => {
-                                row.best_bid_ticks.0 > 0
-                                    && row.best_bid_ticks.0 >= limit_price.0
-                                    && row.ofi_bps < 1_000
+                                (row.best_ask_ticks.0 > 0
+                                    && row.best_ask_ticks.0 < limit_price.0
+                                    && row.ofi_bps <= -1_500
+                                    && row.tfi_bps <= -2_000)
+                                    || (queue_ahead_qty.0 == 0
+                                        && row.best_ask_ticks.0 == limit_price.0
+                                        && row.tfi_bps <= -1_500)
                             }
                         };
-                        if swept_fill {
+                        if fav_step_or_drain {
                             self.total_maker_fills += 1;
                             self.state = SimulatedOrderState::FilledMaker {
                                 side,

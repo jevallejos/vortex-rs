@@ -2066,8 +2066,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 }
                             };
                             // Recompute exact accounting with the actual realized exit price on Bybit (1:1 CSV parity!)
+                            let exit_reason_keep = fsm.last_exit_sub_reason;
+                            let wald_pct_keep = fsm.max_wald_contraction_pct;
                             fsm = saved_fsm;
                             ledger = saved_ledger;
+                            fsm.last_exit_sub_reason = exit_reason_keep;
+                            fsm.max_wald_contraction_pct = wald_pct_keep;
                             summary = fsm.finalize_close(
                                 summary.kind,
                                 summary.side,
