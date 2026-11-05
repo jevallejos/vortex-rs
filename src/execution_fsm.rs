@@ -703,7 +703,7 @@ impl ExecutionFsm {
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
         let severe_adverse_collapse = hold_ns >= STAGNANT_PROFIT_HOLD_NS
-            && peak_gross_now == 0
+            && peak_gross_now < 400
             && adv_p >= 0.70
             && cur_gross_now < -1_200;
         let wald_contraction_pct = if severe_adverse_collapse {
@@ -2309,6 +2309,12 @@ impl OnlineAdaptiveGovernor {
                 return false;
             }
         }
+        if learned_edge < 90
+            && self.win_streak[slot_idx][d] == 0
+            && self_drift_bps.abs() < 320
+        {
+            return false;
+        }
         let opp_exit_1e4 = self.last_exit_px_1e4[slot_idx][1 - d];
         if self.wave_step_count[slot_idx][1 - d] >= 1
             && opp_exit_1e4 > 0
@@ -2319,7 +2325,10 @@ impl OnlineAdaptiveGovernor {
                 Side::Bid => ((opp_exit_1e4 - cur_en_1e4).saturating_mul(1_000_000)) / opp_exit_1e4,
                 Side::Ask => ((cur_en_1e4 - opp_exit_1e4).saturating_mul(1_000_000)) / opp_exit_1e4,
             };
-            if (-150..=1_800).contains(&opp_breakout_bps) {
+            let multi_opp_wave = self.wave_step_count[slot_idx][1 - d] >= 2
+                || self.win_streak[slot_idx][1 - d] >= 1;
+            let min_opp_bound = if multi_opp_wave { -1_500 } else { -150 };
+            if (min_opp_bound..=1_800).contains(&opp_breakout_bps) {
                 return false;
             }
         }

@@ -1037,7 +1037,7 @@ fn print_consolidated_executive_box(
                     v2_cnt += 1;
                     mfe_s += mfe;
                     mae_s += val.get("mae_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    cap_s += val.get("mfe_capture_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    cap_s += val.get("mfe_capture_pct").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 100.0);
                     q_ms_s += val.get("queue_wait_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     h_ms_s += val.get("hold_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     pegs_s += val.get("exit_peg_attempts").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1308,7 +1308,7 @@ fn format_forensic_vault_v2_json_line(
     let mfe_bps = (fsm.last_closed_mfe_bps as f64) / 100.0;
     let mae_bps = (fsm.last_closed_mae_bps as f64) / 100.0;
     let mfe_capture_pct = if fsm.last_closed_mfe_bps > 0 {
-        ((summary.gross_scaled_bps.raw() as f64) * 100.0) / (fsm.last_closed_mfe_bps as f64)
+        (((summary.gross_scaled_bps.raw().max(0) as f64) * 100.0) / (fsm.last_closed_mfe_bps as f64)).clamp(0.0, 100.0)
     } else {
         0.0
     };
@@ -1449,7 +1449,7 @@ fn append_shadow_trade_jsonl(
     let mfe_bps = (fsm.last_closed_mfe_bps as f64) / 100.0;
     let mae_bps = (fsm.last_closed_mae_bps as f64) / 100.0;
     let mfe_capture_pct = if fsm.last_closed_mfe_bps > 0 {
-        ((summary.gross_scaled_bps.raw() as f64) * 100.0) / (fsm.last_closed_mfe_bps as f64)
+        (((summary.gross_scaled_bps.raw().max(0) as f64) * 100.0) / (fsm.last_closed_mfe_bps as f64)).clamp(0.0, 100.0)
     } else {
         0.0
     };
