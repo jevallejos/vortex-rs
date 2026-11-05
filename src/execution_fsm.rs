@@ -467,9 +467,13 @@ impl ExecutionFsm {
         let vol_raw = snap.realized_vol_5m.raw().clamp(4_600, 11_500);
         let learned_raw = self.slot_learned_mfe_bps(snap.symbol_id);
         let target_raw = target_excursion.raw().clamp(2_400, 8_000);
-        let dynamic_sl_cap = (2_400 + ((vol_raw - 5_500).max(0) / 4)).clamp(2_400, 4_200);
+        let slot_mfe_cap = learned_raw.clamp(520, 780);
+        let learned_sl_cap = (4 * slot_mfe_cap
+            + (target_raw.max(0) / 2)
+            + ((vol_raw - 8_000).max(0) / 20))
+            .clamp(2_400, 3_250);
         let elastic_sl_bps =
-            ((vol_raw * 32 + target_raw * 10 + learned_raw * 25) / 100).clamp(2_100, dynamic_sl_cap);
+            ((vol_raw * 28 + target_raw * 10 + slot_mfe_cap * 20) / 100).clamp(2_100, learned_sl_cap);
         let sl_distance_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
@@ -972,11 +976,15 @@ impl ExecutionFsm {
                 && !strong_trend_continuation
                 && hold_elapsed >= elastic_early_harvest_ns
                 && current_gross_bps.raw() >= elastic_harvest_floor;
+            let proactive_stagnant_escape = hold_elapsed >= 45_000_000_000
+                && peak_gross_bps.raw() < active_win_floor
+                && signed_tfi <= 0.0;
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= elastic_scratch_ns
                 && current_gross_bps.raw() >= zero_loss_scratch_floor
                 && (joint_adverse
                     || deep_joint_adverse
+                    || proactive_stagnant_escape
                     || (flow_conviction <= -0.18 && signed_tfi <= -0.05));
             let struggling_rescue = !in_trend_free_ride_zone
                 && ((hold_elapsed >= elastic_struggle_ns
@@ -2323,6 +2331,24 @@ impl OnlineAdaptiveGovernor {
         } else {
             100
         };
+        let prev_same_exit_1e4 = self.last_exit_px_1e4[slot_idx][d];
+        let dist_from_prev_same_bps = if prev_same_exit_1e4 > 0 && cur_en_1e4 > 0 {
+            match side {
+                Side::Bid => ((cur_en_1e4 - prev_same_exit_1e4).saturating_mul(1_000_000)) / prev_same_exit_1e4,
+                Side::Ask => ((prev_same_exit_1e4 - cur_en_1e4).saturating_mul(1_000_000)) / prev_same_exit_1e4,
+            }
+        } else {
+            0
+        };
+        let learned_range_2x = 2 * (400 + learned_edge.clamp(80, 260));
+        let unanchored_rally_pen = (dist_from_prev_same_bps - learned_range_2x).max(0) / 14;
+        let ext_crowd_pen = ((self_ext_bps.abs() * 16) - (abs_d_now * 10)).max(0) / 10;
+        let leader_opp_debt_pen = if slot_idx > 0 {
+            (self.cum_net_bps_x100[0][1 - d].max(0) / 8)
+                + (self.wave_step_count[0][1 - d] as i64) * 35
+        } else {
+            0
+        };
         let base_vol_drift = self_vol / 120;
         let ewma_deficit_pen = ((150 - learned_edge).max(0) * 22) / 10;
         let wave_break_pen = if self.wave_step_count[slot_idx][d] >= 1 && chased_from_origin <= 0 {
@@ -2331,8 +2357,14 @@ impl OnlineAdaptiveGovernor {
             0
         };
         let geom_relief = ((geom_pct - 45).max(0) * 3) / 2;
-        let dynamic_min_drift =
-            (base_vol_drift + ewma_deficit_pen + wave_break_pen - geom_relief).clamp(35, 380);
+        let dynamic_min_drift = (base_vol_drift
+            + ewma_deficit_pen
+            + wave_break_pen
+            + unanchored_rally_pen
+            + ext_crowd_pen
+            + leader_opp_debt_pen
+            - geom_relief)
+            .clamp(35, 520);
         if self.price_sample_count[slot_idx] >= 5 && abs_d_now < dynamic_min_drift {
             return false;
         }
