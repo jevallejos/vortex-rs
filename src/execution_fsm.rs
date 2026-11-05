@@ -704,7 +704,7 @@ impl ExecutionFsm {
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
         let severe_adverse_collapse = hold_ns >= STAGNANT_PROFIT_HOLD_NS
-            && peak_gross_now < 150
+            && peak_gross_now == 0
             && adv_p >= 0.70
             && cur_gross_now < -1_200;
         let wald_contraction_pct = if severe_adverse_collapse {
@@ -720,7 +720,9 @@ impl ExecutionFsm {
         } else {
             0
         };
-        let min_sl_floor_bps = if severe_adverse_collapse { 1_350 } else { 2_250 };
+        let vol_sl_floor =
+            (1_350 + ((snap.realized_vol_5m.raw() - 8_000).max(0) / 3)).clamp(1_350, 2_450);
+        let min_sl_floor_bps = if severe_adverse_collapse { vol_sl_floor } else { 2_250 };
         let min_noise_sl_dist = ((entry_price.0 * min_sl_floor_bps) / 1_000_000).max(4);
         let eff_sl_dist = if severe_adverse_collapse {
             ((base_sl_dist * (100 - wald_contraction_pct)) / 100).max(min_noise_sl_dist)
@@ -1750,6 +1752,20 @@ impl OnlineAdaptiveGovernor {
                 self.wave_step_count[slot_idx][dir] = 0;
                 self.win_streak[slot_idx][dir] = 0;
             }
+            if self.price_sample_count[slot_idx] >= 60
+                && self.sl_streak[slot_idx][dir] >= 1
+                && self.last_sl_ts_ns > 0
+                && now_ns > self.last_sl_ts_ns
+                && now_ns.saturating_sub(self.last_sl_ts_ns) > 900_000_000_000
+                && mean_reverted
+            {
+                self.sl_streak[slot_idx][dir] = 0;
+                self.cum_net_bps_x100[slot_idx][dir] =
+                    (self.cum_net_bps_x100[slot_idx][dir] / 2).max(-1_200);
+                self.global_dir_sl_streak[dir] = 0;
+                self.global_dir_debt_bps_x100[dir] =
+                    (self.global_dir_debt_bps_x100[dir] / 2).max(-1_500);
+            }
             dir += 1;
         }
         if self.last_global_win_ts_ns > 0
@@ -2306,8 +2322,18 @@ impl OnlineAdaptiveGovernor {
         if slot_idx > 0 && (btc_recent_abort || btc_scratch_fatigue || btc_in_sl_cooldown) {
             return false;
         }
-        let sym_net_x100 = self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
-        let sym_debt_abs = (-sym_net_x100).max(0);
+        let sym_debt_abs = (-self.cum_net_bps_x100[slot_idx][d]).max(0);
+        let since_sl_ns = candidate_snap.ts_local_ns.0.saturating_sub(self.last_sl_ts_ns);
+        let elastic_sl_quarantine_ns =
+            (sym_debt_abs.saturating_mul(250_000_000)).clamp(600_000_000_000, 900_000_000_000);
+        if self.sl_streak[slot_idx][d] >= 1
+            && (sym_debt_abs >= 1_200 || learned_edge <= -100)
+            && (since_sl_ns <= elastic_sl_quarantine_ns
+                || candidate_snap.factor_tfi.get().abs() < 0.60
+                || candidate_snap.factor_geom.get().abs() < 0.24)
+        {
+            return false;
+        }
         let abort_p = i64::from(self.abort_streak[slot_idx][d].min(4));
         let base_drift = (((240 - learned_edge).max(90)) * self_vol) / 45_000;
         let min_trend_drift = (base_drift + (sym_debt_abs / 120) + (abort_p * 6)).max(15);
@@ -2326,10 +2352,11 @@ impl OnlineAdaptiveGovernor {
         let abs_ext = self_ext_bps.abs();
         let geom_sup = candidate_snap.factor_geom.get().abs();
         let fatigue_ext_cap = ((self_vol / 38) + (learned_edge / 3)).clamp(210, 340);
-        if self.wave_step_count[slot_idx][d] >= 1
-            && (learned_edge < 160 || geom_sup < 0.16)
-            && abs_ext > abs_drift
-            && abs_ext > fatigue_ext_cap
+        let step0_ext_cap = (abs_drift + 48).min(fatigue_ext_cap);
+        if abs_ext > step0_ext_cap
+            || (self.wave_step_count[slot_idx][d] >= 1
+                && (learned_edge < 160 || geom_sup < 0.16)
+                && abs_ext > abs_drift)
         {
             return false;
         }
@@ -3795,7 +3822,36 @@ mod tests {
         avax_dip.bids[0] = BookLevel { price: PriceTicks(8_715), qty: LotQty(300) };
         avax_dip.asks[0] = BookLevel { price: PriceTicks(8_716), qty: LotQty(300) };
         assert!(fsm.step_open_position(&avax_dip, &mut ledger).is_none());
-        let gov = OnlineAdaptiveGovernor::new();
+        let mut gov = OnlineAdaptiveGovernor::new();
         assert!(!gov.authorizes_adaptive_entry(3, Side::Bid, &avax_dip, &avax_dip));
+        fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+            side: Side::Bid,
+            entry_price: PriceTicks(804_382),
+            peak_favorable_price: PriceTicks(804_382),
+            qty: LotQty(1),
+            tp_maker_price: PriceTicks(809_382),
+            sl_trigger_price: PriceTicks(802_170),
+            opened_ts: TimestampNs(1_000_000_000),
+        };
+        let mut btc_16 = avax_dip;
+        btc_16.symbol_id = SymbolId(1);
+        btc_16.ts_local_ns = TimestampNs(919_000_000_000);
+        btc_16.last_trade_price = PriceTicks(803_029);
+        btc_16.mark_price = PriceTicks(803_029);
+        btc_16.realized_vol_5m = ScaledBps(11_282);
+        btc_16.factor_ofi = BoundedScore::new_clamped(-0.90);
+        btc_16.factor_tfi = BoundedScore::new_clamped(-0.22);
+        btc_16.bids[0] = BookLevel { price: PriceTicks(803_029), qty: LotQty(500) };
+        btc_16.asks[0] = BookLevel { price: PriceTicks(803_030), qty: LotQty(500) };
+        assert!(fsm.step_open_position(&btc_16, &mut ledger).is_none());
+        gov.observe_closed_trade(0, Side::Ask, ScaledBps(-2_603), false, TimestampNs(10_000_000_000));
+        assert_eq!(gov.sl_streak[0][1], 1);
+        let mut k = 0;
+        while k < 65 {
+            btc_16.ts_local_ns = TimestampNs(920_000_000_000 + k * 1_100_000_000);
+            gov.observe_market_price(0, &btc_16);
+            k += 1;
+        }
+        assert_eq!(gov.sl_streak[0][1], 0);
     }
 }
