@@ -788,7 +788,7 @@ fn prewarm_mfe_from_seed(fsm: &mut ExecutionFsm) {
 }
 
 fn prewarm_governor_prices_from_parquet(adaptive_gov: &mut OnlineAdaptiveGovernor) {
-    let data_dir = Path::new("data");
+    let data_dir = Path::new("data/vault");
     let entries = match std::fs::read_dir(data_dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -840,7 +840,7 @@ fn rehydrate_shadow_ledger(
 ) {
     prewarm_mfe_from_seed(fsm);
     prewarm_governor_prices_from_parquet(adaptive_gov);
-    let file_path = Path::new("data/vortex_shadow_trades.jsonl");
+    let file_path = Path::new("data/vault/vortex_shadow_trades.jsonl");
     let file = match File::open(file_path) {
         Ok(f) => f,
         Err(_) => {
@@ -931,7 +931,7 @@ fn print_oos_forensic_vault_v2_audit() {
         (mid_sl as f64) / 100.0,
         (high_sl as f64) / 100.0
     );
-    if let Ok(vf) = File::open("data/vortex_ai_forensic_vault.jsonl") {
+    if let Ok(vf) = File::open("data/vault/vortex_ai_forensic_vault.jsonl") {
         let mut v2_cnt = 0_u64;
         let mut mfe_sum = 0.0_f64;
         let mut mae_sum = 0.0_f64;
@@ -1037,7 +1037,7 @@ fn build_consolidated_executive_sections(
     let mut ex_s = 0.0_f64;
     let mut gm_s = 0.0_f64;
     let mut snr_s = 0.0_f64;
-    if let Ok(vf) = File::open("data/vortex_ai_forensic_vault.jsonl") {
+    if let Ok(vf) = File::open("data/vault/vortex_ai_forensic_vault.jsonl") {
         for line in BufReader::new(vf).lines().map_while(Result::ok) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(mfe) = val.get("mfe_bps").and_then(|v| v.as_f64()) {
@@ -1141,7 +1141,7 @@ fn build_consolidated_executive_sections(
 
 
 fn print_colorized_shadow_trades() -> ExitCode {
-    let file_path = Path::new("data/vortex_shadow_trades.jsonl");
+    let file_path = Path::new("data/vault/vortex_shadow_trades.jsonl");
     let file = match File::open(file_path) {
         Ok(f) => f,
         Err(_) => {
@@ -1458,7 +1458,7 @@ fn append_shadow_trade_jsonl(
     exit_snap: &SymbolLobSnapshot,
     exit_peg_attempts: u32,
 ) {
-    let data_dir = Path::new("data");
+    let data_dir = Path::new("data/vault");
     let _ = std::fs::create_dir_all(data_dir);
     let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
     let gross_bps = (summary.gross_scaled_bps.raw() as f64) / 100.0;
@@ -1541,6 +1541,110 @@ fn append_shadow_trade_jsonl(
         );
         let _ = vf.write_all(vline.as_bytes());
     }
+    if !summary.is_maker_exit || net_bps < -0.50 {
+        let red_path = data_dir.join("vortex_red_loss_box.jsonl");
+        let next_red_id = File::open(&red_path)
+            .map(|f| BufReader::new(f).lines().count() as u64 + 1)
+            .unwrap_or(1);
+        if let Ok(mut rf) = OpenOptions::new().create(true).append(true).open(red_path) {
+            let rline = format_red_loss_forensic_box_json_line(
+                next_red_id,
+                ts_ns,
+                symbol,
+                slot_idx,
+                qty_str,
+                summary,
+                ledger,
+                fsm,
+                entry_forensic,
+                exit_snap,
+                exit_peg_attempts,
+            );
+            let _ = rf.write_all(rline.as_bytes());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_red_loss_forensic_box_json_line(
+    loss_seq_id: u64,
+    ts_ns: i64,
+    symbol: &str,
+    slot_idx: usize,
+    qty_str: &str,
+    summary: &ClosedTradeSummary,
+    ledger: &ParitySyncLedger,
+    fsm: &ExecutionFsm,
+    entry_forensic: &ForensicEntrySnapshot,
+    exit_snap: &SymbolLobSnapshot,
+    exit_peg_attempts: u32,
+) -> String {
+    let base_json = format_forensic_vault_v2_json_line(
+        loss_seq_id,
+        ts_ns,
+        symbol,
+        slot_idx,
+        qty_str,
+        summary,
+        ledger,
+        fsm,
+        entry_forensic,
+        exit_snap,
+        exit_peg_attempts,
+    );
+    let base_trimmed = base_json.trim_end().trim_end_matches('}');
+    let q_floor_ticks = ExecutionFsm::defensive_zero_loss_maker_exit_price(
+        summary.side,
+        summary.entry_price,
+    )
+    .0;
+    let mfe_raw = fsm.last_closed_mfe_bps;
+    let mae_raw = fsm.last_closed_mae_bps;
+    let gap_to_q_floor_bps = ((401 - mfe_raw).max(0) as f64) / 100.0;
+    let opened_ts = if entry_forensic.opened_ts_ns > 0 {
+        entry_forensic.opened_ts_ns
+    } else {
+        ts_ns
+    };
+    let hold_ms = ((ts_ns.saturating_sub(opened_ts)).max(1)) / 1_000_000;
+    let hold_s = (hold_ms as f64) / 1_000.0;
+    let blocked_by_immunity = mfe_raw >= 401 && hold_ms < 20_000;
+    let d_abs = entry_forensic.drift_bps.abs();
+    let e_abs = entry_forensic.ext_bps.abs();
+    let kin_accel_net_bps = ((d_abs - e_abs) as f64) / 100.0;
+    let mfe_est = 400 + entry_forensic.gov_ewma_bps.clamp(80, 260);
+    let kin_energy_in_bps = ((d_abs - e_abs + (d_abs - mfe_est / 2).max(0)) as f64) / 100.0;
+    let req_kin_in_bps = (((mfe_est / 5)
+        + ((160 - entry_forensic.gov_ewma_bps).max(0) / 2)
+        + ((entry_forensic.vol5m_in_bps - 9_500).max(0) / 200))
+        .clamp(115, 360) as f64)
+        / 100.0;
+    let bleed_rate_bps_s = ((summary.gross_scaled_bps.raw() as f64) / 100.0) / hold_s.max(0.1);
+    let mae_to_mfe_ratio = (mae_raw.abs() as f64) / (mfe_raw.max(1) as f64);
+    let geom_out = exit_snap.factor_geom.get();
+    let diag = if mfe_raw < 350 && d_abs < e_abs + 120 {
+        "SUB_FEE_MFE_LOW_KINEMATIC_ENERGY"
+    } else if blocked_by_immunity {
+        "MFE_REACHED_DURING_IMMUNITY_WINDOW"
+    } else if exit_peg_attempts > 0 {
+        "UNFILLED_PASSIVE_EXIT_PEG_SWEPT"
+    } else {
+        "SUSTAINED_L2_AND_TAPE_ADVERSE_CASCADE"
+    };
+    format!(
+        "{},\"vault_box\":\"RED_LOSS_BOX\",\"quantum_floor_ticks\":{},\"gap_to_quantum_floor_bps\":{:.2},\"blocked_by_immunity_timer\":{},\"kin_accel_net_bps\":{:.2},\"kin_energy_in_bps\":{:.2},\"req_kin_energy_in_bps\":{:.2},\"bleed_rate_bps_per_s\":{:.3},\"mae_to_mfe_ratio\":{:.2},\"geom_out\":{:.2},\"loss_root_diagnosis\":\"{}\"}}\n",
+        base_trimmed,
+        q_floor_ticks,
+        gap_to_q_floor_bps,
+        blocked_by_immunity,
+        kin_accel_net_bps,
+        kin_energy_in_bps,
+        req_kin_in_bps,
+        bleed_rate_bps_s,
+        mae_to_mfe_ratio,
+        geom_out,
+        diag
+    )
 }
 
 pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
@@ -1790,7 +1894,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut entry_forensic = ForensicEntrySnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
 
-    if let Ok(sf) = File::open("data/vortex_governor_scar_memory.jsonl") {
+    if let Ok(sf) = File::open("data/vault/vortex_governor_scar_memory.jsonl") {
         for sline in BufReader::new(sf).lines().map_while(Result::ok) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sline) {
                 let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
@@ -2842,6 +2946,85 @@ mod tests {
         assert_eq!(parsed.get("worst_ticks").and_then(|v| v.as_i64()), Some(799_800));
         assert_eq!(parsed.get("init_q_lots").and_then(|v| v.as_i64()), Some(1_240));
         assert_eq!(parsed.get("win_streak").and_then(|v| v.as_u64()), Some(2));
+    }
+
+    #[test]
+    fn test_red_loss_forensic_box_captures_deep_autopsy_metrics() {
+        let mut ledger = ParitySyncLedger::new(10_000_000_000);
+        let mut fsm = ExecutionFsm::new(1_250_000_000, 1_250_000_000);
+        fsm.last_armed_ts = TimestampNs(1_000_000_000);
+        fsm.last_opened_ts = TimestampNs(1_600_000_000);
+        fsm.worst_adverse_price = PriceTicks(225_410);
+        fsm.last_peak_gross_bps = 247;
+        fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+            side: Side::Bid,
+            entry_price: PriceTicks(226_082),
+            peak_favorable_price: PriceTicks(226_138),
+            qty: LotQty(10),
+            tp_maker_price: PriceTicks(227_551),
+            sl_trigger_price: PriceTicks(225_415),
+            opened_ts: TimestampNs(1_600_000_000),
+        };
+        let summary = fsm.finalize_close(
+            ClosedTradeKind::ServerMarkPriceStopLoss,
+            Side::Bid,
+            PriceTicks(226_082),
+            PriceTicks(225_410),
+            TimestampNs(398_030_000_000),
+            &mut ledger,
+        );
+        let entry_f = ForensicEntrySnapshot {
+            armed_ts_ns: 1_000_000_000,
+            opened_ts_ns: 1_600_000_000,
+            init_q_lots: 2_551,
+            abort_recovered: true,
+            ofi_in_bps: 3_200,
+            tfi_in_bps: 9_200,
+            geom_in_bps: 2_700,
+            snr_in_bps: 7_300,
+            vol5m_in_bps: 7_784,
+            spread_in_ticks: 1,
+            btc_comp_in_bps: 3_100,
+            slot_mfe_bps: 605,
+            gov_ewma_bps: 200,
+            win_streak: 0,
+            sl_streak: 0,
+            wave_step: 0,
+            drift_bps: 263,
+            ext_bps: 155,
+            chased_bps: 0,
+            cum_slot_debt_bps: 0,
+        };
+        let exit_snap = SymbolLobSnapshot {
+            symbol_id: SymbolId(2),
+            realized_vol_5m: ScaledBps(11_164),
+            factor_ofi: BoundedScore::new_clamped(-0.74),
+            factor_tfi: BoundedScore::new_clamped(-0.98),
+            factor_geom: BoundedScore::new_clamped(-0.68),
+            ..SymbolLobSnapshot::default()
+        };
+        let red_json = format_red_loss_forensic_box_json_line(
+            1,
+            398_030_000_000,
+            "ETHUSDT",
+            1,
+            "0.01",
+            &summary,
+            &ledger,
+            &fsm,
+            &entry_f,
+            &exit_snap,
+            0,
+        );
+        println!("[RED LOSS FORENSIC BOX SAMPLE] {}", red_json.trim());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&red_json).unwrap_or(serde_json::Value::Null);
+        assert_eq!(parsed.get("vault_box").and_then(|v| v.as_str()), Some("RED_LOSS_BOX"));
+        assert_eq!(
+            parsed.get("loss_root_diagnosis").and_then(|v| v.as_str()),
+            Some("SUB_FEE_MFE_LOW_KINEMATIC_ENERGY")
+        );
+        assert!(parsed.get("gap_to_quantum_floor_bps").and_then(|v| v.as_f64()).unwrap_or(0.0) > 1.50);
     }
 
     #[test]

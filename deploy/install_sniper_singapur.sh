@@ -112,8 +112,8 @@ case "${1:-live}" in
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --trades
         echo "=== [4. WALK-FORWARD PAR1 REPLAY (1,048,576 REAL EVENTS)] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay"
-        echo "=== [5. AI FORENSIC VAULT (data/vortex_ai_forensic_vault.jsonl)] ==="
-        tail -n 15 "${VORTEX_DIR}/data/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
+        echo "=== [5. AI FORENSIC VAULT (data/vault/vortex_ai_forensic_vault.jsonl)] ==="
+        tail -n 15 "${VORTEX_DIR}/data/vault/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
         ;;
     live|-l)
         "${BIN_DIR}/vortex_exec" --live
@@ -145,12 +145,12 @@ case "${1:-live}" in
         ;;
     replay|-r)
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay"
-        echo "=== [5. AI FORENSIC VAULT (data/vortex_ai_forensic_vault.jsonl)] ==="
-        tail -n 15 "${VORTEX_DIR}/data/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
+        echo "=== [5. AI FORENSIC VAULT (data/vault/vortex_ai_forensic_vault.jsonl)] ==="
+        tail -n 15 "${VORTEX_DIR}/data/vault/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
         ;;
     baul|-b)
         echo "=== [VORTEX FORENSIC VAULT V2 (38 METRICS)] ==="
-        cat "${VORTEX_DIR}/data/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
+        cat "${VORTEX_DIR}/data/vault/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
         ;;
     timemachine|-tm)
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay" --timemachine

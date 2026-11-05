@@ -290,7 +290,7 @@ fn replay_captured_live_parquet_segments() {
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
     let mut shadow_history: Vec<(i64, usize, Side, i64, i64, i64, bool)> = Vec::new();
     let mut shadow_cursor: usize = 0;
-    if let Ok(sf) = std::fs::File::open("data/vortex_shadow_trades.jsonl") {
+    if let Ok(sf) = std::fs::File::open("data/vault/vortex_shadow_trades.jsonl") {
         use std::io::{BufRead, BufReader};
         for line in BufReader::new(sf).lines().map_while(Result::ok) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
