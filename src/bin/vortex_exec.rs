@@ -18,7 +18,7 @@ use vortex_rs::execution_fsm::{
 };
 use vortex_rs::forensic_parquet::ParitySyncLedger;
 use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena};
-use vortex_rs::types::{classify_pnl_badge, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs, ANSI_GRAY, ANSI_GREEN, ANSI_ORANGE, ANSI_RED, ANSI_RESET, ANSI_YELLOW, APPROVED_SPECS};
+use vortex_rs::types::{classify_pnl_badge, print_auto_aligned_box, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs, ANSI_GRAY, ANSI_GREEN, ANSI_ORANGE, ANSI_RED, ANSI_RESET, ANSI_YELLOW, APPROVED_SPECS};
 
 pub const TOTAL_OOS_TRADES_GATE: usize = 520;
 
@@ -965,7 +965,7 @@ fn print_oos_forensic_vault_v2_audit() {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print_consolidated_executive_box(
+fn build_consolidated_executive_sections(
     wins: u64,
     scratches: u64,
     losses: u64,
@@ -975,7 +975,7 @@ fn print_consolidated_executive_box(
     total_net_bps: f64,
     pos_net_sum: f64,
     neg_net_abs: f64,
-) {
+) -> Vec<Vec<String>> {
     let notional_usdt = (OPTIMAL_LIVE_NOTIONAL_1E8 as f64) / 100_000_000.0;
     let margin_per_trade = notional_usdt / 10.0;
     let gross_usdt = notional_usdt * (total_gross_bps / 10_000.0);
@@ -1037,7 +1037,11 @@ fn print_consolidated_executive_box(
                     v2_cnt += 1;
                     mfe_s += mfe;
                     mae_s += val.get("mae_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    cap_s += val.get("mfe_capture_pct").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 100.0);
+                    cap_s += val
+                        .get("mfe_capture_pct")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 100.0);
                     q_ms_s += val.get("queue_wait_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     h_ms_s += val.get("hold_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     pegs_s += val.get("exit_peg_attempts").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1051,81 +1055,88 @@ fn print_consolidated_executive_box(
     }
     let vc = (v2_cnt.max(1)) as f64;
     let net_col = if total_net_bps >= 0.0 { ANSI_GREEN } else { ANSI_RED };
-    let border_eq = "\u{2550}".repeat(90);
-    println!("\u{2554}{}\u{2557}", border_eq);
-    println!(
-        "\u{2551} {}\u{1f48e} VORTEX-L2 EXECUTIVE DASHBOARD \u{2014} CAPITAL REAL ({:<17}) & DATOS CONSOLIDADOS{} \u{2551}",
+    let sec_title = vec![format!(
+        "{}\u{1f48e} VORTEX-L2 EXECUTIVE DASHBOARD \u{2014} CAPITAL REAL ({}) & DATOS CONSOLIDADOS{}",
         ANSI_YELLOW, w_mode, ANSI_RESET
-    );
-    println!("\u{2560}{}\u{2563}", border_eq);
-    println!(
-        "\u{2551} {}\u{1f4b0} [1. DINERO REAL EN BILLETERA Y GESTI\u{00d3}N DE MARGEN (USDT)]{}                              \u{2551}",
-        ANSI_GREEN, ANSI_RESET
-    );
-    println!(
-        "\u{2551}   \u{2022} Saldo Billetera (Wallet) : {:>9.4} USDT | Equity Total Vivo : {:>9.4} USDT       \u{2551}",
-        w_usdt, eq_usdt
-    );
-    println!(
-        "\u{2551}   \u{2022} Margen Disponible Libre  : {:>9.4} USDT | PnL Abierto (UPL) : {:>+9.4} USDT       \u{2551}",
-        av_usdt, upl_usdt
-    );
-    println!(
-        "\u{2551}   \u{2022} Nocional por Tiro (10x)  : {:>9.4} USDT | Margen por Tiro   : {:>9.4} USDT       \u{2551}",
-        notional_usdt, margin_per_trade
-    );
-    println!("\u{2560}{}\u{2563}", border_eq);
-    println!(
-        "\u{2551} {}\u{1f4c8} [2. PROGRESO DE RACHA Y RENDIMIENTO CONSOLIDADO DE SESI\u{00d3}N]{}                            \u{2551}",
-        ANSI_YELLOW, ANSI_RESET
-    );
-    println!(
-        "\u{2551}   \u{2022} Meta 50 Tiros  : [{}] {:>2}/50 ({:>4.1}%) | Salidas Maker: {:>5.1}%              \u{2551}",
-        bar_s, total, ((total as f64) * 100.0) / 50.0, mkr_pct
-    );
-    println!(
-        "\u{2551}   \u{2022} Conteo Tiros   : Total: {:>2} | \u{1f7e2} WIN: {:>2} ({:>4.1}%) | \u{1f7e0} SCR: {:>2} ({:>4.1}%) | \u{1f534} LOSS: {:>2} ({:>4.1}%) \u{2551}",
-        total, wins, win_pct, scratches, scr_pct, losses, los_pct
-    );
-    println!(
-        "\u{2551}   \u{2022} Balance (bps)  : Bruto: {:>+7.2} bps | Fees: {:>-7.2} bps | {}Neto: {:>+7.2} bps ({:>+5.2}% @10x){} \u{2551}",
-        total_gross_bps, -total_fee_bps, net_col, total_net_bps, total_net_bps / 10.0, ANSI_RESET
-    );
-    println!(
-        "\u{2551}   \u{2022} Balance (USDT) : Bruto: {:>+7.4} USDT| Fees: {:>-7.4} USDT| {}Neto: {:>+7.4} USDT{}              \u{2551}",
-        gross_usdt, -fee_usdt, net_col, net_usdt, ANSI_RESET
-    );
-    println!(
-        "\u{2551}   \u{2022} Profit Factor  : {:>6.2}            | Expectativa/Tiro : {:>+6.2} bps ({:>+7.4} USDT)     \u{2551}",
-        pf_val, exp_bps, exp_usdt
-    );
-    println!("\u{2560}{}\u{2563}", border_eq);
-    println!(
-        "\u{2551} {}\u{1f52c} [3. CALIDAD MICROESTRUCTURAL CONSOLIDADA (PROMEDIOS BA\u{00da}L V2)]{}                         \u{2551}",
-        ANSI_GREEN, ANSI_RESET
-    );
-    println!(
-        "\u{2551}   \u{2022} Excursi\u{00f3}n Media: MFE: {:>+6.2} bps | MAE: {:>+6.2} bps | Captura MFE Media : {:>5.1}%      \u{2551}",
-        mfe_s / vc, mae_s / vc, cap_s / vc
-    );
-    println!(
-        "\u{2551}   \u{2022} Tiempos Medios : Cola L1: {:>4.0} ms | Custodia: {:>5.1} s | Pegs Salida Medios: {:>4.1}       \u{2551}",
-        q_ms_s / vc, (h_ms_s / vc) / 1_000.0, pegs_s / vc
-    );
-    println!(
-        "\u{2551}   \u{2022} Convicci\u{00f3}n In  : |Drift|: {:>4.2}bp | |Ext|: {:>4.2}bp | |Geom|: {:>4.2} | SNR Medio: {:>4.2}    \u{2551}",
-        dr_s / vc, ex_s / vc, gm_s / vc, snr_s / vc
-    );
-    println!("\u{255a}{}\u{255d}", border_eq);
+    )];
+    let sec_wallet = vec![
+        format!(
+            "{}\u{1f4b0} [1. DINERO REAL EN BILLETERA Y GESTI\u{00d3}N DE MARGEN (USDT)]{}",
+            ANSI_GREEN, ANSI_RESET
+        ),
+        format!(
+            "  \u{2022} Saldo Billetera (Wallet) : {:>10.4} USDT \u{2502} Equity Total Vivo  : {:>10.4} USDT",
+            w_usdt, eq_usdt
+        ),
+        format!(
+            "  \u{2022} Margen Disponible Libre  : {:>10.4} USDT \u{2502} PnL Abierto (UPL)  : {:>+10.4} USDT",
+            av_usdt, upl_usdt
+        ),
+        format!(
+            "  \u{2022} Nocional por Tiro (10x)  : {:>10.4} USDT \u{2502} Margen por Tiro    : {:>10.4} USDT",
+            notional_usdt, margin_per_trade
+        ),
+    ];
+    let sec_streak = vec![
+        format!(
+            "{}\u{1f4c8} [2. PROGRESO DE RACHA Y RENDIMIENTO CONSOLIDADO DE SESI\u{00d3}N]{}",
+            ANSI_YELLOW, ANSI_RESET
+        ),
+        format!(
+            "  \u{2022} Meta 50 Tiros  : [{}] {:>2}/50 ({:>5.1}%) \u{2502} Salidas Maker : {:>6.1}%",
+            bar_s, total, ((total as f64) * 100.0) / 50.0, mkr_pct
+        ),
+        format!(
+            "  \u{2022} Conteo Tiros   : Total: {:>2} \u{2502} \u{1f7e2} WIN: {:>2} ({:>5.1}%) \u{2502} \u{1f7e0} SCR: {:>2} ({:>5.1}%) \u{2502} \u{1f534} LOSS: {:>2} ({:>5.1}%)",
+            total, wins, win_pct, scratches, scr_pct, losses, los_pct
+        ),
+        format!(
+            "  \u{2022} Balance (bps)  : Bruto: {:>+8.2} bps  \u{2502} Fees: {:>-8.2} bps  \u{2502} {}Neto: {:>+8.2} bps  ({:>+6.2}% @10x){}",
+            total_gross_bps, -total_fee_bps, net_col, total_net_bps, total_net_bps / 10.0, ANSI_RESET
+        ),
+        format!(
+            "  \u{2022} Balance (USDT) : Bruto: {:>+8.4} USDT \u{2502} Fees: {:>-8.4} USDT \u{2502} {}Neto: {:>+8.4} USDT ({:>+6.2}% @10x){}",
+            gross_usdt, -fee_usdt, net_col, net_usdt, total_net_bps / 10.0, ANSI_RESET
+        ),
+        format!(
+            "  \u{2022} Profit Factor  :       {:>8.2}       \u{2502} Expectativa/Tiro    : {:>+8.2} bps  ({:>+8.4} USDT)",
+            pf_val, exp_bps, exp_usdt
+        ),
+    ];
+    let sec_micro = vec![
+        format!(
+            "{}\u{1f52c} [3. CALIDAD MICROESTRUCTURAL CONSOLIDADA (PROMEDIOS BA\u{00da}L V2)]{}",
+            ANSI_GREEN, ANSI_RESET
+        ),
+        format!(
+            "  \u{2022} Excursi\u{00f3}n Media: MFE  : {:>+8.2} bps  \u{2502} MAE     : {:>+8.2} bps  \u{2502} Captura MFE : {:>6.1}%",
+            mfe_s / vc, mae_s / vc, cap_s / vc
+        ),
+        format!(
+            "  \u{2022} Tiempos Medios : Cola : {:>8.0} ms   \u{2502} Custodia: {:>8.1} s    \u{2502} Pegs Salida : {:>6.1}",
+            q_ms_s / vc, (h_ms_s / vc) / 1_000.0, pegs_s / vc
+        ),
+        format!(
+            "  \u{2022} Convicci\u{00f3}n In  : Drift: {:>8.2} bps  \u{2502} Ext     : {:>8.2} bps  \u{2502} Geom: {:>5.2} \u{2502} SNR: {:>5.2}",
+            dr_s / vc, ex_s / vc, gm_s / vc, snr_s / vc
+        ),
+    ];
+    vec![sec_title, sec_wallet, sec_streak, sec_micro]
 }
+
 
 fn print_colorized_shadow_trades() -> ExitCode {
     let file_path = Path::new("data/vortex_shadow_trades.jsonl");
     let file = match File::open(file_path) {
         Ok(f) => f,
         Err(_) => {
-            println!("  (No closed trades yet in data/vortex_shadow_trades.jsonl)");
-            print_consolidated_executive_box(0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            let mut sections = vec![vec![String::from(
+                "(No closed trades yet in data/vortex_shadow_trades.jsonl)",
+            )]];
+            sections.extend(build_consolidated_executive_sections(
+                0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ));
+            print_auto_aligned_box(&sections);
             return ExitCode::SUCCESS;
         }
     };
@@ -1139,6 +1150,7 @@ fn print_colorized_shadow_trades() -> ExitCode {
     let mut scratches = 0_u64;
     let mut losses = 0_u64;
     let mut maker_count = 0_u64;
+    let mut trade_rows: Vec<String> = Vec::new();
     for (idx, line) in reader.lines().map_while(Result::ok).enumerate() {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
             let sym = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("-");
@@ -1199,7 +1211,7 @@ fn print_colorized_shadow_trades() -> ExitCode {
                 "LOSS   "
             };
             let c_a = format!(
-                "{} #{} {}] {:<8} {:<3} | {}t -> {}t",
+                "{} #{:<2} {}] {:<8} {:<3} \u{2502} {:>7}t->{:<7}t",
                 v_lbl,
                 idx + 1,
                 tag,
@@ -1209,40 +1221,44 @@ fn print_colorized_shadow_trades() -> ExitCode {
                 ex_t
             );
             let c_b = format!(
-                " | Gross:{:+6.2} Fee:{:.2} Net:{:+6.2} bps ({:+.2}% @10x)",
+                " \u{2502} G:{:+6.2} F:{:.2} N:{:+6.2}bp ({:+.2}%@10x)",
                 gross_bps,
                 fee_bps,
                 net_bps,
                 net_bps / 10.0
             );
             let c_c = format!(
-                " | MFE:{:+5.2} MAE:{:+6.2} | Hold:{}s | {} (Maker={})",
+                " \u{2502} MFE:{:+5.2} MAE:{:+6.2} \u{2502} {:>3}s \u{2502} {} (Mkr={})",
                 mfe_bps,
                 mae_bps,
                 hold_ms / 1_000,
                 sub_r,
                 is_mkr
             );
-            println!("  {}{}{}{}{}", color, c_a, c_b, c_c, ANSI_RESET);
+            trade_rows.push(format!("{}{}{}{}{}", color, c_a, c_b, c_c, ANSI_RESET));
         }
     }
     let total = wins + scratches + losses;
     let sum_color = if losses == 0 { ANSI_GREEN } else { ANSI_RED };
     let sum_icon = if losses == 0 { "\u{1f7e2}" } else { "\u{1f534}" };
-    println!("------------------------------------------------------------------------------------------");
     let s_a = format!(
-        "{} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} | \u{1f7e0} Scratches: {} | \u{1f534} Losses: {})",
+        "{} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} \u{2502} \u{1f7e0} Scratches: {} \u{2502} \u{1f534} Losses: {})",
         sum_icon, total, wins, scratches, losses
     );
     let s_b = format!(
-        " | CumGross: {:+.2} | CumFee: -{:.2} | CumNet: {:+.2} bps ({:+.2}% @10x)",
+        " \u{2502} CumGross: {:+.2} \u{2502} CumFee: -{:.2} \u{2502} CumNet: {:+.2} bps ({:+.2}% @10x)",
         total_gross_bps,
         total_fee_bps,
         total_net_bps,
         total_net_bps / 10.0
     );
-    println!("  {}{}{}{}", sum_color, s_a, s_b, ANSI_RESET);
-    print_consolidated_executive_box(
+    let sum_line = vec![format!("{}{}{}{}", sum_color, s_a, s_b, ANSI_RESET)];
+    let mut all_sections = Vec::new();
+    if !trade_rows.is_empty() {
+        all_sections.push(trade_rows);
+    }
+    all_sections.push(sum_line);
+    all_sections.extend(build_consolidated_executive_sections(
         wins,
         scratches,
         losses,
@@ -1252,7 +1268,8 @@ fn print_colorized_shadow_trades() -> ExitCode {
         total_net_bps,
         pos_net_sum,
         neg_net_abs,
-    );
+    ));
+    print_auto_aligned_box(&all_sections);
     ExitCode::SUCCESS
 }
 
@@ -1622,21 +1639,19 @@ fn print_live_shm_hud() -> ExitCode {
     let hb_ns = arena.heartbeat_ns.load(Ordering::Acquire) as i64;
     let age_ms = ((now_epoch_ns().saturating_sub(hb_ns)).max(0)) / 1_000_000;
     let evaluator = OrthogonalFactorState::new();
-
-    println!("==========================================================================================");
-    println!(
-        "[VORTEX LIVE HUD] SHM v{}: {} | Heartbeat Age: {} ms",
+    let sec_title = vec![format!(
+        "{}\u{1f4e1} [VORTEX LIVE HUD] SHM v{}: {} \u{2502} Heartbeat Age: {} ms{}",
+        ANSI_YELLOW,
         arena.version,
         shm_path.display(),
-        age_ms
-    );
-    println!("------------------------------------------------------------------------------------------");
-    println!(
-        "{:<4} | {:<10} | {:>12} | {:>12} | {:>12} | {:>5} | {:>6} | {:>6} | {:>6} | VERDICT",
+        age_ms,
+        ANSI_RESET
+    )];
+    let sec_hdr = vec![format!(
+        "{:<4} \u{2502} {:<10} \u{2502} {:>12} \u{2502} {:>12} \u{2502} {:>12} \u{2502} {:>5} \u{2502} {:>6} \u{2502} {:>6} \u{2502} {:>6} \u{2502} VERDICT",
         "SLOT", "SYMBOL", "SEQ_ID", "BEST_BID", "BEST_ASK", "SPR_T", "X_OFI", "X_TFI", "X_GEOM"
-    );
-    println!("------------------------------------------------------------------------------------------");
-
+    )];
+    let mut sec_rows: Vec<String> = Vec::with_capacity(APPROVED_SPECS.len());
     let mut slot_idx = 0;
     while slot_idx < APPROVED_SPECS.len() {
         let spec = APPROVED_SPECS[slot_idx];
@@ -1650,17 +1665,17 @@ fn print_live_shm_hud() -> ExitCode {
                 };
                 let (v_col, v_icon, verdict_str) = match evaluator.evaluate_entry_signal(&spec, &snap) {
                     Ok(SignalVerdict::AuthorizeMakerEntry { side: Side::Bid, .. }) => {
-                        (ANSI_YELLOW, "🟡", "AUTH_LONG_MKR")
+                        (ANSI_YELLOW, "\u{1f7e1}", "AUTH_LONG_MKR ")
                     }
                     Ok(SignalVerdict::AuthorizeMakerEntry { side: Side::Ask, .. }) => {
-                        (ANSI_YELLOW, "🟡", "AUTH_SHORT_MKR")
+                        (ANSI_YELLOW, "\u{1f7e1}", "AUTH_SHORT_MKR")
                     }
-                    Ok(SignalVerdict::SpoofingVeto) => (ANSI_ORANGE, "🟠", "SPOOF_VETO"),
-                    Ok(SignalVerdict::NeutralNoAction) => (ANSI_GRAY, "⚪", "NEUTRAL_WAIT"),
-                    Err(_) => (ANSI_RED, "🔴", "GUARD_VETO"),
+                    Ok(SignalVerdict::SpoofingVeto) => (ANSI_ORANGE, "\u{1f7e0}", "SPOOF_VETO    "),
+                    Ok(SignalVerdict::NeutralNoAction) => (ANSI_GRAY, "\u{26aa}", "NEUTRAL_WAIT  "),
+                    Err(_) => (ANSI_RED, "\u{1f534}", "GUARD_VETO    "),
                 };
-                println!(
-                    "  {}  | {:<10} | {:>12} | {:>7}.{:04} | {:>7}.{:04} | {:>5} | {:>+6.2} | {:>+6.2} | {:>+6.2} | {}{} {}{}",
+                sec_rows.push(format!(
+                    "  {}  \u{2502} {:<10} \u{2502} {:>12} \u{2502} {:>7}.{:04} \u{2502} {:>7}.{:04} \u{2502} {:>5} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {:>+6.2} \u{2502} {}{} {}{}",
                     slot_idx,
                     snap.symbol_id.name(),
                     snap.sequence_id,
@@ -1676,12 +1691,11 @@ fn print_live_shm_hud() -> ExitCode {
                     v_icon,
                     verdict_str,
                     ANSI_RESET
-                );
+                ));
             }
         }
         slot_idx += 1;
     }
-
     let state_code = arena.exec_state_code.load(Ordering::Acquire);
     let active_sym = SymbolId(arena.exec_active_symbol.load(Ordering::Acquire) as u16);
     let side_code = arena.exec_side.load(Ordering::Acquire);
@@ -1695,36 +1709,35 @@ fn print_live_shm_hud() -> ExitCode {
     let aborts = arena.exec_abort_count.load(Ordering::Acquire);
     let fills = arena.exec_fill_count.load(Ordering::Acquire);
     let closed = arena.exec_closed_count.load(Ordering::Acquire);
-
     let (st_col, st_icon, state_label) = match state_code {
-        0 => (ANSI_GRAY, "⚪", "IDLE (SCANNING)"),
-        1 => (ANSI_YELLOW, "🟡", "PLACING_MAKER"),
-        2 => (ANSI_YELLOW, "🟡", "RESTING_L1_QUEUE"),
-        3 => (ANSI_YELLOW, "🟡", "POSITION_OPEN_MAKER_TP"),
-        4 => (ANSI_RED, "🔴", "EMERGENCY_SL"),
-        _ => (ANSI_RED, "🔴", "HALTED_GUARD"),
+        0 => (ANSI_GRAY, "\u{26aa}", "IDLE (SCANNING)"),
+        1 => (ANSI_YELLOW, "\u{1f7e1}", "PLACING_MAKER"),
+        2 => (ANSI_YELLOW, "\u{1f7e1}", "RESTING_L1_QUEUE"),
+        3 => (ANSI_YELLOW, "\u{1f7e1}", "POSITION_OPEN_MAKER_TP"),
+        4 => (ANSI_RED, "\u{1f534}", "EMERGENCY_SL"),
+        _ => (ANSI_RED, "\u{1f534}", "HALTED_GUARD"),
     };
-
-    println!("------------------------------------------------------------------------------------------");
-    println!(
-        "[EXEC FSM LIVE] State: {}{} {}{} | Sym: {} ({}) @ {}t [Peak:{}t | TP:{}t | SL:{}t] (Q: {} lots) | 🟡Armed: {} | 🟠Aborts: {} | 🟡Fills: {} | 🟢Closed: {}",
-        st_col,
-        st_icon,
-        state_label,
-        ANSI_RESET,
-        if state_code == 0 { "-" } else { active_sym.name() },
-        if state_code == 0 { "-" } else { side_str },
-        entry_ticks,
-        peak_ticks,
-        tp_ticks,
-        sl_ticks,
-        q_ahead,
-        armed,
-        aborts,
-        fills,
-        closed
-    );
-    println!("==========================================================================================");
+    let sec_fsm = vec![
+        format!(
+            "[EXEC FSM LIVE] State: {}{} {}{} \u{2502} Sym: {} ({}) @ {}t [Peak:{}t \u{2502} TP:{}t \u{2502} SL:{}t] (Q: {} lots)",
+            st_col,
+            st_icon,
+            state_label,
+            ANSI_RESET,
+            if state_code == 0 { "-" } else { active_sym.name() },
+            if state_code == 0 { "-" } else { side_str },
+            entry_ticks,
+            peak_ticks,
+            tp_ticks,
+            sl_ticks,
+            q_ahead
+        ),
+        format!(
+            "[SESSION FLOW ] \u{1f7e1} Armed: {:<4} \u{2502} \u{1f7e0} Aborts: {:<4} \u{2502} \u{1f7e1} Fills: {:<4} \u{2502} \u{1f7e2} Closed: {:<4}",
+            armed, aborts, fills, closed
+        ),
+    ];
+    print_auto_aligned_box(&[sec_title, sec_hdr, sec_rows, sec_fsm]);
     ExitCode::SUCCESS
 }
 
@@ -2744,6 +2757,14 @@ mod tests {
 
     #[test]
     fn test_consolidated_executive_dashboard_box_renders_cleanly() {
-        print_consolidated_executive_box(3, 6, 0, 9, 41.41, 36.00, 5.41, 5.41, 0.0);
+        use vortex_rs::types::{format_auto_aligned_box, visual_width_cols};
+        let sections = build_consolidated_executive_sections(3, 6, 0, 9, 41.41, 36.00, 5.41, 5.41, 0.0);
+        let lines = format_auto_aligned_box(&sections);
+        assert!(!lines.is_empty());
+        let target_cols = visual_width_cols(&lines[0]);
+        for l in &lines {
+            println!("{}", l);
+            assert_eq!(visual_width_cols(l), target_cols);
+        }
     }
 }

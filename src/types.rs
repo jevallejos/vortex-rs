@@ -402,6 +402,76 @@ pub const ANSI_YELLOW: &str = "\x1b[1;33m";
 pub const ANSI_GRAY: &str = "\x1b[90m";
 pub const ANSI_RESET: &str = "\x1b[0m";
 
+/// Computes the exact terminal column width of `s`, ignoring ANSI escape codes (`\x1b[...m`)
+/// and counting wide Unicode emojis as 2 visual columns.
+#[inline]
+#[must_use]
+pub fn visual_width_cols(s: &str) -> usize {
+    let mut cols = 0_usize;
+    let mut in_ansi = false;
+    for ch in s.chars() {
+        if in_ansi {
+            if ch.is_ascii_alphabetic() {
+                in_ansi = false;
+            }
+            continue;
+        }
+        if ch == '\x1b' {
+            in_ansi = true;
+            continue;
+        }
+        let cp = ch as u32;
+        let w = if (0x1F300..=0x1FAFF).contains(&cp) || (0x2600..=0x27BF).contains(&cp) {
+            2
+        } else {
+            1
+        };
+        cols += w;
+    }
+    cols
+}
+
+/// Formats a multi-section box (`╔═..═╗`, `╠═..═╣`, `╚═..═╝`) where every border and row
+/// is mathematically padded to match the visual column width of the longest line.
+#[must_use]
+pub fn format_auto_aligned_box(sections: &[Vec<String>]) -> Vec<String> {
+    let mut max_cols = 0_usize;
+    for sec in sections {
+        for line in sec {
+            let w = visual_width_cols(line);
+            if w > max_cols {
+                max_cols = w;
+            }
+        }
+    }
+    if max_cols == 0 {
+        return Vec::new();
+    }
+    let inner_w = max_cols + 2;
+    let horiz = "\u{2550}".repeat(inner_w);
+    let mut out = Vec::new();
+    out.push(format!("\u{2554}{}\u{2557}", horiz));
+    for (s_idx, sec) in sections.iter().enumerate() {
+        if s_idx > 0 {
+            out.push(format!("\u{2560}{}\u{2563}", horiz));
+        }
+        for line in sec {
+            let w = visual_width_cols(line);
+            let pad = max_cols.saturating_sub(w);
+            out.push(format!("\u{2551} {}{} \u{2551}", line, " ".repeat(pad)));
+        }
+    }
+    out.push(format!("\u{255a}{}\u{255d}", horiz));
+    out
+}
+
+/// Prints a multi-section box aligned to the longest line.
+pub fn print_auto_aligned_box(sections: &[Vec<String>]) {
+    for line in format_auto_aligned_box(sections) {
+        println!("{}", line);
+    }
+}
+
 /// Canonical PnL badge classifier (`WIN` >= +1.00 bps, `SCRATCH` in [-0.50, +1.00) bps, `LOSS` < -0.50 bps).
 #[inline]
 #[must_use]

@@ -110,7 +110,6 @@ case "${1:-live}" in
         journalctl -u vortex-exec.service -n 35 --no-pager | grep -E "BYBIT V5|QUEUE|FILL|CLOSE|VETO|REHYDRATE|ORPHAN|ADOPT|DUPLICATE" || true
         echo "=== [3. CLOSED TRADES LEDGER (COLORIZED + RAW JSONL)] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec" --trades
-        cat "${VORTEX_DIR}/data/vortex_shadow_trades.jsonl" || true
         echo "=== [4. WALK-FORWARD PAR1 REPLAY (1,048,576 REAL EVENTS)] ==="
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay"
         echo "=== [5. AI FORENSIC VAULT (data/vortex_ai_forensic_vault.jsonl)] ==="
