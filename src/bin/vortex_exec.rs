@@ -137,6 +137,82 @@ struct BybitV5LiveClient {
 }
 
 impl BybitV5LiveClient {
+    fn from_env_readonly() -> Option<Self> {
+        let api_key = load_env_var_with_fallback(&["BYBIT_API_KEY", "API_KEY"])?;
+        let api_secret = load_env_var_with_fallback(&["BYBIT_API_SECRET", "API_SECRET"])?;
+        Some(Self { api_key, api_secret })
+    }
+
+    fn query_unified_usdt_wallet(&self) -> Option<(f64, f64, f64, f64)> {
+        let resp = self.get_v5(
+            "/v5/account/wallet-balance",
+            "accountType=UNIFIED&coin=USDT",
+        )?;
+        let list = resp
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(serde_json::Value::as_array)?;
+        let acct = list.first()?;
+        let mut wallet = acct
+            .get("totalWalletBalance")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let mut equity = acct
+            .get("totalEquity")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(wallet);
+        let mut avail = acct
+            .get("totalAvailableBalance")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let mut upl = acct
+            .get("totalPerpUPL")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if let Some(coins) = acct.get("coin").and_then(serde_json::Value::as_array) {
+            for c in coins {
+                if c.get("coin").and_then(serde_json::Value::as_str) == Some("USDT") {
+                    if let Some(w) = c
+                        .get("walletBalance")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
+                        wallet = w;
+                    }
+                    if let Some(eq) = c
+                        .get("equity")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
+                        equity = eq;
+                    }
+                    if let Some(u) = c
+                        .get("unrealisedPnl")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
+                        upl = u;
+                    }
+                    if avail <= 0.0 {
+                        avail = c
+                            .get("availableToWithdraw")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(wallet);
+                    }
+                }
+            }
+        }
+        if avail <= 0.0 {
+            avail = wallet;
+        }
+        Some((wallet, equity, avail, upl))
+    }
+
     fn from_env_if_enabled(live_capital_enabled: bool) -> Option<Self> {
         if !live_capital_enabled {
             return None;
@@ -888,12 +964,168 @@ fn print_oos_forensic_vault_v2_audit() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn print_consolidated_executive_box(
+    wins: u64,
+    scratches: u64,
+    losses: u64,
+    maker_count: u64,
+    total_gross_bps: f64,
+    total_fee_bps: f64,
+    total_net_bps: f64,
+    pos_net_sum: f64,
+    neg_net_abs: f64,
+) {
+    let notional_usdt = (OPTIMAL_LIVE_NOTIONAL_1E8 as f64) / 100_000_000.0;
+    let margin_per_trade = notional_usdt / 10.0;
+    let gross_usdt = notional_usdt * (total_gross_bps / 10_000.0);
+    let fee_usdt = notional_usdt * (total_fee_bps / 10_000.0);
+    let net_usdt = notional_usdt * (total_net_bps / 10_000.0);
+    let live_wallet = BybitV5LiveClient::from_env_readonly()
+        .and_then(|c| c.query_unified_usdt_wallet());
+    let (w_usdt, eq_usdt, av_usdt, upl_usdt, w_mode) = match live_wallet {
+        Some((w, eq, av, u)) => (w, eq, av, u, "BYBIT UTA V5 LIVE"),
+        None => {
+            let sim_eq = 50.9600 + net_usdt;
+            (sim_eq, sim_eq, sim_eq, 0.0, "INTERNAL LEDGER")
+        }
+    };
+    let total = wins + scratches + losses;
+    let goal = 50_u64;
+    let filled_bars = ((total.min(goal) * 20) / goal) as usize;
+    let mut bar_s = String::with_capacity(60);
+    let mut b_i = 0_usize;
+    while b_i < 20 {
+        if b_i < filled_bars {
+            bar_s.push('\u{2588}');
+        } else {
+            bar_s.push('\u{2591}');
+        }
+        b_i += 1;
+    }
+    let tot_f = (total.max(1)) as f64;
+    let win_pct = ((wins as f64) * 100.0) / tot_f;
+    let scr_pct = ((scratches as f64) * 100.0) / tot_f;
+    let los_pct = ((losses as f64) * 100.0) / tot_f;
+    let mkr_pct = if total > 0 {
+        ((maker_count as f64) * 100.0) / tot_f
+    } else {
+        100.0
+    };
+    let pf_val = if neg_net_abs <= 0.001 {
+        9.99
+    } else {
+        (pos_net_sum / neg_net_abs).min(9.99)
+    };
+    let exp_bps = if total > 0 { total_net_bps / tot_f } else { 0.0 };
+    let exp_usdt = if total > 0 { net_usdt / tot_f } else { 0.0 };
+    let mut v2_cnt = 0_u64;
+    let mut mfe_s = 0.0_f64;
+    let mut mae_s = 0.0_f64;
+    let mut cap_s = 0.0_f64;
+    let mut q_ms_s = 0.0_f64;
+    let mut h_ms_s = 0.0_f64;
+    let mut pegs_s = 0.0_f64;
+    let mut dr_s = 0.0_f64;
+    let mut ex_s = 0.0_f64;
+    let mut gm_s = 0.0_f64;
+    let mut snr_s = 0.0_f64;
+    if let Ok(vf) = File::open("data/vortex_ai_forensic_vault.jsonl") {
+        for line in BufReader::new(vf).lines().map_while(Result::ok) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(mfe) = val.get("mfe_bps").and_then(|v| v.as_f64()) {
+                    v2_cnt += 1;
+                    mfe_s += mfe;
+                    mae_s += val.get("mae_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    cap_s += val.get("mfe_capture_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    q_ms_s += val.get("queue_wait_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    h_ms_s += val.get("hold_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    pegs_s += val.get("exit_peg_attempts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    dr_s += val.get("drift_bps").and_then(|v| v.as_f64()).unwrap_or(0.0).abs();
+                    ex_s += val.get("ext_bps").and_then(|v| v.as_f64()).unwrap_or(0.0).abs();
+                    gm_s += val.get("geom_in").and_then(|v| v.as_f64()).unwrap_or(0.0).abs();
+                    snr_s += val.get("snr_in").and_then(|v| v.as_f64()).unwrap_or(0.0).abs();
+                }
+            }
+        }
+    }
+    let vc = (v2_cnt.max(1)) as f64;
+    let net_col = if total_net_bps >= 0.0 { ANSI_GREEN } else { ANSI_RED };
+    let border_eq = "\u{2550}".repeat(90);
+    println!("\u{2554}{}\u{2557}", border_eq);
+    println!(
+        "\u{2551} {}\u{1f48e} VORTEX-L2 EXECUTIVE DASHBOARD \u{2014} CAPITAL REAL ({:<17}) & DATOS CONSOLIDADOS{} \u{2551}",
+        ANSI_YELLOW, w_mode, ANSI_RESET
+    );
+    println!("\u{2560}{}\u{2563}", border_eq);
+    println!(
+        "\u{2551} {}\u{1f4b0} [1. DINERO REAL EN BILLETERA Y GESTI\u{00d3}N DE MARGEN (USDT)]{}                              \u{2551}",
+        ANSI_GREEN, ANSI_RESET
+    );
+    println!(
+        "\u{2551}   \u{2022} Saldo Billetera (Wallet) : {:>9.4} USDT | Equity Total Vivo : {:>9.4} USDT       \u{2551}",
+        w_usdt, eq_usdt
+    );
+    println!(
+        "\u{2551}   \u{2022} Margen Disponible Libre  : {:>9.4} USDT | PnL Abierto (UPL) : {:>+9.4} USDT       \u{2551}",
+        av_usdt, upl_usdt
+    );
+    println!(
+        "\u{2551}   \u{2022} Nocional por Tiro (10x)  : {:>9.4} USDT | Margen por Tiro   : {:>9.4} USDT       \u{2551}",
+        notional_usdt, margin_per_trade
+    );
+    println!("\u{2560}{}\u{2563}", border_eq);
+    println!(
+        "\u{2551} {}\u{1f4c8} [2. PROGRESO DE RACHA Y RENDIMIENTO CONSOLIDADO DE SESI\u{00d3}N]{}                            \u{2551}",
+        ANSI_YELLOW, ANSI_RESET
+    );
+    println!(
+        "\u{2551}   \u{2022} Meta 50 Tiros  : [{}] {:>2}/50 ({:>4.1}%) | Salidas Maker: {:>5.1}%              \u{2551}",
+        bar_s, total, ((total as f64) * 100.0) / 50.0, mkr_pct
+    );
+    println!(
+        "\u{2551}   \u{2022} Conteo Tiros   : Total: {:>2} | \u{1f7e2} WIN: {:>2} ({:>4.1}%) | \u{1f7e0} SCR: {:>2} ({:>4.1}%) | \u{1f534} LOSS: {:>2} ({:>4.1}%) \u{2551}",
+        total, wins, win_pct, scratches, scr_pct, losses, los_pct
+    );
+    println!(
+        "\u{2551}   \u{2022} Balance (bps)  : Bruto: {:>+7.2} bps | Fees: {:>-7.2} bps | {}Neto: {:>+7.2} bps ({:>+5.2}% @10x){} \u{2551}",
+        total_gross_bps, -total_fee_bps, net_col, total_net_bps, total_net_bps / 10.0, ANSI_RESET
+    );
+    println!(
+        "\u{2551}   \u{2022} Balance (USDT) : Bruto: {:>+7.4} USDT| Fees: {:>-7.4} USDT| {}Neto: {:>+7.4} USDT{}              \u{2551}",
+        gross_usdt, -fee_usdt, net_col, net_usdt, ANSI_RESET
+    );
+    println!(
+        "\u{2551}   \u{2022} Profit Factor  : {:>6.2}            | Expectativa/Tiro : {:>+6.2} bps ({:>+7.4} USDT)     \u{2551}",
+        pf_val, exp_bps, exp_usdt
+    );
+    println!("\u{2560}{}\u{2563}", border_eq);
+    println!(
+        "\u{2551} {}\u{1f52c} [3. CALIDAD MICROESTRUCTURAL CONSOLIDADA (PROMEDIOS BA\u{00da}L V2)]{}                         \u{2551}",
+        ANSI_GREEN, ANSI_RESET
+    );
+    println!(
+        "\u{2551}   \u{2022} Excursi\u{00f3}n Media: MFE: {:>+6.2} bps | MAE: {:>+6.2} bps | Captura MFE Media : {:>5.1}%      \u{2551}",
+        mfe_s / vc, mae_s / vc, cap_s / vc
+    );
+    println!(
+        "\u{2551}   \u{2022} Tiempos Medios : Cola L1: {:>4.0} ms | Custodia: {:>5.1} s | Pegs Salida Medios: {:>4.1}       \u{2551}",
+        q_ms_s / vc, (h_ms_s / vc) / 1_000.0, pegs_s / vc
+    );
+    println!(
+        "\u{2551}   \u{2022} Convicci\u{00f3}n In  : |Drift|: {:>4.2}bp | |Ext|: {:>4.2}bp | |Geom|: {:>4.2} | SNR Medio: {:>4.2}    \u{2551}",
+        dr_s / vc, ex_s / vc, gm_s / vc, snr_s / vc
+    );
+    println!("\u{255a}{}\u{255d}", border_eq);
+}
+
 fn print_colorized_shadow_trades() -> ExitCode {
     let file_path = Path::new("data/vortex_shadow_trades.jsonl");
     let file = match File::open(file_path) {
         Ok(f) => f,
         Err(_) => {
             println!("  (No closed trades yet in data/vortex_shadow_trades.jsonl)");
+            print_consolidated_executive_box(0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0);
             return ExitCode::SUCCESS;
         }
     };
@@ -901,10 +1133,12 @@ fn print_colorized_shadow_trades() -> ExitCode {
     let mut total_net_bps = 0.0_f64;
     let mut total_gross_bps = 0.0_f64;
     let mut total_fee_bps = 0.0_f64;
+    let mut pos_net_sum = 0.0_f64;
+    let mut neg_net_abs = 0.0_f64;
     let mut wins = 0_u64;
     let mut scratches = 0_u64;
     let mut losses = 0_u64;
-
+    let mut maker_count = 0_u64;
     for (idx, line) in reader.lines().map_while(Result::ok).enumerate() {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
             let sym = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("-");
@@ -917,6 +1151,9 @@ fn print_colorized_shadow_trades() -> ExitCode {
                 .get("maker_exit")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
+            if is_mkr {
+                maker_count += 1;
+            }
             let def_fee = if is_mkr { 4.00 } else { 7.50 };
             let fee_bps = val
                 .get("fee_bps")
@@ -939,6 +1176,11 @@ fn print_colorized_shadow_trades() -> ExitCode {
             total_net_bps += net_bps;
             total_gross_bps += gross_bps;
             total_fee_bps += fee_bps;
+            if net_bps >= 0.0 {
+                pos_net_sum += net_bps;
+            } else {
+                neg_net_abs += -net_bps;
+            }
             let (color, v_lbl) = if net_bps >= 1.00 {
                 wins += 1;
                 (ANSI_GREEN, "\u{1f7e2} [TRADE")
@@ -1000,6 +1242,17 @@ fn print_colorized_shadow_trades() -> ExitCode {
         total_net_bps / 10.0
     );
     println!("  {}{}{}{}", sum_color, s_a, s_b, ANSI_RESET);
+    print_consolidated_executive_box(
+        wins,
+        scratches,
+        losses,
+        maker_count,
+        total_gross_bps,
+        total_fee_bps,
+        total_net_bps,
+        pos_net_sum,
+        neg_net_abs,
+    );
     ExitCode::SUCCESS
 }
 
@@ -2487,5 +2740,10 @@ mod tests {
         assert_eq!(parsed.get("worst_ticks").and_then(|v| v.as_i64()), Some(799_800));
         assert_eq!(parsed.get("init_q_lots").and_then(|v| v.as_i64()), Some(1_240));
         assert_eq!(parsed.get("win_streak").and_then(|v| v.as_u64()), Some(2));
+    }
+
+    #[test]
+    fn test_consolidated_executive_dashboard_box_renders_cleanly() {
+        print_consolidated_executive_box(3, 6, 0, 9, 41.41, 36.00, 5.41, 5.41, 0.0);
     }
 }
