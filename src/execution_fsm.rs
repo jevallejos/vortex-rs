@@ -703,8 +703,10 @@ impl ExecutionFsm {
         let cur_gross_now =
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
-        let severe_adverse_collapse =
-            hold_ns >= STAGNANT_PROFIT_HOLD_NS && adv_p >= 0.70 && cur_gross_now < -1_200;
+        let severe_adverse_collapse = hold_ns >= STAGNANT_PROFIT_HOLD_NS
+            && peak_gross_now == 0
+            && adv_p >= 0.70
+            && cur_gross_now < -1_200;
         let early_adverse_stall = hold_ns >= STAGNANT_PROFIT_HOLD_NS
             && peak_gross_now < 550
             && cur_gross_now < -450
@@ -730,7 +732,11 @@ impl ExecutionFsm {
         } else {
             self.max_wald_contraction_pct
         };
-        let min_sl_floor_bps = if severe_adverse_collapse { 1_350 } else { 2_250 };
+        let min_sl_floor_bps = if severe_adverse_collapse {
+            1_350
+        } else {
+            (2_250 + (peak_gross_now / 3)).clamp(2_250, 2_550)
+        };
         let min_noise_sl_dist = ((entry_price.0 * min_sl_floor_bps) / 1_000_000).max(4);
         let eff_sl_dist = ((base_sl_dist * (100 - wald_contraction_pct)) / 100)
             .max(min_noise_sl_dist);
@@ -1710,10 +1716,20 @@ impl OnlineAdaptiveGovernor {
                 self.abort_streak[slot_idx][dir] = 0;
             }
             let cd_end = self.directional_cooldown_until_ns[slot_idx][dir];
+            let slow_eq = self.ewma_slow_px_1e4[slot_idx].max(1);
+            let ext_abs_bps = ((px_1e4 - slow_eq).abs().saturating_mul(1_000_000)) / slow_eq;
+            let l_edge_dir = self.ewma_net_bps_x100[slot_idx][dir].clamp(-200, 400);
+            let elastic_eq_band = (140 + (l_edge_dir / 4)).clamp(100, 220);
+            let exit_anc = self.last_exit_px_1e4[slot_idx][dir];
+            let mean_reverted = ext_abs_bps <= elastic_eq_band
+                || exit_anc <= 0
+                || (dir == 0 && px_1e4 <= exit_anc)
+                || (dir == 1 && px_1e4 >= exit_anc);
             if self.sl_streak[slot_idx][dir] == 0
                 && cd_end > 0
                 && now_ns > cd_end
                 && now_ns.saturating_sub(cd_end) > wave_reset_ns
+                && mean_reverted
             {
                 self.wave_anchor_px_1e4[slot_idx][dir] = 0;
                 self.last_exit_px_1e4[slot_idx][dir] = 0;
@@ -1926,6 +1942,21 @@ impl OnlineAdaptiveGovernor {
             let exhausted_scratch_cap = 550 + (learned_edge / 3);
             let had_exhausted_scratch =
                 self.wave_step_count[slot_idx][d] > self.win_streak[slot_idx][d];
+            let raw_e_sc = self.ewma_net_bps_x100[slot_idx][d];
+            let l_edge_sc = if raw_e_sc < -100 {
+                -100
+            } else if raw_e_sc > 270 {
+                270
+            } else {
+                raw_e_sc
+            };
+            if self.win_streak[slot_idx][d] == 0
+                && self.wave_step_count[slot_idx][d] >= 1
+                && raw_e_sc < 175
+                && chased_bps > (1_550 + l_edge_sc)
+            {
+                return Some("VETO_WAVE_STAIRCASE_25BPS");
+            }
             let active_cross_slot_staircase =
                 self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
             if (self.win_streak[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
@@ -2261,6 +2292,16 @@ impl OnlineAdaptiveGovernor {
             - (sym_debt_abs / 20)
             - (abort_p * 25))
             .clamp(180, 400);
+        let abs_drift = self_drift_bps.abs();
+        let abs_ext = self_ext_bps.abs();
+        let geom_sup = candidate_snap.factor_geom.get().abs();
+        let fatigue_ext_cap = (120 + learned_edge).clamp(180, 280);
+        if (learned_edge < 160 || geom_sup < 0.16)
+            && abs_ext > abs_drift
+            && abs_ext > fatigue_ext_cap
+        {
+            return false;
+        }
         let slot_stair_locked =
             self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
         match side {
