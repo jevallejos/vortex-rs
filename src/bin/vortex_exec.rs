@@ -1,5 +1,5 @@
 //! Binary 2 (`vortex_exec`): Institutional Execution Engine, 200.0 Hz Seqlock Reader,
-//! Stage 27 Global Account Single-Position Lock (`settleCoin=USDT`), Non-Abandoning Exchange-Verified Close,
+//! Voragine V0.3.2 Global Account Single-Position Lock (`settleCoin=USDT`), Non-Abandoning Exchange-Verified Close,
 //! Slot-0 `BTCUSDT` Macro Leader Coherence Filter, Dynamic 70% MFE Ratchet, and 520-Trade OOS Verifier.
 
 use core::sync::atomic::Ordering;
@@ -840,7 +840,7 @@ fn rehydrate_shadow_ledger(
     );
 }
 fn compute_vol_scaled_severe_wald_floor(vol_raw: i64) -> i64 {
-    (1_350 + ((vol_raw - 6_200).max(0) / 4)).clamp(1_350, 2_450)
+    (1_350 + ((vol_raw - 8_000).max(0) / 3)).clamp(1_350, 2_450)
 }
 
 fn print_oos_forensic_vault_v2_audit() {

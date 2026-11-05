@@ -163,7 +163,7 @@ case "${1:-live}" in
         "${BIN_DIR}/vortex_exec"
         ;;
     *)
-        echo "Usage: vortex {360|live|-f|follow|trades|status|logs|audit|replay|oos|all}"
+        echo "Usage: vortex {360|live|-f|follow|trades|status|logs|audit|replay|baul|oos|all}"
         exit 1
         ;;
 esac

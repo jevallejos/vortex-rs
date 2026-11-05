@@ -436,7 +436,7 @@ impl ExecutionFsm {
     #[inline]
     pub fn try_arm_maker_entry(
         &mut self,
-        spec: &PairSpec,
+        _spec: &PairSpec,
         snap: &SymbolLobSnapshot,
         verdict: SignalVerdict,
         order_qty: LotQty,
@@ -474,7 +474,6 @@ impl ExecutionFsm {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
             Side::Ask => PriceTicks(entry_price.0 + sl_distance_ticks),
         };
-        let _ = spec;
         PairSpec::validate_stop_loss_geometry(
             side,
             proposed_sl,
@@ -1377,47 +1376,6 @@ impl ExecutionFsm {
         let net_pnl_1e8 = gross_pnl_1e8 - fee_1e8;
 
         ledger.record_closed_trade(gross_pnl_1e8, fee_1e8);
-        let state_peak_px = match self.state {
-            OrderLifecycleState::PositionOpenMakerExit {
-                peak_favorable_price,
-                ..
-            } if peak_favorable_price.0 > 0 => peak_favorable_price,
-            _ => entry_price,
-        };
-        let final_peak_px = match side {
-            Side::Bid => PriceTicks(state_peak_px.0.max(exit_price.0).max(entry_price.0)),
-            Side::Ask => {
-                let min_p = if exit_price.0 > 0 {
-                    state_peak_px.0.min(exit_price.0)
-                } else {
-                    state_peak_px.0
-                };
-                PriceTicks(min_p.min(entry_price.0))
-            }
-        };
-        let raw_worst = if self.worst_adverse_price.0 > 0 {
-            self.worst_adverse_price
-        } else {
-            entry_price
-        };
-        let final_worst_px = match side {
-            Side::Bid => PriceTicks(raw_worst.0.min(exit_price.0).min(entry_price.0)),
-            Side::Ask => PriceTicks(raw_worst.0.max(exit_price.0).max(entry_price.0)),
-        };
-        let mfe_bps = Self::compute_gross_scaled_bps(side, entry_price, final_peak_px)
-            .raw()
-            .max(gross_scaled_bps.raw())
-            .max(self.last_peak_gross_bps)
-            .max(0);
-        let mae_bps = Self::compute_gross_scaled_bps(side, entry_price, final_worst_px)
-            .raw()
-            .min(gross_scaled_bps.raw())
-            .min(0);
-        self.last_closed_mfe_bps = mfe_bps;
-        self.last_closed_mae_bps = mae_bps;
-        self.last_closed_peak_ticks = final_peak_px;
-        self.last_closed_worst_ticks = final_worst_px;
-        self.last_closed_wald_pct = self.max_wald_contraction_pct;
         let state_peak_px = match self.state {
             OrderLifecycleState::PositionOpenMakerExit {
                 peak_favorable_price,
