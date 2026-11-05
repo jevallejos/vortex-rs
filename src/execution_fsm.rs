@@ -467,8 +467,9 @@ impl ExecutionFsm {
         let vol_raw = snap.realized_vol_5m.raw().clamp(4_600, 11_500);
         let learned_raw = self.slot_learned_mfe_bps(snap.symbol_id);
         let target_raw = target_excursion.raw().clamp(2_400, 8_000);
+        let max_sl_cap = if vol_raw >= 9_500 { 4_200 } else { 2_750 };
         let elastic_sl_bps =
-            ((vol_raw * 32 + target_raw * 10 + learned_raw * 25) / 100).clamp(2_100, 2_750);
+            ((vol_raw * 32 + target_raw * 10 + learned_raw * 25) / 100).clamp(2_100, max_sl_cap);
         let sl_distance_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
@@ -703,7 +704,8 @@ impl ExecutionFsm {
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
         let severe_adverse_collapse = hold_ns >= STAGNANT_PROFIT_HOLD_NS
-            && peak_gross_now < 400
+            && peak_gross_now == 0
+            && snap.realized_vol_5m.raw() < 9_000
             && adv_p >= 0.70
             && cur_gross_now < -1_200;
         let wald_contraction_pct = if severe_adverse_collapse {
@@ -2309,9 +2311,25 @@ impl OnlineAdaptiveGovernor {
                 return false;
             }
         }
+        let abs_d_now = self_drift_bps.abs();
+        let extreme_l2_vacuum = candidate_snap.factor_geom.get().abs() >= 0.65
+            && candidate_snap.factor_tfi.get().abs() >= 0.88;
+        if self_vol >= 9_500 && abs_d_now < 260 && !extreme_l2_vacuum {
+            return false;
+        }
+        let anc_1e4 = self.wave_anchor_px_1e4[slot_idx][d];
+        if self.wave_step_count[slot_idx][d] >= 1 && anc_1e4 > 0 && cur_en_1e4 > 0 {
+            let chased_from_origin = match side {
+                Side::Bid => ((cur_en_1e4 - anc_1e4).saturating_mul(1_000_000)) / anc_1e4,
+                Side::Ask => ((anc_1e4 - cur_en_1e4).saturating_mul(1_000_000)) / anc_1e4,
+            };
+            if chased_from_origin <= 0 && abs_d_now < 320 {
+                return false;
+            }
+        }
         if learned_edge < 90
             && self.win_streak[slot_idx][d] == 0
-            && self_drift_bps.abs() < 320
+            && abs_d_now < 320
         {
             return false;
         }

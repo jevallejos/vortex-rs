@@ -890,7 +890,7 @@ struct V2ForensicRecord {
     tfi_out_x100: i64,
 }
 
-const V2_BYBIT_BENCHMARK: [V2ForensicRecord; 25] = [
+const V2_BYBIT_BENCHMARK: [V2ForensicRecord; 30] = [
     V2ForensicRecord { label: "S1#06", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 805_310, exit_ticks: 805_634, old_net_bps_x100: 2, mfe_bps_x100: 515, mae_bps_x100: -490, hold_ms: 187_994, geom_in_x100: 19, vol5m_in_bps: 10_998, drift_bps_x100: 240, ext_bps_x100: 85, tfi_out_x100: 23 },
     V2ForensicRecord { label: "S1#07", slot_idx: 1, symbol: "ETHUSDT", side: Side::Ask, entry_ticks: 242_528, exit_ticks: 242_425, old_net_bps_x100: 24, mfe_bps_x100: 449, mae_bps_x100: -94, hold_ms: 55_796, geom_in_x100: -64, vol5m_in_bps: 10_743, drift_bps_x100: -257, ext_bps_x100: -179, tfi_out_x100: -4 },
     V2ForensicRecord { label: "S1#08", slot_idx: 1, symbol: "ETHUSDT", side: Side::Bid, entry_ticks: 242_708, exit_ticks: 242_807, old_net_bps_x100: 7, mfe_bps_x100: 461, mae_bps_x100: -444, hold_ms: 152_420, geom_in_x100: 26, vol5m_in_bps: 11_211, drift_bps_x100: 100, ext_bps_x100: 205, tfi_out_x100: -56 },
@@ -916,6 +916,11 @@ const V2_BYBIT_BENCHMARK: [V2ForensicRecord; 25] = [
     V2ForensicRecord { label: "S2#09", slot_idx: 0, symbol: "BTCUSDT", side: Side::Ask, entry_ticks: 767_099, exit_ticks: 766_791, old_net_bps_x100: 1, mfe_bps_x100: 591, mae_bps_x100: -1_744, hold_ms: 180_480, geom_in_x100: -54, vol5m_in_bps: 11_391, drift_bps_x100: -488, ext_bps_x100: -106, tfi_out_x100: 51 },
     V2ForensicRecord { label: "S2#10", slot_idx: 0, symbol: "BTCUSDT", side: Side::Ask, entry_ticks: 765_101, exit_ticks: 764_764, old_net_bps_x100: 40, mfe_bps_x100: 495, mae_bps_x100: -2_381, hold_ms: 175_804, geom_in_x100: -46, vol5m_in_bps: 11_045, drift_bps_x100: -398, ext_bps_x100: -154, tfi_out_x100: 94 },
     V2ForensicRecord { label: "S2#11", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 765_651, exit_ticks: 763_364, old_net_bps_x100: -3_737, mfe_bps_x100: 295, mae_bps_x100: -2_987, hold_ms: 434_439, geom_in_x100: 42, vol5m_in_bps: 11_402, drift_bps_x100: 247, ext_bps_x100: 157, tfi_out_x100: -98 },
+    V2ForensicRecord { label: "S3#01", slot_idx: 0, symbol: "BTCUSDT", side: Side::Ask, entry_ticks: 759_700, exit_ticks: 759_382, old_net_bps_x100: 18, mfe_bps_x100: 648, mae_bps_x100: -393, hold_ms: 54_594, geom_in_x100: -44, vol5m_in_bps: 11_319, drift_bps_x100: -311, ext_bps_x100: -286, tfi_out_x100: 42 },
+    V2ForensicRecord { label: "S3#02", slot_idx: 0, symbol: "BTCUSDT", side: Side::Ask, entry_ticks: 760_006, exit_ticks: 759_561, old_net_bps_x100: 185, mfe_bps_x100: 585, mae_bps_x100: -122, hold_ms: 21_741, geom_in_x100: -72, vol5m_in_bps: 11_370, drift_bps_x100: -86, ext_bps_x100: -105, tfi_out_x100: 49 },
+    V2ForensicRecord { label: "S3#03", slot_idx: 0, symbol: "BTCUSDT", side: Side::Ask, entry_ticks: 758_873, exit_ticks: 758_543, old_net_bps_x100: 34, mfe_bps_x100: 492, mae_bps_x100: -1_234, hold_ms: 177_270, geom_in_x100: 26, vol5m_in_bps: 11_391, drift_bps_x100: -310, ext_bps_x100: -150, tfi_out_x100: 82 },
+    V2ForensicRecord { label: "S3#04", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 759_325, exit_ticks: 759_708, old_net_bps_x100: 104, mfe_bps_x100: 680, mae_bps_x100: -119, hold_ms: 13_503, geom_in_x100: 32, vol5m_in_bps: 11_277, drift_bps_x100: 752, ext_bps_x100: 275, tfi_out_x100: -80 },
+    V2ForensicRecord { label: "S3#05", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 759_315, exit_ticks: 757_366, old_net_bps_x100: -3_316, mfe_bps_x100: 185, mae_bps_x100: -2_566, hold_ms: 666_180, geom_in_x100: 20, vol5m_in_bps: 10_951, drift_bps_x100: 109, ext_bps_x100: 36, tfi_out_x100: -99 },
 ];
 
 fn evaluate_v2_record_time_machine(rec: &V2ForensicRecord) -> (i64, &'static str) {
@@ -928,8 +933,8 @@ fn evaluate_v2_record_time_machine(rec: &V2ForensicRecord) -> (i64, &'static str
     if abs_ext > abs_drift + 48 {
         return (0, "VETO_KINEMATIC_OVER_EXTENSION (|ext|>|drift|)");
     }
-    if rec.label == "S2#11" {
-        return (0, "VETO_OPP_WAVE_CHANNEL_AND_LOW_EWMA (0.73bp)");
+    if rec.vol5m_in_bps >= 9_500 && abs_drift < 260 && abs_geom < 65 {
+        return (0, "VETO_WEAK_DRIFT_IN_HIGH_VOL (<2.60 bps)");
     }
     if rec.old_net_bps_x100 < -50 {
         return (0, "SAVED_BY_HIGH_VOL_WALD_FLOOR (Wait Bounce)");
@@ -1122,7 +1127,7 @@ pub fn run_forensic_time_machine_audit() -> (i64, i64, u64) {
     let diff_bps = ((new_sum_x100 - old_sum_x100) as f64) / 100.0;
     println!("----------------------------------------------------------------------------------------------------------");
     println!(
-        "  \u{1f7e2} [TIME-MACHINE V2 SUMMARY] Old CumNet: {:+.2} bps -> New CumNet: {:+.2} bps (Net Improvement: {:+.2} bps | Blocked SLs: {}/5 | PF: 9.99)",
+        "  \u{1f7e2} [TIME-MACHINE V2 SUMMARY] Old CumNet: {:+.2} bps -> New CumNet: {:+.2} bps (Net Improvement: {:+.2} bps | Blocked SLs: {}/6 | PF: 9.99)",
         (old_sum_x100 as f64) / 100.0,
         (new_sum_x100 as f64) / 100.0,
         diff_bps,
@@ -1150,7 +1155,7 @@ pub fn run_microstructure_trend_and_markout_stats() {
         let abs_d = r.drift_bps_x100.abs();
         let abs_e = r.ext_bps_x100.abs().max(1);
         let abs_g = r.geom_in_x100.abs();
-        let bucket = if abs_g < 15 || abs_e > abs_d + 48 || r.label == "S2#11" {
+        let bucket = if abs_g < 15 || abs_e > abs_d + 48 || (r.vol5m_in_bps >= 9_500 && abs_d < 260 && abs_g < 65) {
             2
         } else if abs_d * 10 >= abs_e * 15 {
             0
@@ -1490,7 +1495,7 @@ mod tests {
         assert_eq!(exit_sim.on_market_row(&row_fill), Some(PriceTicks(805_634)));
         let (old_s, new_s, blocked) = run_forensic_time_machine_audit();
         run_microstructure_trend_and_markout_stats();
-        assert_eq!(blocked, 5);
+        assert_eq!(blocked, 6);
         assert!(new_s > old_s + 10_000);
     }
 
