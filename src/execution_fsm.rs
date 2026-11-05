@@ -1892,19 +1892,25 @@ impl OnlineAdaptiveGovernor {
         {
             return Some("VETO_GLOBAL_WAVE_OR_SL_BREATHER");
         }
+        let raw_e_slot = self.ewma_net_bps_x100[slot_idx][d];
+        let learned_e_slot = if raw_e_slot < -100 {
+            -100
+        } else if raw_e_slot > 250 {
+            250
+        } else {
+            raw_e_slot
+        };
         let exit_anc_1e4 = self.last_exit_px_1e4[slot_idx][d];
         if exit_anc_1e4 > 0 && cur_1e4 > 0 && self.wave_step_count[slot_idx][d] >= 1 {
             let beyond_exit_bps = match side {
                 Side::Bid => ((cur_1e4 - exit_anc_1e4).saturating_mul(1_000_000)) / exit_anc_1e4,
                 Side::Ask => ((exit_anc_1e4 - cur_1e4).saturating_mul(1_000_000)) / exit_anc_1e4,
             };
-            let r_edge = self.ewma_net_bps_x100[slot_idx][d];
-            let l_edge = if r_edge < -100 { -100 } else if r_edge > 250 { 250 } else { r_edge };
             let fee_rt_bps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
             let elastic_shelf_cap = if self.win_streak[slot_idx][d] >= 1 {
-                ((fee_rt_bps * 3) / 2) + (l_edge / 2)
+                ((fee_rt_bps * 3) / 2) + (learned_e_slot / 2)
             } else {
-                ((fee_rt_bps * 4) / 5) + (l_edge / 4)
+                ((fee_rt_bps * 4) / 5) + (learned_e_slot / 4)
             };
             if beyond_exit_bps >= 0 && beyond_exit_bps <= elastic_shelf_cap {
                 return Some("VETO_WAVE_STAIRCASE_25BPS");
@@ -1920,55 +1926,8 @@ impl OnlineAdaptiveGovernor {
                 Side::Bid => ((cur_1e4 - abort_anc_1e4).saturating_mul(1_000_000)) / abort_anc_1e4,
                 Side::Ask => ((abort_anc_1e4 - cur_1e4).saturating_mul(1_000_000)) / abort_anc_1e4,
             };
-            let raw_e = self.ewma_net_bps_x100[slot_idx][d];
-            let clamped_e = if raw_e < -100 { -100 } else if raw_e > 250 { 250 } else { raw_e };
-            let elastic_abort_chase_cap = 1_600 + (clamped_e * 2);
-            if abort_chased_bps > elastic_abort_chase_cap {
+            if abort_chased_bps > 1_600 + (learned_e_slot * 2) {
                 return Some("VETO_RUNAWAY_ABORT_EXHAUSTION");
-            }
-        }
-        if anchor_1e4 > 0 && cur_1e4 > 0 {
-            let chased_bps = match side {
-                Side::Bid => ((cur_1e4 - anchor_1e4).saturating_mul(1_000_000)) / anchor_1e4,
-                Side::Ask => ((anchor_1e4 - cur_1e4).saturating_mul(1_000_000)) / anchor_1e4,
-            };
-            let raw_edge = self.ewma_net_bps_x100[slot_idx][d];
-            let learned_edge = if raw_edge < -100 {
-                -100
-            } else if raw_edge > 250 {
-                250
-            } else {
-                raw_edge
-            };
-            let elastic_stair_cap = 2_300 + learned_edge;
-            let elastic_single_cap = 3_300 + learned_edge;
-            let exhausted_scratch_cap = 550 + (learned_edge / 3);
-            let had_exhausted_scratch =
-                self.wave_step_count[slot_idx][d] > self.win_streak[slot_idx][d];
-            let raw_e_sc = self.ewma_net_bps_x100[slot_idx][d];
-            let l_edge_sc = if raw_e_sc < -100 {
-                -100
-            } else if raw_e_sc > 270 {
-                270
-            } else {
-                raw_e_sc
-            };
-            if self.win_streak[slot_idx][d] == 0
-                && self.wave_step_count[slot_idx][d] >= 1
-                && raw_e_sc < 175
-                && chased_bps > (1_550 + l_edge_sc)
-            {
-                return Some("VETO_WAVE_STAIRCASE_25BPS");
-            }
-            let active_cross_slot_staircase =
-                self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
-            if (self.win_streak[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
-                || (active_cross_slot_staircase && chased_bps > elastic_stair_cap)
-                || (self.win_streak[slot_idx][d] >= 1 && chased_bps > elastic_single_cap)
-                || (self.wave_step_count[slot_idx][d] >= 2 && chased_bps > elastic_stair_cap)
-                || (had_exhausted_scratch && chased_bps > exhausted_scratch_cap)
-            {
-                return Some("VETO_WAVE_STAIRCASE_25BPS");
             }
         }
         let chased_from_anc_bps = if anchor_1e4 > 0 && cur_1e4 > 0 {
@@ -1979,14 +1938,37 @@ impl OnlineAdaptiveGovernor {
         } else {
             0
         };
-        let raw_e_slot = self.ewma_net_bps_x100[slot_idx][d];
-        let learned_e_slot = if raw_e_slot < -100 {
-            -100
-        } else if raw_e_slot > 250 {
-            250
-        } else {
-            raw_e_slot
-        };
+        if anchor_1e4 > 0 && cur_1e4 > 0 {
+            let elastic_stair_cap = 2_300 + learned_e_slot;
+            let elastic_single_cap = 3_300 + learned_e_slot;
+            let exhausted_scratch_cap = 550 + (learned_e_slot / 3);
+            let had_exhausted_scratch =
+                self.wave_step_count[slot_idx][d] > self.win_streak[slot_idx][d];
+            let l_edge_sc = if raw_e_slot < -100 {
+                -100
+            } else if raw_e_slot > 270 {
+                270
+            } else {
+                raw_e_slot
+            };
+            if self.win_streak[slot_idx][d] == 0
+                && self.wave_step_count[slot_idx][d] >= 1
+                && raw_e_slot < 175
+                && chased_from_anc_bps > (1_550 + l_edge_sc)
+            {
+                return Some("VETO_WAVE_STAIRCASE_25BPS");
+            }
+            let active_cross_slot_staircase =
+                self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
+            if (self.win_streak[slot_idx][d] >= 2 && chased_from_anc_bps > elastic_stair_cap)
+                || (active_cross_slot_staircase && chased_from_anc_bps > elastic_stair_cap)
+                || (self.win_streak[slot_idx][d] >= 1 && chased_from_anc_bps > elastic_single_cap)
+                || (self.wave_step_count[slot_idx][d] >= 2 && chased_from_anc_bps > elastic_stair_cap)
+                || (had_exhausted_scratch && chased_from_anc_bps > exhausted_scratch_cap)
+            {
+                return Some("VETO_WAVE_STAIRCASE_25BPS");
+            }
+        }
         let scar_stair_cap = 1_150 + (learned_e_slot / 2);
         if self.sl_streak[slot_idx][d] >= 1
             && (self.cum_net_bps_x100[slot_idx][d] <= -4_200

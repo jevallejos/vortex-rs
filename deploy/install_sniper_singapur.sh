@@ -21,7 +21,7 @@ ARCH_DIR="${DATA_DIR}/archive_voragine_v02_record23"
 mkdir -p "${ARCH_DIR}"
 if [ -f "${SEED_V}" ]; then
     cp -f "${SEED_V}" "${ARCH_DIR}/forensic_vault_221_historico.jsonl"
-    echo "[VAULT ARCHIVE] 221 historical trades (36/36 LOSS-LAB) sealed in ${ARCH_DIR}."
+    echo "[VAULT ARCHIVE] 222 historical trades (37/37 LOSS-LAB) sealed in ${ARCH_DIR}."
 fi
 
 TARGET_SHA=$(git rev-parse HEAD)
@@ -157,6 +157,10 @@ case "${1:-live}" in
         echo "=== [VORTEX FORENSIC VAULT V2 (38 METRICS)] ==="
         cat "${VORTEX_DIR}/data/vault/vortex_ai_forensic_vault.jsonl" 2>/dev/null || true
         ;;
+    redbox|-rb)
+        echo "=== [VORTEX RED LOSS FORENSIC BOX (54 METRICS)] ==="
+        cat "${VORTEX_DIR}/data/vault/vortex_red_loss_box.jsonl" 2>/dev/null || echo "  (0 Red Losses recorded in data/vault/vortex_red_loss_box.jsonl)"
+        ;;
     timemachine|-tm)
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_replay" --timemachine
         ;;
@@ -173,7 +177,7 @@ case "${1:-live}" in
         "${BIN_DIR}/vortex_exec"
         ;;
     *)
-        echo "Usage: vortex {360|live|-f|follow|trades|status|logs|audit|replay|baul|timemachine|stats|oos|all}"
+        echo "Usage: vortex {360|live|-f|follow|trades|status|logs|audit|replay|baul|redbox|timemachine|stats|oos|all}"
         exit 1
         ;;
 esac

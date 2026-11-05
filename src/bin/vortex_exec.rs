@@ -1894,7 +1894,12 @@ fn print_live_shm_hud() -> ExitCode {
         2 => (ANSI_YELLOW, "\u{1f7e1}", "RESTING_L1_QUEUE"),
         3 => (ANSI_YELLOW, "\u{1f7e1}", "POSITION_OPEN_MAKER_TP"),
         4 => (ANSI_RED, "\u{1f534}", "EMERGENCY_SL"),
-        _ => (ANSI_RED, "\u{1f534}", "HALTED_GUARD"),
+        _ => (ANSI_RED, "\u{1f7e3}", "HALTED_ON_LOSS"),
+    };
+    let (disp_en, disp_pk, disp_tp, disp_sl) = if state_code == 0 {
+        (0, 0, 0, 0)
+    } else {
+        (entry_ticks, peak_ticks, tp_ticks, sl_ticks)
     };
     let sec_fsm = vec![
         format!(
@@ -1905,10 +1910,10 @@ fn print_live_shm_hud() -> ExitCode {
             ANSI_RESET,
             if state_code == 0 { "-" } else { active_sym.name() },
             if state_code == 0 { "-" } else { side_str },
-            entry_ticks,
-            peak_ticks,
-            tp_ticks,
-            sl_ticks,
+            disp_en,
+            disp_pk,
+            disp_tp,
+            disp_sl,
             q_ahead
         ),
         format!(
@@ -1927,6 +1932,14 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         Err(_) => return ExitCode::from(9),
     };
     let arena = region.arena();
+    if Path::new("data/vault/HALTED_ON_LOSS.lock").exists() {
+        arena.exec_state_code.store(5, Ordering::Release);
+        println!(
+            "{}\u{1f7e3} [HALTED_ON_LOSS LOCK ACTIVE] data/vault/HALTED_ON_LOSS.lock present \u{2014} refusing to arm orders until audited.{}",
+            ANSI_RED, ANSI_RESET
+        );
+        return ExitCode::SUCCESS;
+    }
     let tg_tx = spawn_async_telegram_notifier(live_capital_enabled);
     let live_client = BybitV5LiveClient::from_env_if_enabled(live_capital_enabled);
 
@@ -1945,15 +1958,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut exit_peg_attempts: u32 = 0;
     let mut entry_forensic = ForensicEntrySnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
-
-    if Path::new("data/vault/HALTED_ON_LOSS.lock").exists() {
-        arena.exec_state_code.store(5, Ordering::Release);
-        println!(
-            "{}\u{1f7e3} [HALTED_ON_LOSS LOCK ACTIVE] data/vault/HALTED_ON_LOSS.lock present \u{2014} refusing to arm orders until audited.{}",
-            ANSI_RED, ANSI_RESET
-        );
-        return ExitCode::SUCCESS;
-    }
     rehydrate_shadow_ledger(&mut ledger, &mut fsm, &mut adaptive_gov, arena);
 
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
@@ -2535,6 +2539,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 snap.ts_local_ns,
                                 &mut ledger,
                             );
+                            let qty_s = compute_optimal_50usdt_wallet_qty_str(
+                                spec.symbol_id,
+                                adaptive_gov.is_in_scar_debt(active_slot, summary.side),
+                            );
                             adaptive_gov.seed_historical_price(
                                 active_slot,
                                 summary.side,
@@ -2554,13 +2562,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             last_pegged_exit_price = PriceTicks(0);
                             arena.exec_closed_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(0, Ordering::Release);
+                            arena.exec_entry_ticks.store(0, Ordering::Release);
                             arena.exec_peak_ticks.store(0, Ordering::Release);
                             arena.exec_tp_ticks.store(0, Ordering::Release);
                             arena.exec_sl_ticks.store(0, Ordering::Release);
-                            let qty_s = compute_optimal_50usdt_wallet_qty_str(
-                                spec.symbol_id,
-                                adaptive_gov.is_in_scar_debt(active_slot, summary.side),
-                            );
                             append_shadow_trade_jsonl(
                                 snap.symbol_id.name(),
                                 active_slot,
@@ -2587,7 +2592,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 * 10_000.0;
                             let cum_pct_1x = cum_bps / 100.0;
                             let cum_pct_10x = cum_bps / 10.0;
-                            let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, adaptive_gov.is_in_scar_debt(active_slot, summary.side));
+                            let qty_str = qty_s;
                             let (c_col, c_icon, c_badge) = classify_pnl_badge(net_bps);
 
                             println!(

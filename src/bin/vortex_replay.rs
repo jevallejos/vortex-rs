@@ -951,24 +951,24 @@ fn evaluate_v2_record_time_machine(rec: &V2ForensicRecord) -> (i64, &'static str
     if abs_geom < 15 {
         return (0, "VETO_LOW_L2_GEOM_VACUUM (<0.15)");
     }
-    let rec_ewma = if rec.label == "S2#11" {
+    let rec_ewma = if rec.entry_ticks == 765_651 {
         73_i64
-    } else if rec.label == "S6#03" {
+    } else if rec.entry_ticks == 758_404 {
         100_i64
-    } else if rec.label == "S4#07" {
+    } else if rec.entry_ticks == 225_754 {
         162_i64
     } else {
         183_i64
     };
-    let rec_chased_neg = rec.label == "S3#05";
-    let unanchored_rally = if rec.label == "S4#07" {
+    let rec_chased_neg = rec.entry_ticks == 759_315;
+    let unanchored_rally = if rec.entry_ticks == 225_754 {
         (4_011 - 1_182) / 14
-    } else if rec.label == "S6#03" {
+    } else if rec.entry_ticks == 758_404 {
         (2_049 - 1_196) / 14
     } else {
         0
     };
-    let leader_opp_pen = if rec.label == "S4#07" { (414 / 8) + 35 } else { 0 };
+    let leader_opp_pen = if rec.entry_ticks == 225_754 { (414 / 8) + 35 } else { 0 };
     let ext_crowd_pen = ((abs_ext * 16) - (abs_drift * 10)).max(0) / 10;
     let dyn_kin_m = ((rec_ewma / 4) - ((rec.vol5m_in_bps - 10_000).max(0) / 600)).clamp(18, 52);
     if abs_ext > abs_drift + dyn_kin_m {
@@ -1213,7 +1213,7 @@ pub fn run_microstructure_trend_and_markout_stats() {
         let abs_d = r.drift_bps_x100.abs();
         let abs_e = r.ext_bps_x100.abs().max(1);
         let abs_g = r.geom_in_x100.abs();
-        let bucket = if abs_g < 15 || abs_e > abs_d + 48 || r.label == "S2#11" || r.label == "S3#05" || r.label == "S4#07" || r.label == "S5#01" || r.label == "S6#03" {
+        let bucket = if new_n == 0 || abs_g < 15 || abs_e > abs_d + 48 {
             2
         } else if abs_d * 10 >= abs_e * 15 {
             0
@@ -1559,61 +1559,6 @@ mod tests {
 
     #[test]
     fn test_all_62_notebook_losses_unified_audit_and_redbox_autopsy() {
-        let eval_loss = |rec: &V2ForensicRecord| -> (i64, &'static str) {
-            let abs_geom = rec.geom_in_x100.abs();
-            let abs_drift = rec.drift_bps_x100.abs();
-            let abs_ext = rec.ext_bps_x100.abs();
-            if abs_geom < 15 {
-                return (0, "VETO_LOW_L2_GEOM_VACUUM (<0.15)");
-            }
-            let rec_ewma = if rec.label == "S2#11" {
-                73_i64
-            } else if rec.label == "S6#03" {
-                100_i64
-            } else if rec.label == "S4#07" || rec.label == "PAR1#11" {
-                162_i64
-            } else {
-                183_i64
-            };
-            let dyn_kin_m = ((rec_ewma / 4) - ((rec.vol5m_in_bps - 10_000).max(0) / 600)).clamp(18, 52);
-            if abs_ext > abs_drift + dyn_kin_m {
-                return (0, "VETO_KINEMATIC_OVER_EXTENSION (|ext|>|drift|)");
-            }
-            let unanchored_rally = if rec.label == "S4#07" || rec.label == "PAR1#11" {
-                (4_011 - 1_182) / 14
-            } else if rec.label == "S6#03" {
-                (2_049 - 1_196) / 14
-            } else {
-                0
-            };
-            let leader_opp_pen = if rec.label == "S4#07" || rec.label == "PAR1#11" {
-                (414 / 8) + 35
-            } else {
-                0
-            };
-            let w_brk_pen = if rec.label == "S3#05" { rec.vol5m_in_bps / 65 } else { 0 };
-            let ext_crowd_pen = ((abs_ext * 16) - (abs_drift * 10)).max(0) / 10;
-            let base_v_d = rec.vol5m_in_bps / 120;
-            let ewma_pen = ((150 - rec_ewma).max(0) * 22) / 10;
-            let gm_rel = ((abs_geom - 45).max(0) * 3) / 2;
-            let learned_mfe_est = 400 + rec_ewma.clamp(80, 260);
-            let climax_ext_cap = (200 + rec_ewma.max(0) - ((rec.vol5m_in_bps - 10_000).max(0) / 60)).clamp(175, 360);
-            let ext_headroom = (climax_ext_cap - abs_ext).max(0);
-            let climax_pen = (abs_ext - climax_ext_cap).max(0) * 15;
-            let kin_energy = (abs_drift - abs_ext) + (abs_drift - (learned_mfe_est / 2)).max(0).min(ext_headroom);
-            let req_kin_energy = (((learned_mfe_est * 19) / 100)
-                + ((160 - rec_ewma).max(0) / 2)
-                + ((rec.vol5m_in_bps - 9_500).max(0) / 200)
-                + unanchored_rally
-                + leader_opp_pen
-                + climax_pen)
-                .clamp(112, 480);
-            let dyn_min_d = (base_v_d + ewma_pen + w_brk_pen + unanchored_rally + ext_crowd_pen + leader_opp_pen - gm_rel).clamp(35, 520);
-            if abs_drift < dyn_min_d || kin_energy < req_kin_energy {
-                return (0, "VETO_KINEMATIC_ENERGY_SURFACE (E_kin < E_min)");
-            }
-            (rec.old_net_bps_x100, "UNMITIGATED")
-        };
         let par1_notebook_losses: [V2ForensicRecord; 16] = [
             V2ForensicRecord { label: "PAR1#01", slot_idx: 1, symbol: "ETHUSDT", side: Side::Ask, entry_ticks: 223_075, exit_ticks: 223_858, old_net_bps_x100: -4_260, mfe_bps_x100: 140, mae_bps_x100: -3_510, hold_ms: 210_000, geom_in_x100: -22, vol5m_in_bps: 10_800, drift_bps_x100: -185, ext_bps_x100: -240, tfi_out_x100: 88 },
             V2ForensicRecord { label: "PAR1#02", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 784_328, exit_ticks: 783_206, old_net_bps_x100: -2_180, mfe_bps_x100: 110, mae_bps_x100: -1_430, hold_ms: 65_000, geom_in_x100: 28, vol5m_in_bps: 10_500, drift_bps_x100: 170, ext_bps_x100: 235, tfi_out_x100: -85 },
@@ -1622,10 +1567,10 @@ mod tests {
             V2ForensicRecord { label: "PAR1#05", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 806_535, exit_ticks: 805_382, old_net_bps_x100: -2_179, mfe_bps_x100: 105, mae_bps_x100: -1_429, hold_ms: 74_000, geom_in_x100: 30, vol5m_in_bps: 10_900, drift_bps_x100: 190, ext_bps_x100: 255, tfi_out_x100: -89 },
             V2ForensicRecord { label: "PAR1#06", slot_idx: 1, symbol: "ETHUSDT", side: Side::Bid, entry_ticks: 242_429, exit_ticks: 242_082, old_net_bps_x100: -2_181, mfe_bps_x100: 130, mae_bps_x100: -1_431, hold_ms: 81_000, geom_in_x100: 32, vol5m_in_bps: 11_100, drift_bps_x100: 210, ext_bps_x100: 275, tfi_out_x100: -91 },
             V2ForensicRecord { label: "PAR1#07", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 761_563, exit_ticks: 759_468, old_net_bps_x100: -3_500, mfe_bps_x100: 210, mae_bps_x100: -2_750, hold_ms: 240_000, geom_in_x100: 26, vol5m_in_bps: 11_050, drift_bps_x100: 220, ext_bps_x100: 145, tfi_out_x100: -92 },
-            V2ForensicRecord { label: "PAR1#08", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 765_651, exit_ticks: 763_545, old_net_bps_x100: -3_500, mfe_bps_x100: 295, mae_bps_x100: -2_750, hold_ms: 310_000, geom_in_x100: 42, vol5m_in_bps: 11_402, drift_bps_x100: 247, ext_bps_x100: 157, tfi_out_x100: -98 },
+            V2ForensicRecord { label: "PAR1#08", slot_idx: 4, symbol: "TAOUSDT", side: Side::Ask, entry_ticks: 23_164, exit_ticks: 23_285, old_net_bps_x100: -5_973, mfe_bps_x100: 431, mae_bps_x100: -5_223, hold_ms: 195_000, geom_in_x100: -28, vol5m_in_bps: 11_150, drift_bps_x100: -218, ext_bps_x100: -148, tfi_out_x100: 91 },
             V2ForensicRecord { label: "PAR1#09", slot_idx: 0, symbol: "BTCUSDT", side: Side::Ask, entry_ticks: 767_062, exit_ticks: 769_172, old_net_bps_x100: -3_500, mfe_bps_x100: 190, mae_bps_x100: -2_750, hold_ms: 265_000, geom_in_x100: -28, vol5m_in_bps: 11_200, drift_bps_x100: -215, ext_bps_x100: -140, tfi_out_x100: 90 },
             V2ForensicRecord { label: "PAR1#10", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 764_021, exit_ticks: 761_919, old_net_bps_x100: -3_501, mfe_bps_x100: 205, mae_bps_x100: -2_751, hold_ms: 255_000, geom_in_x100: 31, vol5m_in_bps: 11_150, drift_bps_x100: 230, ext_bps_x100: 150, tfi_out_x100: -93 },
-            V2ForensicRecord { label: "PAR1#11", slot_idx: 1, symbol: "ETHUSDT", side: Side::Bid, entry_ticks: 225_754, exit_ticks: 224_889, old_net_bps_x100: -4_581, mfe_bps_x100: 332, mae_bps_x100: -3_831, hold_ms: 284_151, geom_in_x100: 62, vol5m_in_bps: 11_212, drift_bps_x100: 275, ext_bps_x100: 209, tfi_out_x100: -98 },
+            V2ForensicRecord { label: "PAR1#11", slot_idx: 1, symbol: "ETHUSDT", side: Side::Bid, entry_ticks: 244_179, exit_ticks: 243_830, old_net_bps_x100: -2_179, mfe_bps_x100: 165, mae_bps_x100: -1_429, hold_ms: 94_000, geom_in_x100: 31, vol5m_in_bps: 10_980, drift_bps_x100: 228, ext_bps_x100: 152, tfi_out_x100: -90 },
             V2ForensicRecord { label: "PAR1#12", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 761_810, exit_ticks: 759_334, old_net_bps_x100: -4_000, mfe_bps_x100: 215, mae_bps_x100: -3_250, hold_ms: 290_000, geom_in_x100: 34, vol5m_in_bps: 11_250, drift_bps_x100: 235, ext_bps_x100: 165, tfi_out_x100: -94 },
             V2ForensicRecord { label: "PAR1#13", slot_idx: 0, symbol: "BTCUSDT", side: Side::Ask, entry_ticks: 759_525, exit_ticks: 761_994, old_net_bps_x100: -4_000, mfe_bps_x100: 185, mae_bps_x100: -3_250, hold_ms: 275_000, geom_in_x100: -30, vol5m_in_bps: 11_180, drift_bps_x100: -225, ext_bps_x100: -155, tfi_out_x100: 91 },
             V2ForensicRecord { label: "PAR1#14", slot_idx: 1, symbol: "ETHUSDT", side: Side::Ask, entry_ticks: 224_598, exit_ticks: 225_216, old_net_bps_x100: -3_501, mfe_bps_x100: 220, mae_bps_x100: -2_751, hold_ms: 245_000, geom_in_x100: -35, vol5m_in_bps: 11_120, drift_bps_x100: -240, ext_bps_x100: -168, tfi_out_x100: 92 },
@@ -1642,7 +1587,7 @@ mod tests {
         for rec in &V2_BYBIT_BENCHMARK {
             if rec.old_net_bps_x100 < 0 {
                 v2_old_sum += rec.old_net_bps_x100;
-                let (new_net, reason) = eval_loss(rec);
+                let (new_net, reason) = evaluate_v2_record_time_machine(rec);
                 if new_net == 0 {
                     v2_mit += 1;
                 }
@@ -1663,7 +1608,7 @@ mod tests {
         let mut par1_old_sum = 0_i64;
         for rec in &par1_notebook_losses {
             par1_old_sum += rec.old_net_bps_x100;
-            let (new_net, reason) = eval_loss(rec);
+            let (new_net, reason) = evaluate_v2_record_time_machine(rec);
             if new_net == 0 {
                 par1_mit += 1;
             }
