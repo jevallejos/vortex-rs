@@ -2285,7 +2285,15 @@ impl OnlineAdaptiveGovernor {
         let abort_p = i64::from(self.abort_streak[slot_idx][d].min(4));
         let _ = sym_debt_abs;
         let sym_debt_abs = (-self.cum_net_bps_x100[slot_idx][d]).max(0);
-        if self.sl_streak[slot_idx][d] >= 1 && (sym_debt_abs >= 1_800 || learned_edge <= -150) {
+        let since_sl_ns = candidate_snap.ts_local_ns.0.saturating_sub(self.last_sl_ts_ns);
+        let elastic_sl_quarantine_ns =
+            (sym_debt_abs.saturating_mul(180_000_000)).clamp(300_000_000_000, 900_000_000_000);
+        if self.sl_streak[slot_idx][d] >= 1
+            && (sym_debt_abs >= 1_800 || learned_edge <= -150)
+            && (since_sl_ns <= elastic_sl_quarantine_ns
+                || candidate_snap.factor_tfi.get().abs() < 0.55
+                || candidate_snap.factor_geom.get().abs() < 0.22)
+        {
             return false;
         }
         let base_drift = (((300 - learned_edge).max(110)) * self_vol) / 20_000;

@@ -1034,19 +1034,19 @@ fn format_forensic_vault_v2_json_line(
         .0
     };
     let pf_x100 = fsm.net_profit_factor_x100();
-    let armed_ts = if entry_forensic.armed_ts_ns > 0 {
-        entry_forensic.armed_ts_ns
-    } else if fsm.last_armed_ts.0 > 0 {
-        fsm.last_armed_ts.0
-    } else {
-        ts_ns
-    };
     let opened_ts = if entry_forensic.opened_ts_ns > 0 {
         entry_forensic.opened_ts_ns
     } else if fsm.last_opened_ts.0 > 0 {
         fsm.last_opened_ts.0
     } else {
-        armed_ts
+        ts_ns
+    };
+    let armed_ts = if entry_forensic.armed_ts_ns > 0 {
+        entry_forensic.armed_ts_ns
+    } else if fsm.last_armed_ts.0 > 0 {
+        fsm.last_armed_ts.0
+    } else {
+        opened_ts
     };
     let queue_wait_ms = (opened_ts.saturating_sub(armed_ts).max(0)) / 1_000_000;
     let hold_ms = (ts_ns.saturating_sub(opened_ts).max(0)) / 1_000_000;
@@ -1057,16 +1057,45 @@ fn format_forensic_vault_v2_json_line(
     } else {
         0.0
     };
-    let ofi_in = f64::from(entry_forensic.ofi_in_bps) / 10_000.0;
-    let tfi_in = f64::from(entry_forensic.tfi_in_bps) / 10_000.0;
-    let geom_in = f64::from(entry_forensic.geom_in_bps) / 10_000.0;
-    let snr_in = (entry_forensic.snr_in_bps as f64) / 10_000.0;
-    let vol5m_in = (entry_forensic.vol5m_in_bps as f64) / 100.0;
-    let btc_comp_in = (entry_forensic.btc_comp_in_bps as f64) / 10_000.0;
     let ofi_out = exit_snap.factor_ofi.get();
     let tfi_out = exit_snap.factor_tfi.get();
     let vol5m_out = (exit_snap.realized_vol_5m.raw() as f64) / 100.0;
-    let slot_mfe = (entry_forensic.slot_mfe_bps as f64) / 100.0;
+    let hot_restored = entry_forensic.vol5m_in_bps <= 0;
+    let ofi_in = if hot_restored {
+        ofi_out
+    } else {
+        f64::from(entry_forensic.ofi_in_bps) / 10_000.0
+    };
+    let tfi_in = if hot_restored {
+        tfi_out
+    } else {
+        f64::from(entry_forensic.tfi_in_bps) / 10_000.0
+    };
+    let geom_in = if hot_restored {
+        exit_snap.factor_geom.get()
+    } else {
+        f64::from(entry_forensic.geom_in_bps) / 10_000.0
+    };
+    let snr_in = if hot_restored {
+        OrthogonalFactorState::snr_composite_score(exit_snap)
+    } else {
+        (entry_forensic.snr_in_bps as f64) / 10_000.0
+    };
+    let vol5m_in = if hot_restored {
+        vol5m_out
+    } else {
+        (entry_forensic.vol5m_in_bps as f64) / 100.0
+    };
+    let btc_comp_in = if hot_restored {
+        snr_in
+    } else {
+        (entry_forensic.btc_comp_in_bps as f64) / 10_000.0
+    };
+    let slot_mfe = if entry_forensic.slot_mfe_bps > 0 {
+        (entry_forensic.slot_mfe_bps as f64) / 100.0
+    } else {
+        (fsm.learned_mfe_ewma_bps as f64) / 100.0
+    };
     let gov_ewma = (entry_forensic.gov_ewma_bps as f64) / 100.0;
     let drift_bps = (entry_forensic.drift_bps as f64) / 100.0;
     let ext_bps = (entry_forensic.ext_bps as f64) / 100.0;

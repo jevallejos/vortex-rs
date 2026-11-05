@@ -239,6 +239,8 @@ fn replay_captured_live_parquet_segments() {
 
     let evaluator = OrthogonalFactorState::new();
     let mut adaptive_gov = OnlineAdaptiveGovernor::new();
+    let mut shadow_history: Vec<(i64, usize, Side, i64, i64, i64, bool)> = Vec::new();
+    let mut shadow_cursor: usize = 0;
     if let Ok(sf) = std::fs::File::open("data/vortex_shadow_trades.jsonl") {
         use std::io::{BufRead, BufReader};
         for line in BufReader::new(sf).lines().map_while(Result::ok) {
@@ -262,14 +264,7 @@ fn replay_captured_live_parquet_segments() {
                 if let Some(s_i) = slot_opt {
                     let s_side = if side_s == "Ask" { Side::Ask } else { Side::Bid };
                     let net_sc = (net_bps * 100.0).round() as i64;
-                    adaptive_gov.seed_historical_price(s_i, s_side, en_t, ex_t);
-                    adaptive_gov.observe_closed_trade(
-                        s_i,
-                        s_side,
-                        ScaledBps(net_sc),
-                        is_mkr,
-                        TimestampNs(ts_s),
-                    );
+                    shadow_history.push((ts_s, s_i, s_side, en_t, ex_t, net_sc, is_mkr));
                 }
             }
         }
@@ -331,6 +326,21 @@ fn replay_captured_live_parquet_segments() {
                     match row.event_kind {
                         MarketEventKind::L2BookSnapshot => total_l2_events += 1,
                         MarketEventKind::PublicTradePrint => total_trade_prints += 1,
+                    }
+                    while shadow_cursor < shadow_history.len()
+                        && shadow_history[shadow_cursor].0 <= row.ts_local_ns.0
+                    {
+                        let (ts_s, s_i, s_side, en_t, ex_t, net_sc, is_mkr) =
+                            shadow_history[shadow_cursor];
+                        adaptive_gov.seed_historical_price(s_i, s_side, en_t, ex_t);
+                        adaptive_gov.observe_closed_trade(
+                            s_i,
+                            s_side,
+                            ScaledBps(net_sc),
+                            is_mkr,
+                            TimestampNs(ts_s),
+                        );
+                        shadow_cursor += 1;
                     }
                     if let Some((slot_idx, spec)) = spec_for_symbol(row.symbol_id) {
                         let mut snap = SymbolLobSnapshot {
