@@ -850,6 +850,43 @@ fn rehydrate_shadow_ledger(
     };
     let reader = BufReader::new(file);
     let mut restored_count: u64 = 0;
+    let mut seen_gov_ts: Vec<i64> = Vec::new();
+    if let Ok(sf) = File::open("data/vault/vortex_governor_scar_memory.jsonl") {
+        for sline in BufReader::new(sf).lines().map_while(Result::ok) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sline) {
+                let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                if ts_saved > 0 && !seen_gov_ts.contains(&ts_saved) {
+                    seen_gov_ts.push(ts_saved);
+                    let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                    let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                    let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
+                    let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
+                    let slot_opt = match sym_str {
+                        "BTCUSDT" => Some(0),
+                        "ETHUSDT" => Some(1),
+                        "SOLUSDT" => Some(2),
+                        "AVAXUSDT" => Some(3),
+                        "TAOUSDT" => Some(4),
+                        "SUIUSDT" => Some(5),
+                        _ => None,
+                    };
+                    if let Some(s_idx) = slot_opt {
+                        let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                        let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                        let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                        adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
+                        adaptive_gov.observe_closed_trade(
+                            s_idx,
+                            s_side,
+                            ScaledBps((net_bps * 100.0).round() as i64),
+                            is_maker,
+                            TimestampNs(ts_saved),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     for line in reader.lines().map_while(Result::ok) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -872,17 +909,22 @@ fn rehydrate_shadow_ledger(
                 _ => None,
             };
             if let Some(s_idx) = slot_opt {
-                let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
-                let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
-                adaptive_gov.observe_closed_trade(
-                    s_idx,
-                    s_side,
-                    ScaledBps(net_scaled_bps),
-                    is_maker,
-                    TimestampNs(ts_saved),
-                );
+                if ts_saved == 0 || !seen_gov_ts.contains(&ts_saved) {
+                    if ts_saved > 0 {
+                        seen_gov_ts.push(ts_saved);
+                    }
+                    let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                    let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
+                    adaptive_gov.observe_closed_trade(
+                        s_idx,
+                        s_side,
+                        ScaledBps(net_scaled_bps),
+                        is_maker,
+                        TimestampNs(ts_saved),
+                    );
+                }
             }
             let fee_scaled_bps: i64 = if is_maker { 400 } else { 750 };
             let gross_scaled_bps = net_scaled_bps + fee_scaled_bps;
@@ -1894,38 +1936,13 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut entry_forensic = ForensicEntrySnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
 
-    if let Ok(sf) = File::open("data/vault/vortex_governor_scar_memory.jsonl") {
-        for sline in BufReader::new(sf).lines().map_while(Result::ok) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sline) {
-                let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-                let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
-                let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
-                let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
-                let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                let slot_opt = match sym_str {
-                    "BTCUSDT" => Some(0),
-                    "ETHUSDT" => Some(1),
-                    "SOLUSDT" => Some(2),
-                    "AVAXUSDT" => Some(3),
-                    "TAOUSDT" => Some(4),
-                    "SUIUSDT" => Some(5),
-                    _ => None,
-                };
-                if let Some(s_idx) = slot_opt {
-                    let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
-                    let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                    let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                    adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
-                    adaptive_gov.observe_closed_trade(
-                        s_idx,
-                        s_side,
-                        ScaledBps((net_bps * 100.0).round() as i64),
-                        is_maker,
-                        TimestampNs(ts_saved),
-                    );
-                }
-            }
-        }
+    if Path::new("data/vault/HALTED_ON_LOSS.lock").exists() {
+        arena.exec_state_code.store(5, Ordering::Release);
+        println!(
+            "{}\u{1f7e3} [HALTED_ON_LOSS LOCK ACTIVE] data/vault/HALTED_ON_LOSS.lock present \u{2014} refusing to arm orders until audited.{}",
+            ANSI_RED, ANSI_RESET
+        );
+        return ExitCode::SUCCESS;
     }
     rehydrate_shadow_ledger(&mut ledger, &mut fsm, &mut adaptive_gov, arena);
 
@@ -2636,12 +2653,20 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 let _ = tx.try_send(alert);
                             }
                             if is_loss_halt {
+                                let _ = std::fs::create_dir_all("data/vault");
+                                let _ = std::fs::write(
+                                    "data/vault/HALTED_ON_LOSS.lock",
+                                    format!("HALTED_ON_LOSS sym={} net_bps={:+.2}\n", snap.symbol_id.name(), net_bps),
+                                );
                                 arena.exec_state_code.store(5, Ordering::Release);
                                 println!(
-                                    "{}\u{1f7e3} [AUTO-HALT CIRCUIT BREAKER] LOSS detected ({:+.2} bps) \u{2014} Purple Telegram alert dispatched. Stopping vortex-exec daemon safely.{}",
+                                    "{}\u{1f7e3} [AUTO-HALT CIRCUIT BREAKER] LOSS detected ({:+.2} bps) \u{2014} Lockfile written & Purple Telegram alert dispatched. Stopping vortex-exec.{}",
                                     ANSI_RED, net_bps, ANSI_RESET
                                 );
                                 std::thread::sleep(Duration::from_millis(2_000));
+                                let _ = std::process::Command::new("sudo")
+                                    .args(["systemctl", "stop", "vortex-exec.service"])
+                                    .spawn();
                                 return ExitCode::SUCCESS;
                             }
                         } else if let OrderLifecycleState::PositionOpenMakerExit {

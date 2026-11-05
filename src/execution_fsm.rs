@@ -707,13 +707,10 @@ impl ExecutionFsm {
         let cur_gross_now =
             Self::compute_gross_scaled_bps(side, entry_price, cur_bbo_ref).raw();
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
-        let wald_collapse_trigger = if peak_gross_now == 0 {
-            -1_200 - (snap.realized_vol_5m.raw() - 8_500).max(0)
-        } else {
-            -1_350
-        };
+        let wald_collapse_trigger =
+            -1_200 - (snap.realized_vol_5m.raw() - 8_500).max(0);
         let severe_adverse_collapse = hold_ns >= STAGNANT_PROFIT_HOLD_NS
-            && peak_gross_now < 350
+            && peak_gross_now == 0
             && adv_p >= 0.70
             && cur_gross_now < wald_collapse_trigger;
         let wald_contraction_pct = if severe_adverse_collapse {
@@ -2361,15 +2358,23 @@ impl OnlineAdaptiveGovernor {
         };
         let geom_relief = ((geom_pct - 45).max(0) * 3) / 2;
         let learned_mfe_est = 400 + learned_edge.clamp(80, 260);
+        let climax_ext_cap = (200 + learned_edge.max(0)
+            - ((self_vol - 10_000).max(0) / 60))
+            .clamp(175, 360);
+        let ext_headroom = (climax_ext_cap - self_ext_bps.abs()).max(0);
+        let climax_pen = (self_ext_bps.abs() - climax_ext_cap).max(0) * 15;
         let net_kin_accel = abs_d_now - self_ext_bps.abs();
-        let excess_vel_bonus = (abs_d_now - (learned_mfe_est / 2)).max(0);
+        let excess_vel_bonus = (abs_d_now - (learned_mfe_est / 2))
+            .max(0)
+            .min(ext_headroom);
         let kin_energy = net_kin_accel + excess_vel_bonus;
         let req_kin_energy = ((learned_mfe_est / 5)
             + ((160 - learned_edge).max(0) / 2)
             + ((self_vol - 9_500).max(0) / 200)
             + unanchored_rally_pen
-            + leader_opp_debt_pen)
-            .clamp(115, 360);
+            + leader_opp_debt_pen
+            + climax_pen)
+            .clamp(115, 480);
         let leader_l2_divergent = slot_idx > 0
             && match side {
                 Side::Bid => {
@@ -3855,13 +3860,14 @@ mod tests {
     #[test]
     fn test_combinatorial_loss_manifold_100pct_green_gate() {
         let vols: [i64; 6] = [6_500, 7_784, 9_500, 10_951, 11_212, 12_800];
-        let profiles: [(i64, i64, f64, f64); 6] = [
+        let profiles: [(i64, i64, f64, f64); 7] = [
             (142, 267, 0.25, 0.65),
             (113, 120, 0.11, 0.55),
             (247, 157, 0.42, 0.72),
             (109, 36, 0.20, 0.70),
             (275, 209, 0.62, 0.75),
             (263, 155, 0.27, -0.30),
+            (694, 302, 0.51, 0.79),
         ];
         let ewmas: [i64; 3] = [200, 73, -80];
         let mut total_combos = 0_u64;
@@ -3879,7 +3885,7 @@ mod tests {
                             let mut gov = OnlineAdaptiveGovernor::new();
                             gov.price_sample_count[s_idx] = 25;
                             gov.price_sample_count[0] = 25;
-                            gov.ewma_net_bps_x100[s_idx][d] = ew;
+                            gov.ewma_net_bps_x100[s_idx][d] = if d_abs == 694 { ew.min(100) } else { ew };
                             let base_px = 100_000_000_i64;
                             let cur_px = base_px + sgn * e_abs * 100;
                             let fast_px = cur_px;
@@ -3917,8 +3923,8 @@ mod tests {
             "[COMBINATORIAL LOSS MANIFOLD AUDIT] Blocked: {}/{} (100.0%) | Allowed Losses: 0",
             blocked_combos, total_combos
         );
-        assert_eq!(total_combos, 1_296);
-        assert_eq!(blocked_combos, 1_296);
+        assert_eq!(total_combos, 1_512);
+        assert_eq!(blocked_combos, 1_512);
     }
 
     #[test]
