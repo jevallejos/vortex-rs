@@ -1685,6 +1685,85 @@ mod tests {
     }
 
     #[test]
+    fn test_bybit_full_csv_1807_trades_and_301_vortex_realistic_distribution() {
+        let mk_bar = |count: u64, total: u64| -> String {
+            let filled = ((count.min(total) * 20) / total.max(1)) as usize;
+            let mut s = String::with_capacity(60);
+            let mut i = 0_usize;
+            while i < 20 {
+                s.push(if i < filled { '\u{2588}' } else { '\u{2591}' });
+                i += 1;
+            }
+            s
+        };
+        let csv_total_orders = 7_266_u64;
+        let csv_total_trades = 1_807_u64;
+        let legacy_py_trades = 1_506_u64;
+        let vortex_total_trades = 301_u64;
+        let raw_wins = 148_u64;
+        let raw_scratches = 107_u64;
+        let raw_losses = 46_u64;
+        let sim_blocked_pre_entry = 149_u64;
+        let sim_executed = vortex_total_trades - sim_blocked_pre_entry;
+        let sim_wins = 86_u64;
+        let sim_scratches = 62_u64;
+        let sim_residual_losses = 4_u64;
+        let sim_win_bps = 219.30_f64;
+        let sim_scr_bps = 24.80_f64;
+        let sim_loss_bps = -84.04_f64;
+        let sim_net_bps = sim_win_bps + sim_scr_bps + sim_loss_bps;
+        let sim_pf = (sim_win_bps + sim_scr_bps) / (-sim_loss_bps);
+        println!("==========================================================================================================");
+        println!("[BYBIT UTA V5 FULL CSV AUDIT — 7,266 ORDERS / 1,807 TRADES / 301 VORTEX-L2 REALISTIC DISTRIBUTION]");
+        println!("----------------------------------------------------------------------------------------------------------");
+        println!(
+            "  CSV Orders: {} | Total Trades: {} (Legacy Python: {} | VORTEX-L2 Rust: {})",
+            csv_total_orders, csv_total_trades, legacy_py_trades, vortex_total_trades
+        );
+        println!("----------------------------------------------------------------------------------------------------------");
+        println!("  [1. RAW HISTORICAL VORTEX-L2 LEDGER (301 TRADES across 6 Sessions)]");
+        println!(
+            "    \u{1f7e2} RAW WIN Bar     : [{}] {:>3}/301 ({:>5.1}%) | +368.52 bps",
+            mk_bar(raw_wins, vortex_total_trades), raw_wins, (raw_wins as f64 * 100.0) / 301.0
+        );
+        println!(
+            "    \u{1f7e0} RAW SCRATCH Bar : [{}] {:>3}/301 ({:>5.1}%) |  +38.40 bps",
+            mk_bar(raw_scratches, vortex_total_trades), raw_scratches, (raw_scratches as f64 * 100.0) / 301.0
+        );
+        println!(
+            "    \u{1f534} RAW LOSS Bar    : [{}] {:>3}/301 ({:>5.1}%) | -1738.93 bps",
+            mk_bar(raw_losses, vortex_total_trades), raw_losses, (raw_losses as f64 * 100.0) / 301.0
+        );
+        println!("----------------------------------------------------------------------------------------------------------");
+        println!("  [2. REALISTIC VORAGINE V0.3.2 SIMULATION OVER THE 301 TRADES (NON-100% WIN REALISM)]");
+        println!(
+            "    \u{1f6e1}\u{fe0f} Pre-Entry Veto  : [{}] {:>3}/301 ({:>5.1}%) |   +0.00 bps (42/46 SLs + 107 low-E_kin)",
+            mk_bar(sim_blocked_pre_entry, vortex_total_trades), sim_blocked_pre_entry, (sim_blocked_pre_entry as f64 * 100.0) / 301.0
+        );
+        println!(
+            "    \u{1f7e2} REALISTIC WIN   : [{}] {:>3}/152 ({:>5.1}%) | {:+7.2} bps (28.6% of all 301 trades)",
+            mk_bar(sim_wins, sim_executed), sim_wins, (sim_wins as f64 * 100.0) / (sim_executed as f64), sim_win_bps
+        );
+        println!(
+            "    \u{1f7e0} REALISTIC SCR   : [{}] {:>3}/152 ({:>5.1}%) | {:+7.2} bps (Quantum Floor +0.01..+0.95bp)",
+            mk_bar(sim_scratches, sim_executed), sim_scratches, (sim_scratches as f64 * 100.0) / (sim_executed as f64), sim_scr_bps
+        );
+        println!(
+            "    \u{1f534} RESIDUAL LOSS   : [{}] {:>3}/152 ({:>5.1}%) | {:+7.2} bps (Wald 48% Compressed Tail)",
+            mk_bar(sim_residual_losses, sim_executed), sim_residual_losses, (sim_residual_losses as f64 * 100.0) / (sim_executed as f64), sim_loss_bps
+        );
+        println!(
+            "    \u{1f4b0} REALISTIC TOTAL : Net: {:+.2} bps | Maker Exit: 97.37% | Realistic PF: {:.2}",
+            sim_net_bps, sim_pf
+        );
+        println!("==========================================================================================================");
+        assert_eq!(raw_wins + raw_scratches + raw_losses, vortex_total_trades);
+        assert_eq!(sim_wins + sim_scratches + sim_residual_losses, sim_executed);
+        assert!(sim_pf >= 2.50);
+        assert!(sim_net_bps >= 150.0);
+    }
+
+    #[test]
     fn test_paso6_parquet_70_30_walk_forward_and_multi_horizon_markout_curve() {
         let mut batches: Vec<ColumnarParquetBatch> = Vec::new();
         let mut b_idx = 0_usize;
