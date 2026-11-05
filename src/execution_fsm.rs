@@ -732,8 +732,9 @@ impl ExecutionFsm {
         } else {
             self.max_wald_contraction_pct
         };
+        let vol_sl_ref = snap.realized_vol_5m.raw().clamp(3_800, 12_500);
         let min_sl_floor_bps = if severe_adverse_collapse {
-            1_350
+            (1_350 + ((vol_sl_ref - 6_200).max(0) / 4)).clamp(1_350, 2_450)
         } else {
             (2_250 + (peak_gross_now / 3)).clamp(2_250, 2_550)
         };
@@ -2282,6 +2283,8 @@ impl OnlineAdaptiveGovernor {
         let sym_net_x100 = self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
         let sym_debt_abs = (-sym_net_x100).max(0);
         let abort_p = i64::from(self.abort_streak[slot_idx][d].min(4));
+        let _ = sym_debt_abs;
+        let sym_debt_abs = (-self.cum_net_bps_x100[slot_idx][d]).max(0);
         let base_drift = (((300 - learned_edge).max(110)) * self_vol) / 20_000;
         let min_trend_drift = (base_drift + (sym_debt_abs / 80) + (abort_p * 8)).max(32);
         let max_self_ext = ((self_vol / 22) + (learned_edge / 5)
