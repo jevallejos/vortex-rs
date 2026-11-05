@@ -705,7 +705,7 @@ impl ExecutionFsm {
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
         let severe_adverse_collapse =
             hold_ns >= STAGNANT_PROFIT_HOLD_NS && adv_p >= 0.70 && cur_gross_now < -1_200;
-        let early_adverse_stall = hold_ns > wald_grace_ns
+        let early_adverse_stall = hold_ns >= STAGNANT_PROFIT_HOLD_NS
             && peak_gross_now < 550
             && cur_gross_now < -450
             && adv_p >= 0.25;
@@ -730,7 +730,7 @@ impl ExecutionFsm {
         } else {
             self.max_wald_contraction_pct
         };
-        let min_sl_floor_bps = if severe_adverse_collapse { 1_350 } else { 2_150 };
+        let min_sl_floor_bps = if severe_adverse_collapse { 1_350 } else { 2_250 };
         let min_noise_sl_dist = ((entry_price.0 * min_sl_floor_bps) / 1_000_000).max(4);
         let eff_sl_dist = ((base_sl_dist * (100 - wald_contraction_pct)) / 100)
             .max(min_noise_sl_dist);
@@ -2251,8 +2251,8 @@ impl OnlineAdaptiveGovernor {
         let sym_net_x100 = self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];
         let sym_debt_abs = (-sym_net_x100).max(0);
         let abort_p = i64::from(self.abort_streak[slot_idx][d].min(4));
-        let base_drift = (((260 - learned_edge).max(60)) * self_vol) / 26_000;
-        let min_trend_drift = (base_drift + (sym_debt_abs / 80) + (abort_p * 5)).max(10);
+        let base_drift = (((300 - learned_edge).max(110)) * self_vol) / 20_000;
+        let min_trend_drift = (base_drift + (sym_debt_abs / 80) + (abort_p * 8)).max(32);
         let max_self_ext = ((self_vol / 22) + (learned_edge / 5)
             - (sym_debt_abs / 20)
             - (abort_p * 25))
