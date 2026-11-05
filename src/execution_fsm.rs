@@ -972,7 +972,9 @@ impl ExecutionFsm {
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= elastic_scratch_ns
                 && current_gross_bps.raw() >= zero_loss_scratch_floor
-                && (joint_adverse || deep_joint_adverse || flow_conviction <= -0.15);
+                && (joint_adverse
+                    || deep_joint_adverse
+                    || (flow_conviction <= -0.18 && signed_tfi <= -0.05));
             let struggling_rescue = !in_trend_free_ride_zone
                 && ((hold_elapsed >= elastic_struggle_ns
                     && joint_adverse
@@ -2279,6 +2281,30 @@ impl OnlineAdaptiveGovernor {
                 && now_ts < self.directional_cooldown_until_ns[0][1 - d]);
         if slot_idx > 0 && (btc_recent_abort || btc_scratch_fatigue || btc_in_sl_cooldown) {
             return false;
+        }
+        if slot_idx == 0
+            && self.win_streak[0][d] == 0
+            && self.global_dir_win_streak[1 - d] >= 2
+            && now_ts.saturating_sub(self.last_global_win_ts_ns) <= 600_000_000_000
+        {
+            return false;
+        }
+        let exit_anc_1e4 = self.last_exit_px_1e4[slot_idx][d];
+        let cur_en_1e4 = entry_ticks.saturating_mul(10_000);
+        if self.win_streak[slot_idx][d] == 0
+            && self.wave_step_count[slot_idx][d] >= 1
+            && exit_anc_1e4 > 0
+            && cur_en_1e4 > 0
+        {
+            let beyond_exit_bps = match side {
+                Side::Bid => ((cur_en_1e4 - exit_anc_1e4).saturating_mul(1_000_000)) / exit_anc_1e4,
+                Side::Ask => ((exit_anc_1e4 - cur_en_1e4).saturating_mul(1_000_000)) / exit_anc_1e4,
+            };
+            if (-350..=0).contains(&beyond_exit_bps)
+                && candidate_snap.factor_tfi.get().abs() < 0.85
+            {
+                return false;
+            }
         }
         let sym_debt_abs = (-self.cum_net_bps_x100[slot_idx][d]).max(0);
         let since_sl_ns = candidate_snap.ts_local_ns.0.saturating_sub(self.last_sl_ts_ns);
