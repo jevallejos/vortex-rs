@@ -897,9 +897,33 @@ impl ExecutionFsm {
                     .raw()
                     .max(fee_barrier_bps + 1);
             let mfe_excess = (learned_mfe - fee_barrier_bps).max(0);
+            let cur_mae_raw = Self::compute_gross_scaled_bps(
+                side,
+                entry_price,
+                if self.worst_adverse_price.0 > 0 {
+                    self.worst_adverse_price
+                } else {
+                    entry_price
+                },
+            )
+            .raw();
+            let fav_tfi = match side {
+                Side::Bid => snap.factor_tfi.get(),
+                Side::Ask => -snap.factor_tfi.get(),
+            };
             let structural_win_floor = (fee_barrier_bps + (vol_5m / 60))
                 .clamp(500, 550)
                 .max(zero_loss_scratch_floor);
+            let zero_loss_scratch_floor = if peak_gross_bps.raw() < 750
+                && hold_ns < 90_000_000_000
+                && cur_mae_raw > -600
+                && adv_p < 0.22
+                && fav_tfi > -0.10
+            {
+                structural_win_floor
+            } else {
+                zero_loss_scratch_floor
+            };
             let elastic_win_horizon_secs = (learned_mfe / 10).clamp(60, 105);
             let elastic_decay_span_secs = (elastic_win_horizon_secs * 3) / 2;
             let elastic_zombie_ns =
@@ -2273,11 +2297,18 @@ impl OnlineAdaptiveGovernor {
             return false;
         }
         let now_ts = candidate_snap.ts_local_ns.0;
+        let btc_abort_win_ns = if self.abort_streak[0][d] >= 2 {
+            45_000_000_000
+        } else {
+            15_000_000_000
+        };
         let btc_recent_abort = self.abort_streak[0][d] >= 1
-            && now_ts.saturating_sub(self.abort_last_ts_ns[0][d]) <= 60_000_000_000;
-        let btc_in_cooldown = now_ts < self.directional_cooldown_until_ns[0][d]
-            || now_ts < self.directional_cooldown_until_ns[0][1 - d];
-        if slot_idx > 0 && (btc_recent_abort || btc_in_cooldown) {
+            && now_ts.saturating_sub(self.abort_last_ts_ns[0][d]) <= btc_abort_win_ns;
+        let btc_in_sl_cooldown = (self.sl_streak[0][d] >= 1
+            && now_ts < self.directional_cooldown_until_ns[0][d])
+            || (self.sl_streak[0][1 - d] >= 1
+                && now_ts < self.directional_cooldown_until_ns[0][1 - d]);
+        if slot_idx > 0 && (btc_recent_abort || btc_in_sl_cooldown) {
             return false;
         }
         let sym_net_x100 = self.cum_net_bps_x100[slot_idx][0] + self.cum_net_bps_x100[slot_idx][1];

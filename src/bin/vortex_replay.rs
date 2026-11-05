@@ -197,10 +197,32 @@ impl FifoQueueSimulator {
                         };
                         if current_l1_qty < last_observed_l1_qty.0 {
                             let drop = last_observed_l1_qty.0 - current_l1_qty;
-                            let conservative_credit = (drop / 4).max(1);
+                            let conservative_credit = ((drop * 3) / 5).max(1);
                             queue_ahead_qty = LotQty((queue_ahead_qty.0 - conservative_credit).max(0));
                         }
                         last_observed_l1_qty = LotQty(current_l1_qty);
+                        let swept_fill = row.ofi_bps != 0 && match side {
+                            Side::Bid => {
+                                row.best_ask_ticks.0 > 0
+                                    && row.best_ask_ticks.0 <= limit_price.0
+                                    && row.ofi_bps > -1_000
+                            }
+                            Side::Ask => {
+                                row.best_bid_ticks.0 > 0
+                                    && row.best_bid_ticks.0 >= limit_price.0
+                                    && row.ofi_bps < 1_000
+                            }
+                        };
+                        if swept_fill {
+                            self.total_maker_fills += 1;
+                            self.state = SimulatedOrderState::FilledMaker {
+                                side,
+                                fill_price: limit_price,
+                                filled_qty: order_qty,
+                                fill_ts_ns: row.ts_local_ns,
+                            };
+                            return;
+                        }
                     }
                 }
 
@@ -524,6 +546,13 @@ fn replay_captured_live_parquet_segments() {
                                             && snap.bids[0].price.0 > entry_price.0
                                     }
                                 };
+                                if matches!(row.event_kind, MarketEventKind::L2BookSnapshot) {
+                                    fifo_sim.on_market_row(&row);
+                                    if matches!(fifo_sim.state, SimulatedOrderState::FilledMaker { .. }) {
+                                        let _ = fsm.on_entry_filled_maker(row.ts_local_ns);
+                                        continue;
+                                    }
+                                }
                                 let q_ahead_lots = match fifo_sim.state {
                                     SimulatedOrderState::RestingInFifoQueue {
                                         queue_ahead_qty,
