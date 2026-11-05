@@ -850,6 +850,8 @@ fn print_colorized_shadow_trades() -> ExitCode {
     };
     let reader = BufReader::new(file);
     let mut total_net_bps = 0.0_f64;
+    let mut total_gross_bps = 0.0_f64;
+    let mut total_fee_bps = 0.0_f64;
     let mut wins = 0_u64;
     let mut scratches = 0_u64;
     let mut losses = 0_u64;
@@ -862,57 +864,93 @@ fn print_colorized_shadow_trades() -> ExitCode {
             let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
             let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
             let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-            let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
-
+            let is_mkr = val
+                .get("maker_exit")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let def_fee = if is_mkr { 4.00 } else { 7.50 };
+            let fee_bps = val
+                .get("fee_bps")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(def_fee);
+            let gross_bps = val
+                .get("gross_bps")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(net_bps + fee_bps);
+            let mfe_bps = val
+                .get("mfe_bps")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(gross_bps.max(0.0));
+            let mae_bps = val.get("mae_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+            let hold_ms = val.get("hold_ms").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let sub_r = val
+                .get("exit_sub_reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(kind);
             total_net_bps += net_bps;
-            let (color, icon, badge) = classify_pnl_badge(net_bps);
-            if net_bps >= 1.00 {
+            total_gross_bps += gross_bps;
+            total_fee_bps += fee_bps;
+            let (color, v_lbl) = if net_bps >= 1.00 {
                 wins += 1;
+                (ANSI_GREEN, "\u{1f7e2} [TRADE")
             } else if net_bps >= -0.50 {
                 scratches += 1;
+                (ANSI_YELLOW, "\u{1f7e0} [TRADE")
             } else {
                 losses += 1;
-            }
-            let net_pct_1x = net_bps / 100.0;
-            let net_pct_10x = net_bps / 10.0;
-
-            println!(
-                "  {}{} [TRADE #{} {:<7}] {:<9} {:<4} {:<20} | {}t -> {}t | Net: {:+.2} bps ({:+.3}% | {:+.2}% @10x) (Maker={}){}",
-                color,
-                icon,
+                (ANSI_RED, "\u{1f534} [TRADE")
+            };
+            let tag = if net_bps >= 1.00 {
+                "WIN    "
+            } else if net_bps >= -0.50 {
+                "SCRATCH"
+            } else {
+                "LOSS   "
+            };
+            let c_a = format!(
+                "{} #{} {}] {:<8} {:<3} | {}t -> {}t",
+                v_lbl,
                 idx + 1,
-                badge,
+                tag,
                 sym,
                 side,
-                kind,
                 en_t,
-                ex_t,
-                net_bps,
-                net_pct_1x,
-                net_pct_10x,
-                is_maker,
-                ANSI_RESET
+                ex_t
             );
+            let c_b = format!(
+                " | Gross:{:+6.2} Fee:{:.2} Net:{:+6.2} bps ({:+.2}% @10x)",
+                gross_bps,
+                fee_bps,
+                net_bps,
+                net_bps / 10.0
+            );
+            let c_c = format!(
+                " | MFE:{:+5.2} MAE:{:+6.2} | Hold:{}s | {} (Maker={})",
+                mfe_bps,
+                mae_bps,
+                hold_ms / 1_000,
+                sub_r,
+                is_mkr
+            );
+            println!("  {}{}{}{}{}", color, c_a, c_b, c_c, ANSI_RESET);
         }
     }
-
-    let (sum_color, sum_icon, _) = classify_pnl_badge(total_net_bps);
-    let total_pct_1x = total_net_bps / 100.0;
-    let total_pct_10x = total_net_bps / 10.0;
+    let total = wins + scratches + losses;
+    let sum_color = if losses == 0 { ANSI_GREEN } else { ANSI_RED };
+    let sum_icon = if losses == 0 { "\u{1f7e2}" } else { "\u{1f534}" };
     println!("------------------------------------------------------------------------------------------");
-    println!(
-        "  {}{} [LEDGER SUMMARY] Total: {} (🟢 Wins: {} | 🟠 Scratches: {} | 🔴 Losses: {}) | CumNet: {:+.2} bps ({:+.3}% | {:+.2}% @10x){}",
-        sum_color,
-        sum_icon,
-        wins + scratches + losses,
-        wins,
-        scratches,
-        losses,
-        total_net_bps,
-        total_pct_1x,
-        total_pct_10x,
-        ANSI_RESET
+    let s_a = format!(
+        "{} [LEDGER SUMMARY] Total: {} (\u{1f7e2} Wins: {} | \u{1f7e0} Scratches: {} | \u{1f534} Losses: {})",
+        sum_icon, total, wins, scratches, losses
     );
+    let s_b = format!(
+        " | CumGross: {:+.2} | CumFee: -{:.2} | CumNet: {:+.2} bps ({:+.2}% @10x)",
+        total_gross_bps,
+        total_fee_bps,
+        total_net_bps,
+        total_net_bps / 10.0
+    );
+    println!("  {}{}{}{}", sum_color, s_a, s_b, ANSI_RESET);
     ExitCode::SUCCESS
 }
 
@@ -1060,8 +1098,30 @@ fn append_shadow_trade_jsonl(
     let data_dir = Path::new("data");
     let _ = std::fs::create_dir_all(data_dir);
     let net_bps = (summary.net_scaled_bps.raw() as f64) / 100.0;
+    let gross_bps = (summary.gross_scaled_bps.raw() as f64) / 100.0;
+    let fee_bps = if summary.is_maker_exit { 4.00 } else { 7.50 };
+    let fee_drag_pct = if gross_bps > 0.01 {
+        (fee_bps / gross_bps) * 100.0
+    } else {
+        100.0
+    };
     let ts_ns = now_epoch_ns();
     let pf_x100 = fsm.net_profit_factor_x100();
+    let opened_ts = if entry_forensic.opened_ts_ns > 0 {
+        entry_forensic.opened_ts_ns
+    } else if fsm.last_opened_ts.0 > 0 {
+        fsm.last_opened_ts.0
+    } else {
+        ts_ns
+    };
+    let hold_ms = (ts_ns.saturating_sub(opened_ts).max(0)) / 1_000_000;
+    let mfe_bps = (fsm.last_closed_mfe_bps as f64) / 100.0;
+    let mae_bps = (fsm.last_closed_mae_bps as f64) / 100.0;
+    let mfe_capture_pct = if fsm.last_closed_mfe_bps > 0 {
+        ((summary.gross_scaled_bps.raw() as f64) * 100.0) / (fsm.last_closed_mfe_bps as f64)
+    } else {
+        0.0
+    };
     let shadow_path = data_dir.join("vortex_shadow_trades.jsonl");
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(shadow_path) {
         let s1 = format!(
@@ -1069,14 +1129,25 @@ fn append_shadow_trade_jsonl(
             ts_ns, symbol, summary.kind, summary.side
         );
         let s2 = format!(
-            "\"entry_ticks\":{},\"exit_ticks\":{},\"net_bps\":{:.2},\"maker_exit\":{},",
-            summary.entry_price.0, summary.exit_price.0, net_bps, summary.is_maker_exit
+            "\"entry_ticks\":{},\"exit_ticks\":{},\"gross_bps\":{:.2},\"fee_bps\":{:.2},",
+            summary.entry_price.0, summary.exit_price.0, gross_bps, fee_bps
         );
         let s3 = format!(
+            "\"net_bps\":{:.2},\"fee_drag_pct\":{:.1},\"mfe_bps\":{:.2},\"mae_bps\":{:.2},",
+            net_bps, fee_drag_pct, mfe_bps, mae_bps
+        );
+        let s4 = format!(
+            "\"mfe_capture_pct\":{:.1},\"hold_ms\":{},\"exit_sub_reason\":\"{}\",\"maker_exit\":{},",
+            mfe_capture_pct,
+            hold_ms,
+            fsm.last_exit_sub_reason.as_str(),
+            summary.is_maker_exit
+        );
+        let s5 = format!(
             "\"total_trades\":{},\"pf_x100\":{},\"cum_net_pnl_1e8\":{}}}\n",
             ledger.closed_trades_count, pf_x100, ledger.cumulative_net_pnl_1e8
         );
-        let line = format!("{}{}{}", s1, s2, s3);
+        let line = format!("{}{}{}{}{}", s1, s2, s3, s4, s5);
         let _ = f.write_all(line.as_bytes());
     }
     let vault_path = data_dir.join("vortex_ai_forensic_vault.jsonl");
