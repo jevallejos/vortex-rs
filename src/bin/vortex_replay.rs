@@ -642,7 +642,7 @@ fn replay_captured_live_parquet_segments() {
                                             .abs()
                                             .saturating_mul(1_000_000))
                                             / summary.entry_price.0.max(1);
-                                        let ref_bps = if summary.gross_scaled_bps.raw() < 650 {
+                                        let ref_bps = if summary.gross_scaled_bps.raw() < 500 {
                                             ScaledBps(q_bps)
                                         } else {
                                             summary.gross_scaled_bps
@@ -890,7 +890,7 @@ struct V2ForensicRecord {
     tfi_out_x100: i64,
 }
 
-const V2_BYBIT_BENCHMARK: [V2ForensicRecord; 17] = [
+const V2_BYBIT_BENCHMARK: [V2ForensicRecord; 21] = [
     V2ForensicRecord { label: "S1#06", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 805_310, exit_ticks: 805_634, old_net_bps_x100: 2, mfe_bps_x100: 515, mae_bps_x100: -490, hold_ms: 187_994, geom_in_x100: 19, vol5m_in_bps: 10_998, drift_bps_x100: 240, ext_bps_x100: 85, tfi_out_x100: 23 },
     V2ForensicRecord { label: "S1#07", slot_idx: 1, symbol: "ETHUSDT", side: Side::Ask, entry_ticks: 242_528, exit_ticks: 242_425, old_net_bps_x100: 24, mfe_bps_x100: 449, mae_bps_x100: -94, hold_ms: 55_796, geom_in_x100: -64, vol5m_in_bps: 10_743, drift_bps_x100: -257, ext_bps_x100: -179, tfi_out_x100: -4 },
     V2ForensicRecord { label: "S1#08", slot_idx: 1, symbol: "ETHUSDT", side: Side::Bid, entry_ticks: 242_708, exit_ticks: 242_807, old_net_bps_x100: 7, mfe_bps_x100: 461, mae_bps_x100: -444, hold_ms: 152_420, geom_in_x100: 26, vol5m_in_bps: 11_211, drift_bps_x100: 100, ext_bps_x100: 205, tfi_out_x100: -56 },
@@ -908,6 +908,10 @@ const V2_BYBIT_BENCHMARK: [V2ForensicRecord; 17] = [
     V2ForensicRecord { label: "S2#01", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 794_675, exit_ticks: 794_994, old_net_bps_x100: 1, mfe_bps_x100: 549, mae_bps_x100: -912, hold_ms: 45_572, geom_in_x100: 17, vol5m_in_bps: 11_317, drift_bps_x100: 450, ext_bps_x100: 198, tfi_out_x100: 5 },
     V2ForensicRecord { label: "S2#02", slot_idx: 0, symbol: "BTCUSDT", side: Side::Ask, entry_ticks: 794_582, exit_ticks: 794_180, old_net_bps_x100: 105, mfe_bps_x100: 654, mae_bps_x100: -84, hold_ms: 45_993, geom_in_x100: -29, vol5m_in_bps: 11_425, drift_bps_x100: -283, ext_bps_x100: -162, tfi_out_x100: 4 },
     V2ForensicRecord { label: "S2#03", slot_idx: 1, symbol: "ETHUSDT", side: Side::Bid, entry_ticks: 228_906, exit_ticks: 229_050, old_net_bps_x100: 229, mfe_bps_x100: 869, mae_bps_x100: -336, hold_ms: 6_466, geom_in_x100: 82, vol5m_in_bps: 11_278, drift_bps_x100: 1_132, ext_bps_x100: 54, tfi_out_x100: -93 },
+    V2ForensicRecord { label: "S2#04", slot_idx: 0, symbol: "BTCUSDT", side: Side::Ask, entry_ticks: 765_286, exit_ticks: 764_978, old_net_bps_x100: 2, mfe_bps_x100: 614, mae_bps_x100: -416, hold_ms: 19_245, geom_in_x100: -55, vol5m_in_bps: 11_317, drift_bps_x100: -378, ext_bps_x100: -306, tfi_out_x100: 24 },
+    V2ForensicRecord { label: "S2#05", slot_idx: 0, symbol: "BTCUSDT", side: Side::Ask, entry_ticks: 762_314, exit_ticks: 761_907, old_net_bps_x100: 133, mfe_bps_x100: 741, mae_bps_x100: -217, hold_ms: 7_695, geom_in_x100: -44, vol5m_in_bps: 11_258, drift_bps_x100: -579, ext_bps_x100: -171, tfi_out_x100: 91 },
+    V2ForensicRecord { label: "S2#06", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 759_898, exit_ticks: 760_247, old_net_bps_x100: 59, mfe_bps_x100: 726, mae_bps_x100: -589, hold_ms: 30_717, geom_in_x100: 26, vol5m_in_bps: 11_161, drift_bps_x100: 952, ext_bps_x100: 158, tfi_out_x100: -98 },
+    V2ForensicRecord { label: "S2#07", slot_idx: 0, symbol: "BTCUSDT", side: Side::Bid, entry_ticks: 758_348, exit_ticks: 758_659, old_net_bps_x100: 10, mfe_bps_x100: 466, mae_bps_x100: -758, hold_ms: 36_369, geom_in_x100: 80, vol5m_in_bps: 11_182, drift_bps_x100: 374, ext_bps_x100: 278, tfi_out_x100: -86 },
 ];
 
 fn evaluate_v2_record_time_machine(rec: &V2ForensicRecord) -> (i64, &'static str) {

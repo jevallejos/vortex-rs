@@ -1008,9 +1008,12 @@ impl ExecutionFsm {
                 current_gross_bps.raw() >= active_win_floor
                     && current_gross_bps.raw() <= convex_ratchet_floor
             } else {
+                let tape_slammed = peak_gross_bps.raw() >= 680
+                    && hold_elapsed >= 5_000_000_000
+                    && signed_tfi <= -0.55;
                 peak_gross_bps.raw() >= active_win_floor
-                    && hold_elapsed >= impulse_immunity_ns
-                    && flow_conviction <= -0.12
+                    && (hold_elapsed >= impulse_immunity_ns || tape_slammed)
+                    && (flow_conviction <= -0.12 || tape_slammed)
                     && current_gross_bps.raw() >= allowed_base_floor
                     && current_gross_bps.raw() <= convex_ratchet_floor
             };
@@ -2303,6 +2306,20 @@ impl OnlineAdaptiveGovernor {
             if (-350..=0).contains(&beyond_exit_bps)
                 && candidate_snap.factor_tfi.get().abs() < 0.85
             {
+                return false;
+            }
+        }
+        let opp_exit_1e4 = self.last_exit_px_1e4[slot_idx][1 - d];
+        if self.wave_step_count[slot_idx][1 - d] >= 1
+            && opp_exit_1e4 > 0
+            && cur_en_1e4 > 0
+            && self_drift_bps.abs() < 600
+        {
+            let opp_breakout_bps = match side {
+                Side::Bid => ((opp_exit_1e4 - cur_en_1e4).saturating_mul(1_000_000)) / opp_exit_1e4,
+                Side::Ask => ((cur_en_1e4 - opp_exit_1e4).saturating_mul(1_000_000)) / opp_exit_1e4,
+            };
+            if (-150..=1_800).contains(&opp_breakout_bps) {
                 return false;
             }
         }

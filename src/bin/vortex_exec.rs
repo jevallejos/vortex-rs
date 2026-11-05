@@ -536,8 +536,10 @@ impl BybitV5LiveClient {
                     / entry_price.0.max(1);
                 let span_bps = (summary.gross_scaled_bps.raw() - q_bps).max(0);
                 let att_i64 = attempt as i64;
-                let relaxed_ref_bps = if summary.gross_scaled_bps.raw() < 650 {
+                let relaxed_ref_bps = if summary.gross_scaled_bps.raw() < 500 {
                     ScaledBps(q_bps)
+                } else if attempt < 3 {
+                    summary.gross_scaled_bps
                 } else {
                     ScaledBps(q_bps + (span_bps * (8 - att_i64).max(0)) / (8 + att_i64))
                 };
