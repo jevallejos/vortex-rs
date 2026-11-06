@@ -628,7 +628,8 @@ impl ExecutionFsm {
         false
     }
 
-    /// pub fn check_resting_queue_abort.
+    /// Evaluates whether a resting L1 entry order must abort due to elastic flow fade,
+    /// passive spoofing absorption, unilateral tape/geometry collapse, TTL, or BBO runaway.
     #[inline]
     pub fn check_resting_queue_abort(&mut self, snap: &SymbolLobSnapshot) -> bool {
         if let OrderLifecycleState::RestingEntryQueue {
@@ -638,9 +639,17 @@ impl ExecutionFsm {
             ..
         } = self.state
         {
-            let (signed_ofi, signed_tfi) = match side {
-                Side::Bid => (snap.factor_ofi.get(), snap.factor_tfi.get()),
-                Side::Ask => (-snap.factor_ofi.get(), -snap.factor_tfi.get()),
+            let (signed_ofi, signed_tfi, signed_geom) = match side {
+                Side::Bid => (
+                    snap.factor_ofi.get(),
+                    snap.factor_tfi.get(),
+                    snap.factor_geom.get(),
+                ),
+                Side::Ask => (
+                    -snap.factor_ofi.get(),
+                    -snap.factor_tfi.get(),
+                    -snap.factor_geom.get(),
+                ),
             };
             let vol_5m = snap.realized_vol_5m.raw().clamp(3_800, 12_500);
             let learned_mfe = self.slot_learned_mfe_bps(snap.symbol_id);
@@ -657,10 +666,20 @@ impl ExecutionFsm {
                 ((elapsed_ns as f64) / (elastic_residence_ns as f64)).clamp(0.5, 1.5);
             let fade_ofi_floor = (0.19 - 0.14 * res_progress) * vol_ratio;
             let fade_tfi_floor = (0.10 - 0.10 * res_progress) * vol_ratio;
+            let mfe_norm = ((learned_mfe as f64) / 720.0).clamp(0.80, 1.35);
             let rev_threshold = (-0.12 * vol_ratio).clamp(-0.18, -0.09);
+            let spoof_ofi_wall = (0.35 * mfe_norm / vol_ratio).clamp(0.28, 0.48);
+            let spoof_tfi_dump = (-0.05 * vol_ratio / mfe_norm).clamp(-0.10, -0.03);
+            let spoof_in_queue = signed_ofi >= spoof_ofi_wall && signed_tfi <= spoof_tfi_dump;
+            let unilateral_tfi_floor =
+                (-(0.30 - 0.05 * res_progress) * vol_ratio / mfe_norm).clamp(-0.38, -0.18);
+            let geom_collapse_floor = (-0.05 * vol_ratio / mfe_norm).clamp(-0.10, -0.03);
+            let tape_or_geom_collapse = signed_tfi <= unilateral_tfi_floor
+                || (signed_geom <= geom_collapse_floor && signed_tfi <= 0.0);
             let flow_faded = elapsed_ns >= early_fade_ns
-                && signed_ofi <= fade_ofi_floor
-                && signed_tfi <= fade_tfi_floor;
+                && ((signed_ofi <= fade_ofi_floor && signed_tfi <= fade_tfi_floor)
+                    || spoof_in_queue
+                    || tape_or_geom_collapse);
             let joint_flow_reversal = flow_faded
                 || (signed_ofi <= rev_threshold && signed_tfi <= (rev_threshold - 0.03));
             let elastic_runaway_bps =
@@ -712,6 +731,62 @@ impl ExecutionFsm {
             let crit_depletion = (0.55 * vol_norm).clamp(0.45, 0.72);
             let signed_flow_impulse = signed_ofi + 0.50 * signed_tfi;
             if depleted_ratio >= crit_depletion && signed_flow_impulse <= (-0.05 * vol_norm) {
+                self.state = OrderLifecycleState::Idle;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Evaluates whether a resting Altcoin L1 order (`slot_idx > 0`) must abort due to
+    /// elastic cross-asset leader (`BTCUSDT`, Slot 0) flow contagion after `early_fade_ns`.
+    #[inline]
+    pub fn check_leader_queue_contagion_abort(
+        &mut self,
+        slot_idx: usize,
+        candidate_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        leader_edge_bps_x100: i64,
+    ) -> bool {
+        if slot_idx == 0 {
+            return false;
+        }
+        if let OrderLifecycleState::RestingEntryQueue {
+            side,
+            resting_since_ts,
+            ..
+        } = self.state
+        {
+            let ref_now_ns = candidate_snap.ts_local_ns.0.max(btc_leader_snap.ts_local_ns.0);
+            let elapsed_ns = ref_now_ns.saturating_sub(resting_since_ts.0);
+            let learned_mfe = self.slot_learned_mfe_bps(candidate_snap.symbol_id);
+            let raw_res_ns = (MIN_QUEUE_RESIDENCE_NS * learned_mfe) / 720;
+            let elastic_residence_ns = raw_res_ns.clamp(1_250_000_000, 2_200_000_000);
+            let early_fade_ns = (elastic_residence_ns * 53) / 100;
+            if elapsed_ns < early_fade_ns {
+                return false;
+            }
+            let (b_ofi, b_tfi, b_geom) = match side {
+                Side::Bid => (
+                    btc_leader_snap.factor_ofi.get(),
+                    btc_leader_snap.factor_tfi.get(),
+                    btc_leader_snap.factor_geom.get(),
+                ),
+                Side::Ask => (
+                    -btc_leader_snap.factor_ofi.get(),
+                    -btc_leader_snap.factor_tfi.get(),
+                    -btc_leader_snap.factor_geom.get(),
+                ),
+            };
+            let btc_vol = btc_leader_snap.realized_vol_5m.raw().clamp(3_800, 12_500);
+            let btc_vol_norm = ((btc_vol as f64) / 6_000.0).clamp(0.80, 1.25);
+            let edge_c = leader_edge_bps_x100.clamp(-200, 400);
+            let edge_shield = (((200 - edge_c) as f64) / 4_000.0).clamp(-0.04, 0.08);
+            let ldr_ofi_trig = (-0.10 * btc_vol_norm + edge_shield).clamp(-0.18, -0.05);
+            let ldr_tfi_trig = (-0.08 * btc_vol_norm + edge_shield).clamp(-0.16, -0.04);
+            if (b_ofi <= ldr_ofi_trig && b_tfi <= ldr_tfi_trig)
+                || (b_geom <= -0.15 && b_tfi <= ldr_tfi_trig)
+            {
                 self.state = OrderLifecycleState::Idle;
                 return true;
             }
@@ -1089,9 +1164,19 @@ impl ExecutionFsm {
             let proactive_stagnant_escape = hold_elapsed >= 45_000_000_000
                 && peak_gross_bps.raw() < active_win_floor
                 && signed_tfi <= 0.0;
+            let maker_l1_px = match side {
+                Side::Bid => best_ask.price,
+                Side::Ask => best_bid.price,
+            };
+            let maker_l1_gross =
+                Self::compute_gross_scaled_bps(side, entry_price, maker_l1_px).raw();
+            let trade_ref_gross =
+                Self::compute_gross_scaled_bps(side, entry_price, ref_trade_price).raw();
+            let rescue_gross_bps =
+                current_gross_bps.raw().max(maker_l1_gross.min(trade_ref_gross));
             let scratch_escape = !in_trend_free_ride_zone
                 && hold_elapsed >= elastic_scratch_ns
-                && current_gross_bps.raw() >= zero_loss_scratch_floor
+                && rescue_gross_bps >= zero_loss_scratch_floor
                 && (joint_adverse
                     || deep_joint_adverse
                     || proactive_stagnant_escape
@@ -1107,12 +1192,12 @@ impl ExecutionFsm {
                 && hold_elapsed >= elastic_zombie_ns
                 && !strong_trend_continuation
                 && ofi_reversed
-                && current_gross_bps.raw() >= zero_loss_scratch_floor;
+                && rescue_gross_bps >= zero_loss_scratch_floor;
             let stagnant_unwind = struggling_rescue
                 || zombie_breakeven_escape
                 || (hold_elapsed >= elastic_stagnant_ns
                     && !strong_trend_continuation
-                    && current_gross_bps.raw() >= zero_loss_scratch_floor);
+                    && rescue_gross_bps >= zero_loss_scratch_floor);
             let flow_conviction_bonus = if flow_conviction > 0.0 {
                 (flow_conviction * 140.0) as i64
             } else {
@@ -1158,11 +1243,16 @@ impl ExecutionFsm {
                 } else {
                     ExitSubReason::StagnantTimerUnwind
                 };
+                let exit_px_final = if current_gross_bps.raw() >= zero_loss_scratch_floor {
+                    bbo_exit_price
+                } else {
+                    Self::clamp_defensive_zero_loss_floor(side, entry_price, maker_l1_px)
+                };
                 return Some(self.finalize_close(
                     ClosedTradeKind::MakerPassiveUnwind,
                     side,
                     entry_price,
-                    bbo_exit_price,
+                    exit_px_final,
                     snap.ts_local_ns,
                     ledger,
                 ));
@@ -4292,5 +4382,71 @@ mod tests {
             0, Side::Bid, PriceTicks(win_t), sl_t, 100, &snap_quiet, &snap_quiet
         ));
         println!("[VECTOR 2 PREFLIGHT GATE AUDIT] Hawkes hysteresis & structural guards certified!");
+    }
+
+    #[test]
+    fn test_stage36_vectors3_to_6_queue_spoof_leader_contagion_and_maker_rescue() {
+        let mut fsm = ExecutionFsm::new(1_250_000_000, 1_250_000_000);
+        fsm.state = OrderLifecycleState::RestingEntryQueue {
+            side: Side::Bid,
+            entry_price: PriceTicks(780_000),
+            qty: LotQty(10),
+            target_excursion: ScaledBps(4_500),
+            sl_trigger_price: PriceTicks(778_000),
+            resting_since_ts: TimestampNs(1_000_000_000),
+        };
+        let mut spoof_q_snap = SymbolLobSnapshot {
+            symbol_id: SymbolId(2),
+            ts_local_ns: TimestampNs(2_100_000_000),
+            realized_vol_5m: ScaledBps(6_000),
+            factor_ofi: BoundedScore::new_clamped(0.45),
+            factor_tfi: BoundedScore::new_clamped(-0.35),
+            factor_geom: BoundedScore::new_clamped(0.20),
+            ..SymbolLobSnapshot::default()
+        };
+        spoof_q_snap.bids[0] = BookLevel { price: PriceTicks(780_000), qty: LotQty(2_000) };
+        spoof_q_snap.asks[0] = BookLevel { price: PriceTicks(780_001), qty: LotQty(2_000) };
+        assert!(fsm.check_resting_queue_abort(&spoof_q_snap));
+        assert_eq!(fsm.state, OrderLifecycleState::Idle);
+        fsm.state = OrderLifecycleState::RestingEntryQueue {
+            side: Side::Bid,
+            entry_price: PriceTicks(230_000),
+            qty: LotQty(10),
+            target_excursion: ScaledBps(4_500),
+            sl_trigger_price: PriceTicks(228_500),
+            resting_since_ts: TimestampNs(1_000_000_000),
+        };
+        let mut btc_crash = spoof_q_snap;
+        btc_crash.symbol_id = SymbolId(1);
+        btc_crash.factor_ofi = BoundedScore::new_clamped(-0.18);
+        btc_crash.factor_tfi = BoundedScore::new_clamped(-0.22);
+        assert!(fsm.check_leader_queue_contagion_abort(1, &spoof_q_snap, &btc_crash, 180));
+        assert_eq!(fsm.state, OrderLifecycleState::Idle);
+        let mut ledger = ParitySyncLedger::new(10_000_000_000);
+        fsm.state = OrderLifecycleState::PositionOpenMakerExit {
+            side: Side::Bid,
+            entry_price: PriceTicks(22_850),
+            peak_favorable_price: PriceTicks(22_861),
+            qty: LotQty(10),
+            tp_maker_price: PriceTicks(22_950),
+            sl_trigger_price: PriceTicks(22_780),
+            opened_ts: TimestampNs(1_000_000_000),
+        };
+        let mut wide_snap = spoof_q_snap;
+        wide_snap.symbol_id = SymbolId(5);
+        wide_snap.ts_local_ns = TimestampNs(30_000_000_000);
+        wide_snap.bids[0] = BookLevel { price: PriceTicks(22_858), qty: LotQty(300) };
+        wide_snap.asks[0] = BookLevel { price: PriceTicks(22_861), qty: LotQty(300) };
+        wide_snap.last_trade_price = PriceTicks(22_861);
+        wide_snap.mark_price = PriceTicks(22_860);
+        wide_snap.factor_ofi = BoundedScore::new_clamped(-0.22);
+        wide_snap.factor_tfi = BoundedScore::new_clamped(-0.22);
+        let closed = fsm.step_open_position(&wide_snap, &mut ledger);
+        assert!(closed.is_some());
+        if let Some(s) = closed {
+            assert!(s.is_maker_exit);
+            assert!(s.net_scaled_bps.raw() > 0);
+        }
+        println!("[VECTORS 3-6 AUDIT] Queue spoof, BTC contagion & Maker rescue certified!");
     }
 }

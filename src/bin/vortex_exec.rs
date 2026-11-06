@@ -417,7 +417,14 @@ impl BybitV5LiveClient {
                                 let adopt_side = if open_side_str == "Sell" { Side::Ask } else { Side::Bid };
                                 let mfe_bps = fsm.slot_learned_mfe_bps(spec.symbol_id).clamp(600, 1_600);
                                 let tp_d = ((entry_t.0 * (mfe_bps * 6)) / 1_000_000).max(2);
-                                let sl_d = ((entry_t.0 * 2_450) / 1_000_000).max(4);
+                                let ad_vol = arena
+                                    .slot(slot_idx)
+                                    .and_then(|s| s.read_snapshot(2))
+                                    .map(|sn| sn.realized_vol_5m.raw().clamp(4_600, 11_500))
+                                    .unwrap_or(6_000);
+                                let raw_ad_sl = (ad_vol * 26 + mfe_bps * 36) / 100;
+                                let ad_sl_bps = raw_ad_sl.clamp(2_100, 2_750);
+                                let sl_d = ((entry_t.0 * ad_sl_bps) / 1_000_000).max(4);
                                 let (tp_t, sl_t) = match adopt_side {
                                     Side::Bid => (PriceTicks(entry_t.0 + tp_d), PriceTicks((entry_t.0 - sl_d).max(1))),
                                     Side::Ask => (PriceTicks((entry_t.0 - tp_d).max(1)), PriceTicks(entry_t.0 + sl_d)),
@@ -561,6 +568,39 @@ impl BybitV5LiveClient {
                         }
                     } else {
                         candidate_exit
+                    }
+                } else if let Ok(slot) = arena.slot(active_slot) {
+                    if let Ok(s) = slot.read_snapshot(4) {
+                        let eff_sl = fsm.last_eff_sl_ticks.0;
+                        let v_c = s.realized_vol_5m.raw().clamp(4_000, 12_500);
+                        let v_tol = (v_c / 40).clamp(100, 300);
+                        let tol_t = ((entry_price.0 * v_tol) / 1_000_000).max(2);
+                        let m_p = s.mark_price.0;
+                        let l_p = s.last_trade_price.0;
+                        let sl_hit = eff_sl > 0 && match open_side {
+                            Side::Bid => (m_p > 0 && m_p <= eff_sl + tol_t)
+                                || (l_p > 0 && l_p <= eff_sl + tol_t),
+                            Side::Ask => (m_p >= eff_sl.saturating_sub(tol_t))
+                                || (l_p >= eff_sl.saturating_sub(tol_t)),
+                        };
+                        if sl_hit && l_p > 0 {
+                            s.last_trade_price
+                        } else if sl_hit {
+                            PriceTicks(eff_sl)
+                        } else if last_pegged_price.0 > 0 {
+                            *last_pegged_price
+                        } else {
+                            ExecutionFsm::clamp_continuous_maker_floor(
+                                open_side,
+                                entry_price,
+                                candidate_exit,
+                                summary.gross_scaled_bps,
+                            )
+                        }
+                    } else if last_pegged_price.0 > 0 {
+                        *last_pegged_price
+                    } else {
+                        defensive_floor_price
                     }
                 } else if last_pegged_price.0 > 0 {
                     *last_pegged_price
@@ -2146,14 +2186,22 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 entry_price,
                 target_excursion,
                 sl_trigger_price: resting_sl_price,
+                resting_since_ts,
                 ..
             } => {
-                if let Ok(slot) = arena.slot(active_slot) {
-                    if let Ok(snap) = slot.read_snapshot(4) {
+                if arena.slot(active_slot).is_ok() {
+                    let mut snap = cached_snaps[active_slot];
+                    if snap.sequence_id > 0 {
+                        let btc_now = cached_snaps[0];
                         if snap.sequence_id == last_seen_seq[active_slot] {
-                            continue;
+                            let ref_ts = snap.ts_local_ns.0.max(btc_now.ts_local_ns.0);
+                            if ref_ts.saturating_sub(resting_since_ts.0) < 250_000_000 {
+                                continue;
+                            }
+                            snap.ts_local_ns = TimestampNs(ref_ts);
+                        } else {
+                            last_seen_seq[active_slot] = snap.sequence_id;
                         }
-                        last_seen_seq[active_slot] = snap.sequence_id;
 
                         let level_swept = match side {
                             Side::Bid => snap.asks[0].price.0 > 0 && snap.asks[0].price.0 < entry_price.0,
@@ -2210,9 +2258,16 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         let clean_sweep_fill = level_swept && !toxic_sweep;
                         let paper_queue_filled = live_client.is_none()
                             && (resting_queue_ahead.0 == 0 || clean_sweep_fill);
+                        let ldr_edge = adaptive_gov.slot_direction_diagnostics(0, side).0;
                         let want_abort = !paper_queue_filled
                             && !clean_sweep_fill
                             && (toxic_sweep
+                                || fsm.check_leader_queue_contagion_abort(
+                                    active_slot,
+                                    &snap,
+                                    &btc_now,
+                                    ldr_edge,
+                                )
                                 || fsm.check_queue_depletion_velocity_abort(
                                     &snap,
                                     resting_init_queue_ahead,
@@ -2394,8 +2449,9 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 sl_trigger_price: open_sl_price,
                 opened_ts: open_since_ts,
             } => {
-                if let Ok(slot) = arena.slot(active_slot) {
-                    if let Ok(snap) = slot.read_snapshot(4) {
+                if arena.slot(active_slot).is_ok() {
+                    let snap = cached_snaps[active_slot];
+                    if snap.sequence_id > 0 {
                         if snap.sequence_id == last_seen_seq[active_slot] {
                             continue;
                         }
@@ -2471,8 +2527,17 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             ledger = saved_ledger;
                             fsm.last_exit_sub_reason = exit_reason_keep;
                             fsm.max_wald_contraction_pct = wald_pct_keep;
+                            let sl_on_peg = match summary.side {
+                                Side::Bid => realized_exit_price.0 < summary.entry_price.0,
+                                Side::Ask => realized_exit_price.0 > summary.entry_price.0,
+                            };
+                            let real_kind = if sl_on_peg {
+                                ClosedTradeKind::ServerMarkPriceStopLoss
+                            } else {
+                                summary.kind
+                            };
                             summary = fsm.finalize_close(
-                                summary.kind,
+                                real_kind,
                                 summary.side,
                                 summary.entry_price,
                                 realized_exit_price,

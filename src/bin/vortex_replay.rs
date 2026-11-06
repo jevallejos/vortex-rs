@@ -614,7 +614,14 @@ fn replay_captured_live_parquet_segments() {
                                         Side::Bid => snap.factor_ofi.get() <= -0.10,
                                         Side::Ask => snap.factor_ofi.get() >= 0.10,
                                     };
+                                let ldr_e = adaptive_gov.slot_direction_diagnostics(0, side).0;
                                 if toxic_sweep
+                                    || fsm.check_leader_queue_contagion_abort(
+                                        active_slot,
+                                        &snap,
+                                        &btc_leader_snap,
+                                        ldr_e,
+                                    )
                                     || fsm.check_queue_depletion_velocity_abort(
                                         &snap,
                                         resting_init_queue_ahead,
