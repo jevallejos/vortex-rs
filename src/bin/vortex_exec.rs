@@ -832,7 +832,7 @@ fn prewarm_governor_prices_from_parquet(adaptive_gov: &mut OnlineAdaptiveGoverno
         }
     }
     paths.sort();
-    let start_idx = paths.len().saturating_sub(32);
+    let start_idx = paths.len().saturating_sub(512);
     for path in &paths[start_idx..] {
         if let Ok(b) = vortex_rs::forensic_parquet::ColumnarParquetBatch::read_from_file(path) {
             let mut idx = 0;

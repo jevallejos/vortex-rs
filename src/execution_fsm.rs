@@ -1927,6 +1927,7 @@ impl OnlineAdaptiveGovernor {
                 && mean_reverted
             {
                 self.wave_anchor_px_1e4[slot_idx][dir] = 0;
+                self.last_exit_px_1e4[slot_idx][dir] = 0;
                 self.wave_step_count[slot_idx][dir] = 0;
                 self.win_streak[slot_idx][dir] = 0;
             }
@@ -1940,11 +1941,20 @@ impl OnlineAdaptiveGovernor {
                 self.sl_streak[slot_idx][dir] = 0;
                 self.cum_net_bps_x100[slot_idx][dir] =
                     (self.cum_net_bps_x100[slot_idx][dir] / 2).max(-1_200);
+                self.ewma_net_bps_x100[slot_idx][dir] =
+                    ((self.ewma_net_bps_x100[slot_idx][dir] + 160) / 2).max(80);
                 self.global_dir_sl_streak[dir] = 0;
                 self.global_dir_debt_bps_x100[dir] =
                     (self.global_dir_debt_bps_x100[dir] / 2).max(-1_500);
             }
             dir += 1;
+        }
+        if self.price_sample_count[slot_idx] >= 60 {
+            self.last_seen_px_1e4[slot_idx] = px_1e4;
+            let any_sl = self.sl_streak.iter().any(|s| s[0] > 0 || s[1] > 0);
+            if !any_sl && now_ns.saturating_sub(self.last_sl_ts_ns) > 900_000_000_000 {
+                self.last_sl_ts_ns = 0;
+            }
         }
         if self.last_global_win_ts_ns > 0
             && now_ns > self.last_global_win_ts_ns
@@ -4448,5 +4458,49 @@ mod tests {
             assert!(s.net_scaled_bps.raw() > 0);
         }
         println!("[VECTORS 3-6 AUDIT] Queue spoof, BTC contagion & Maker rescue certified!");
+    }
+
+    #[test]
+    fn test_stage36_post_sl_2h_deadlock_healed_by_1hz_market_price() {
+        let mut gov = OnlineAdaptiveGovernor::new();
+        let t_win = 1_793_900_000_000_000_000_i64;
+        gov.seed_historical_price(0, Side::Ask, 761_022, 760_504);
+        gov.observe_closed_trade(0, Side::Ask, ScaledBps(280), true, TimestampNs(t_win));
+        let t_sl = 1_793_914_324_463_799_534_i64;
+        gov.seed_historical_price(0, Side::Ask, 758_404, 760_238);
+        gov.observe_closed_trade(0, Side::Ask, ScaledBps(-3_168), false, TimestampNs(t_sl));
+        let t_scr = TimestampNs(t_sl + 300_000_000_000);
+        gov.seed_historical_price(0, Side::Ask, 758_355, 758_045);
+        gov.observe_closed_trade(0, Side::Ask, ScaledBps(8), true, t_scr);
+        let t_6h_later = t_sl + 24_000_000_000_000;
+        let base_t = 757_450_i64;
+        let mut snap = SymbolLobSnapshot {
+            symbol_id: SymbolId(1),
+            sequence_id: 100,
+            ts_local_ns: TimestampNs(t_6h_later),
+            mark_price: PriceTicks(base_t),
+            last_trade_price: PriceTicks(base_t),
+            realized_vol_5m: ScaledBps(6_500),
+            factor_ofi: BoundedScore::new_clamped(0.48),
+            factor_tfi: BoundedScore::new_clamped(0.78),
+            factor_geom: BoundedScore::new_clamped(0.84),
+            ..SymbolLobSnapshot::default()
+        };
+        snap.bids[0] = BookLevel { price: PriceTicks(base_t), qty: LotQty(4_000) };
+        snap.asks[0] = BookLevel { price: PriceTicks(base_t + 1), qty: LotQty(4_000) };
+        let mut k = 0_i64;
+        while k < 65 {
+            snap.ts_local_ns = TimestampNs(t_6h_later + k * 1_100_000_000);
+            gov.observe_market_price(0, &snap);
+            k += 1;
+        }
+        assert_eq!(gov.last_sl_ts_ns, 0);
+        let veto = gov.audit_historical_entry_veto(0, Side::Bid, base_t, snap.ts_local_ns.0);
+        assert_eq!(veto, None);
+        let base_px = base_t * 10_000;
+        gov.ewma_slow_px_1e4[0] = base_px - 180_000;
+        gov.ewma_fast_px_1e4[0] = base_px + 1_650_000;
+        assert!(gov.authorizes_adaptive_entry(0, Side::Bid, &snap, &snap));
+        println!("[POST-SL 2H DEADLOCK AUDIT] 1Hz healing & live entry certified!");
     }
 }
