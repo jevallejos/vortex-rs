@@ -406,7 +406,9 @@ impl BybitV5LiveClient {
             if Some(sym) == tracked_symbol {
                 continue;
             }
-            self.cancel_all_symbol_orders(sym);
+            if !self.get_open_position_size(sym).0 {
+                self.cancel_all_symbol_orders(sym);
+            }
         }
         if tracked_symbol.is_none() {
             if let Some((open_sym, open_qty, open_side_str, avg_px_str)) = self.get_any_account_open_position() {
@@ -1949,6 +1951,18 @@ fn print_live_shm_hud() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[derive(Copy, Clone, Debug)]
+struct ParallelOpenSession {
+    slot_idx: usize,
+    state: OrderLifecycleState,
+    last_pegged_exit_price: PriceTicks,
+    exit_peg_attempts: u32,
+    entry_forensic: ForensicEntrySnapshot,
+    worst_adverse_price: PriceTicks,
+    last_opened_ts: TimestampNs,
+    last_armed_ts: TimestampNs,
+}
+
 fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let shm_path = MappedShmRegion::default_shm_path();
     let region = match MappedShmRegion::open_or_create(&shm_path, false) {
@@ -1982,6 +1996,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut exit_peg_attempts: u32 = 0;
     let mut entry_forensic = ForensicEntrySnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
+    let mut sec_pos: Option<ParallelOpenSession> = None;
+    let mut mux_tick: u64 = 0;
     rehydrate_shadow_ledger(&mut ledger, &mut fsm, &mut adaptive_gov, arena);
 
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
@@ -2072,7 +2088,77 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     if let Some(ref client) = live_client {
-        client.adopt_or_clean_exchange_positions(tracked_sym_on_startup, &mut fsm, arena, &mut active_slot, &tg_tx);
+        client.adopt_or_clean_exchange_positions(
+            tracked_sym_on_startup,
+            &mut fsm,
+            arena,
+            &mut active_slot,
+            &tg_tx,
+        );
+        if matches!(fsm.state, OrderLifecycleState::PositionOpenMakerExit { .. }) {
+            for (s_i, sp_spec) in APPROVED_SPECS.iter().enumerate() {
+                if s_i == active_slot {
+                    continue;
+                }
+                let s_name = sp_spec.symbol_id.name();
+                let (has_p2, _, side_p2) = client.get_open_position_info(s_name);
+                if has_p2 {
+                    let q_str = format!("category=linear&symbol={}", s_name);
+                    let avg_t = client
+                        .get_v5("/v5/position/list", &q_str)
+                        .and_then(|v| {
+                            v.get("result")?
+                                .get("list")?
+                                .as_array()?
+                                .first()?
+                                .get("avgPrice")?
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                        .and_then(|ap| sp_spec.parse_price_ticks(&ap).ok())
+                        .unwrap_or(PriceTicks(sp_spec.tick_size_1e8));
+                    if avg_t.0 > 0 {
+                        let ad_s2 = if side_p2 == "Sell" { Side::Ask } else { Side::Bid };
+                        let tp_d2 = ((avg_t.0 * 4_500) / 1_000_000).max(2);
+                        let sl_d2 = ((avg_t.0 * 18_000) / 1_000_000).max(4);
+                        let (tp2, sl2) = match ad_s2 {
+                            Side::Bid => (
+                                PriceTicks(avg_t.0 + tp_d2),
+                                PriceTicks((avg_t.0 - sl_d2).max(1)),
+                            ),
+                            Side::Ask => (
+                                PriceTicks((avg_t.0 - tp_d2).max(1)),
+                                PriceTicks(avg_t.0 + sl_d2),
+                            ),
+                        };
+                        let now2 = TimestampNs(now_epoch_ns());
+                        sec_pos = Some(ParallelOpenSession {
+                            slot_idx: s_i,
+                            state: OrderLifecycleState::PositionOpenMakerExit {
+                                side: ad_s2,
+                                entry_price: avg_t,
+                                peak_favorable_price: avg_t,
+                                qty: LotQty(10),
+                                tp_maker_price: tp2,
+                                sl_trigger_price: sl2,
+                                opened_ts: now2,
+                            },
+                            last_pegged_exit_price: PriceTicks(0),
+                            exit_peg_attempts: 0,
+                            entry_forensic: ForensicEntrySnapshot::default(),
+                            worst_adverse_price: avg_t,
+                            last_opened_ts: now2,
+                            last_armed_ts: now2,
+                        });
+                        println!(
+                            "{}\u{1f7e2} [PARALLEL SESSION #2 ADOPTED] {} {:?} @ {}t{}",
+                            ANSI_GREEN, s_name, ad_s2, avg_t.0, ANSI_RESET
+                        );
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     println!(
@@ -2102,10 +2188,67 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
             p_slot += 1;
         }
 
+        mux_tick = mux_tick.wrapping_add(1);
+        match (fsm.state, sec_pos) {
+            (OrderLifecycleState::PositionOpenMakerExit { .. }, Some(sp)) => {
+                let cur_s = ParallelOpenSession {
+                    slot_idx: active_slot,
+                    state: fsm.state,
+                    last_pegged_exit_price,
+                    exit_peg_attempts,
+                    entry_forensic,
+                    worst_adverse_price: fsm.worst_adverse_price,
+                    last_opened_ts: fsm.last_opened_ts,
+                    last_armed_ts: fsm.last_armed_ts,
+                };
+                active_slot = sp.slot_idx;
+                fsm.active_slot_idx = sp.slot_idx;
+                fsm.state = sp.state;
+                last_pegged_exit_price = sp.last_pegged_exit_price;
+                exit_peg_attempts = sp.exit_peg_attempts;
+                entry_forensic = sp.entry_forensic;
+                fsm.worst_adverse_price = sp.worst_adverse_price;
+                fsm.last_opened_ts = sp.last_opened_ts;
+                fsm.last_armed_ts = sp.last_armed_ts;
+                sec_pos = Some(cur_s);
+            }
+            (OrderLifecycleState::PositionOpenMakerExit { .. }, None)
+                if (mux_tick & 1) == 1 =>
+            {
+                sec_pos = Some(ParallelOpenSession {
+                    slot_idx: active_slot,
+                    state: fsm.state,
+                    last_pegged_exit_price,
+                    exit_peg_attempts,
+                    entry_forensic,
+                    worst_adverse_price: fsm.worst_adverse_price,
+                    last_opened_ts: fsm.last_opened_ts,
+                    last_armed_ts: fsm.last_armed_ts,
+                });
+                fsm.state = OrderLifecycleState::Idle;
+                last_pegged_exit_price = PriceTicks(0);
+                exit_peg_attempts = 0;
+            }
+            (OrderLifecycleState::Idle, Some(sp)) if (mux_tick & 1) == 0 => {
+                active_slot = sp.slot_idx;
+                fsm.active_slot_idx = sp.slot_idx;
+                fsm.state = sp.state;
+                last_pegged_exit_price = sp.last_pegged_exit_price;
+                exit_peg_attempts = sp.exit_peg_attempts;
+                entry_forensic = sp.entry_forensic;
+                fsm.worst_adverse_price = sp.worst_adverse_price;
+                fsm.last_opened_ts = sp.last_opened_ts;
+                fsm.last_armed_ts = sp.last_armed_ts;
+                sec_pos = None;
+            }
+            _ => {}
+        }
         match fsm.state {
             OrderLifecycleState::Idle => {
-                arena.exec_state_code.store(0, Ordering::Release);
-                arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                if sec_pos.is_none() {
+                    arena.exec_state_code.store(0, Ordering::Release);
+                    arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                }
 
                 let btc_leader_snap = cached_snaps[0];
 
@@ -2120,6 +2263,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 while s < APPROVED_SPECS.len() {
                     let spec = APPROVED_SPECS[s];
                     let snap = cached_snaps[s];
+                    if let Some(ref sp) = sec_pos {
+                        if s == sp.slot_idx {
+                            s += 1;
+                            continue;
+                        }
+                    }
                     if snap.sequence_id > 0 {
                         {
                             if snap.sequence_id == last_seen_seq[s] {
@@ -2775,6 +2924,18 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     Ordering::Release,
                                 );
                             }
+                            arena.exec_active_slot.store(active_slot as u64, Ordering::Release);
+                            arena.exec_active_symbol.store(
+                                u64::from(APPROVED_SPECS[active_slot].symbol_id.0),
+                                Ordering::Release,
+                            );
+                            arena.exec_side.store(open_side as u64, Ordering::Release);
+                            arena.exec_entry_ticks.store(
+                                open_entry_price.0 as u64,
+                                Ordering::Release,
+                            );
+                            arena.exec_tp_ticks.store(open_tp_price.0 as u64, Ordering::Release);
+                            arena.exec_state_code.store(3, Ordering::Release);
                             let hold_el = snap.ts_local_ns.0.saturating_sub(open_since_ts.0);
                             let g_px = ExecutionFsm::dynamic_maker_floor_price(
                                 open_side,
