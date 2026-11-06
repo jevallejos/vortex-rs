@@ -19,8 +19,11 @@ pub enum SignalVerdict {
     SpoofingVeto,
     /// Authorized passive `Limit PostOnly` entry at the BBO.
     AuthorizeMakerEntry {
+        /// Variant field side.
         side: Side,
+        /// Variant field target_excursion_scaled_bps.
         target_excursion_scaled_bps: ScaledBps,
+        /// Variant field estimated_cost_rt_scaled_bps.
         estimated_cost_rt_scaled_bps: ScaledBps,
     },
 }

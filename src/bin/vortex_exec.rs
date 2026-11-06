@@ -9,7 +9,8 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::BTreeSet;
+use std::time::Duration;
 
 use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use vortex_rs::execution_fsm::{
@@ -18,8 +19,9 @@ use vortex_rs::execution_fsm::{
 };
 use vortex_rs::forensic_parquet::ParitySyncLedger;
 use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena};
-use vortex_rs::types::{classify_pnl_badge, print_auto_aligned_box, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs, ANSI_GRAY, ANSI_GREEN, ANSI_ORANGE, ANSI_RED, ANSI_RESET, ANSI_YELLOW, APPROVED_SPECS};
+use vortex_rs::types::{classify_pnl_badge, now_epoch_ns, print_auto_aligned_box, side_from_str, slot_from_symbol_name, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs, ANSI_GRAY, ANSI_GREEN, ANSI_ORANGE, ANSI_RED, ANSI_RESET, ANSI_YELLOW, APPROVED_SPECS};
 
+/// Minimum number of Out-of-Sample trades required by the institutional certification gate.
 pub const TOTAL_OOS_TRADES_GATE: usize = 520;
 
 /// Optimal Live Canary Notional Reference (12.50 USDT in 1e8 fixed-point scale).
@@ -52,12 +54,7 @@ struct ForensicEntrySnapshot {
     cum_slot_debt_bps: i64,
 }
 
-fn now_epoch_ns() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_nanos() as i64,
-        Err(_) => 1_762_012_800_000_000_000,
-    }
-}
+
 
 #[inline]const fn compute_optimal_50usdt_wallet_qty_str(
     symbol_id: SymbolId,
@@ -766,15 +763,7 @@ fn prewarm_mfe_from_seed(fsm: &mut ExecutionFsm) {
             }
             let net_scaled_bps = (net_bps * 100.0).round() as i64;
             let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
-            let slot_opt = match sym_str {
-                "BTCUSDT" => Some(0),
-                "ETHUSDT" => Some(1),
-                "SOLUSDT" => Some(2),
-                "AVAXUSDT" => Some(3),
-                "TAOUSDT" => Some(4),
-                "SUIUSDT" => Some(5),
-                _ => None,
-            };
+            let slot_opt = slot_from_symbol_name(sym_str);
             if let Some(s_idx) = slot_opt {
                 fsm.observe_mfe_sample_for_slot(s_idx, net_scaled_bps + 400, true);
                 seeded_count += 1;
@@ -843,13 +832,12 @@ fn rehydrate_shadow_ledger(
     prewarm_mfe_from_seed(fsm);
     prewarm_governor_prices_from_parquet(adaptive_gov);
     let mut restored_count: u64 = 0;
-    let mut seen_gov_ts: Vec<i64> = Vec::new();
+    let mut seen_gov_ts: BTreeSet<i64> = BTreeSet::new();
     if let Ok(sf) = File::open("data/vault/vortex_governor_scar_memory.jsonl") {
         for sline in BufReader::new(sf).lines().map_while(Result::ok) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sline) {
                 let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                if ts_saved > 0 && !seen_gov_ts.contains(&ts_saved) {
-                    seen_gov_ts.push(ts_saved);
+                if ts_saved > 0 && seen_gov_ts.insert(ts_saved) {
                     let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
                     let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
                     let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
@@ -864,7 +852,7 @@ fn rehydrate_shadow_ledger(
                         _ => None,
                     };
                     if let Some(s_idx) = slot_opt {
-                        let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                        let s_side = side_from_str(side_str);
                         let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
                         let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
                         adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
@@ -900,21 +888,10 @@ fn rehydrate_shadow_ledger(
             let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
             let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
             let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            let slot_opt = match sym_str {
-                "BTCUSDT" => Some(0),
-                "ETHUSDT" => Some(1),
-                "SOLUSDT" => Some(2),
-                "AVAXUSDT" => Some(3),
-                "TAOUSDT" => Some(4),
-                "SUIUSDT" => Some(5),
-                _ => None,
-            };
+            let slot_opt = slot_from_symbol_name(sym_str);
             if let Some(s_idx) = slot_opt {
-                if ts_saved == 0 || !seen_gov_ts.contains(&ts_saved) {
-                    if ts_saved > 0 {
-                        seen_gov_ts.push(ts_saved);
-                    }
-                    let s_side = if side_str == "Ask" { Side::Ask } else { Side::Bid };
+                if ts_saved == 0 || seen_gov_ts.insert(ts_saved) {
+                    let s_side = side_from_str(side_str);
                     let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
                     let ex_t = val.get("exit_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
                     adaptive_gov.seed_historical_price(s_idx, s_side, en_t, ex_t);
@@ -1431,62 +1408,22 @@ fn format_forensic_vault_v2_json_line(
     let ext_bps = (entry_forensic.ext_bps as f64) / 100.0;
     let chased_bps = (entry_forensic.chased_bps as f64) / 100.0;
     let cum_slot_debt = (entry_forensic.cum_slot_debt_bps as f64) / 100.0;
-    let p1 = format!(
-        "{{\"event\":\"TRADE_CLOSE\",\"trade_id\":{},\"armed_ts_ns\":{},\"opened_ts_ns\":{},",
-        next_vault_id, armed_ts, opened_ts
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(1_024);
+    let _ = writeln!(
+        out,
+        "{{\"event\":\"TRADE_CLOSE\",\"trade_id\":{},\"armed_ts_ns\":{},\"opened_ts_ns\":{},\"ts_ns\":{},\"queue_wait_ms\":{},\"hold_ms\":{},\"symbol\":\"{}\",\"slot_idx\":{},\"side\":\"{:?}\",\"qty\":\"{}\",\"entry_ticks\":{},\"exit_ticks\":{},\"floor_ticks\":{},\"gross_bps\":{:.2},\"fee_bps\":{:.2},\"net_bps\":{:.2},\"fee_drag_pct\":{:.1},\"pf_x100\":{},\"cum_net_pnl_1e8\":{},\"kind\":\"{:?}\",\"exit_sub_reason\":\"{}\",\"maker_exit\":{},\"exit_peg_attempts\":{},\"wald_contraction_pct\":{},\"peak_ticks\":{},\"mfe_bps\":{:.2},\"worst_ticks\":{},\"mae_bps\":{:.2},\"mfe_capture_pct\":{:.1},\"init_q_lots\":{},\"abort_recovered\":{},\"ofi_in\":{:.2},\"tfi_in\":{:.2},\"geom_in\":{:.2},\"snr_in\":{:.2},\"vol5m_in\":{:.2},\"spread_in\":{},\"btc_comp_in\":{:.2},\"ofi_out\":{:.2},\"tfi_out\":{:.2},\"vol5m_out\":{:.2},\"slot_mfe_bps\":{:.2},\"gov_ewma_bps\":{:.2},\"win_streak\":{},\"sl_streak\":{},\"wave_step\":{},\"drift_bps\":{:.2},\"ext_bps\":{:.2},\"chased_bps\":{:.2},\"cum_slot_debt_bps\":{:.2}}}",
+        next_vault_id, armed_ts, opened_ts, ts_ns, queue_wait_ms, hold_ms, symbol, slot_idx,
+        summary.side, qty_str, summary.entry_price.0, summary.exit_price.0, floor_ticks,
+        gross_bps, fee_bps, net_bps, fee_drag_pct, pf_x100, ledger.cumulative_net_pnl_1e8,
+        summary.kind, fsm.last_exit_sub_reason.as_str(), summary.is_maker_exit, exit_peg_attempts,
+        fsm.last_closed_wald_pct, fsm.last_closed_peak_ticks.0, mfe_bps, fsm.last_closed_worst_ticks.0,
+        mae_bps, mfe_capture_pct, entry_forensic.init_q_lots, entry_forensic.abort_recovered,
+        ofi_in, tfi_in, geom_in, snr_in, vol5m_in, entry_forensic.spread_in_ticks, btc_comp_in,
+        ofi_out, tfi_out, vol5m_out, slot_mfe, gov_ewma, entry_forensic.win_streak,
+        entry_forensic.sl_streak, entry_forensic.wave_step, drift_bps, ext_bps, chased_bps, cum_slot_debt
     );
-    let p2 = format!(
-        "\"ts_ns\":{},\"queue_wait_ms\":{},\"hold_ms\":{},\"symbol\":\"{}\",\"slot_idx\":{},",
-        ts_ns, queue_wait_ms, hold_ms, symbol, slot_idx
-    );
-    let p3 = format!(
-        "\"side\":\"{:?}\",\"qty\":\"{}\",\"entry_ticks\":{},\"exit_ticks\":{},\"floor_ticks\":{},",
-        summary.side, qty_str, summary.entry_price.0, summary.exit_price.0, floor_ticks
-    );
-    let p4 = format!(
-        "\"gross_bps\":{:.2},\"fee_bps\":{:.2},\"net_bps\":{:.2},\"fee_drag_pct\":{:.1},",
-        gross_bps, fee_bps, net_bps, fee_drag_pct
-    );
-    let p5 = format!(
-        "\"pf_x100\":{},\"cum_net_pnl_1e8\":{},\"kind\":\"{:?}\",\"exit_sub_reason\":\"{}\",",
-        pf_x100, ledger.cumulative_net_pnl_1e8, summary.kind, fsm.last_exit_sub_reason.as_str()
-    );
-    let p6 = format!(
-        "\"maker_exit\":{},\"exit_peg_attempts\":{},\"wald_contraction_pct\":{},",
-        summary.is_maker_exit, exit_peg_attempts, fsm.last_closed_wald_pct
-    );
-    let p7 = format!(
-        "\"peak_ticks\":{},\"mfe_bps\":{:.2},\"worst_ticks\":{},\"mae_bps\":{:.2},",
-        fsm.last_closed_peak_ticks.0, mfe_bps, fsm.last_closed_worst_ticks.0, mae_bps
-    );
-    let p8 = format!(
-        "\"mfe_capture_pct\":{:.1},\"init_q_lots\":{},\"abort_recovered\":{},",
-        mfe_capture_pct, entry_forensic.init_q_lots, entry_forensic.abort_recovered
-    );
-    let p9 = format!(
-        "\"ofi_in\":{:.2},\"tfi_in\":{:.2},\"geom_in\":{:.2},\"snr_in\":{:.2},",
-        ofi_in, tfi_in, geom_in, snr_in
-    );
-    let p10 = format!(
-        "\"vol5m_in\":{:.2},\"spread_in\":{},\"btc_comp_in\":{:.2},\"ofi_out\":{:.2},",
-        vol5m_in, entry_forensic.spread_in_ticks, btc_comp_in, ofi_out
-    );
-    let p11 = format!(
-        "\"tfi_out\":{:.2},\"vol5m_out\":{:.2},\"slot_mfe_bps\":{:.2},\"gov_ewma_bps\":{:.2},",
-        tfi_out, vol5m_out, slot_mfe, gov_ewma
-    );
-    let p12 = format!(
-        "\"win_streak\":{},\"sl_streak\":{},\"wave_step\":{},\"drift_bps\":{:.2},",
-        entry_forensic.win_streak, entry_forensic.sl_streak, entry_forensic.wave_step, drift_bps
-    );
-    let p13 = format!(
-        "\"ext_bps\":{:.2},\"chased_bps\":{:.2},\"cum_slot_debt_bps\":{:.2}}}\n",
-        ext_bps, chased_bps, cum_slot_debt
-    );
-    format!(
-        "{}{}{}{}{}{}{}{}{}{}{}{}{}",
-        p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13
-    )
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1701,6 +1638,7 @@ fn format_red_loss_forensic_box_json_line(
     )
 }
 
+/// Executes the deterministic 520-trade Out-of-Sample certification suite.
 pub fn run_oos_certification_suite() -> Result<(u64, u64, i64, i64, i64), u8> {
     let arena = VortexShmArena::new();
     let spec = APPROVED_SPECS[0];

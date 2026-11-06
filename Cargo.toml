@@ -2,7 +2,7 @@
 name = "vortex-rs"
 version = "1.0.0"
 edition = "2021"
-description = "VORTEX-L2 — Institutional Low-Latency Execution Core (VORTEX-RS-V1.0)"
+description = "VORTEX-L2 - Institutional Low-Latency Execution Core (VORTEX-RS-V1.0)"
 license = "Proprietary"
 
 [lib]
@@ -35,6 +35,8 @@ strip = false
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "deny"
+missing_docs = "warn"
+unused_must_use = "deny"
 
 [lints.clippy]
 unwrap_used = "deny"
@@ -43,3 +45,7 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 float_cmp = "deny"
+dbg_macro = "deny"
+cloned_instead_of_copied = "deny"
+inefficient_to_string = "deny"
+redundant_else = "deny"

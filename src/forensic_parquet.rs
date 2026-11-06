@@ -19,28 +19,46 @@ pub const MAX_PARITY_DRIFT_1E8: i64 = 10_000;
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MarketEventKind {
+    /// Variant L2BookSnapshot.
     L2BookSnapshot = 1,
+    /// Variant PublicTradePrint.
     PublicTradePrint = 2,
 }
 
 /// Single normalized market event for replay and forensic attribution.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ColumnarMarketRow {
+    /// Field symbol_id.
     pub symbol_id: SymbolId,
+    /// Field event_kind.
     pub event_kind: MarketEventKind,
+    /// Field side.
     pub side: Side,
+    /// Field sequence_id.
     pub sequence_id: u64,
+    /// Field ts_exchange_ns.
     pub ts_exchange_ns: TimestampNs,
+    /// Field ts_local_ns.
     pub ts_local_ns: TimestampNs,
+    /// Field price_ticks.
     pub price_ticks: PriceTicks,
+    /// Field lot_qty.
     pub lot_qty: LotQty,
+    /// Field best_bid_ticks.
     pub best_bid_ticks: PriceTicks,
+    /// Field best_ask_ticks.
     pub best_ask_ticks: PriceTicks,
+    /// Field best_bid_qty.
     pub best_bid_qty: LotQty,
+    /// Field best_ask_qty.
     pub best_ask_qty: LotQty,
+    /// Field mark_price_ticks.
     pub mark_price_ticks: PriceTicks,
+    /// Field ofi_bps.
     pub ofi_bps: i32,
+    /// Field tfi_bps.
     pub tfi_bps: i32,
+    /// Field geom_bps.
     pub geom_bps: i32,
 }
 
@@ -48,21 +66,37 @@ pub struct ColumnarMarketRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnarParquetBatch {
     len: usize,
+    /// Field symbol_id.
     pub symbol_id: [u16; COLUMNAR_BATCH_CAP],
+    /// Field event_kind.
     pub event_kind: [u8; COLUMNAR_BATCH_CAP],
+    /// Field side.
     pub side: [u8; COLUMNAR_BATCH_CAP],
+    /// Field sequence_id.
     pub sequence_id: [u64; COLUMNAR_BATCH_CAP],
+    /// Field ts_exchange_ns.
     pub ts_exchange_ns: [i64; COLUMNAR_BATCH_CAP],
+    /// Field ts_local_ns.
     pub ts_local_ns: [i64; COLUMNAR_BATCH_CAP],
+    /// Field price_ticks.
     pub price_ticks: [i64; COLUMNAR_BATCH_CAP],
+    /// Field lot_qty.
     pub lot_qty: [i64; COLUMNAR_BATCH_CAP],
+    /// Field best_bid_ticks.
     pub best_bid_ticks: [i64; COLUMNAR_BATCH_CAP],
+    /// Field best_ask_ticks.
     pub best_ask_ticks: [i64; COLUMNAR_BATCH_CAP],
+    /// Field best_bid_qty.
     pub best_bid_qty: [i64; COLUMNAR_BATCH_CAP],
+    /// Field best_ask_qty.
     pub best_ask_qty: [i64; COLUMNAR_BATCH_CAP],
+    /// Field mark_price_ticks.
     pub mark_price_ticks: [i64; COLUMNAR_BATCH_CAP],
+    /// Field ofi_bps.
     pub ofi_bps: [i32; COLUMNAR_BATCH_CAP],
+    /// Field tfi_bps.
     pub tfi_bps: [i32; COLUMNAR_BATCH_CAP],
+    /// Field geom_bps.
     pub geom_bps: [i32; COLUMNAR_BATCH_CAP],
 }
 
@@ -74,6 +108,7 @@ impl Default for ColumnarParquetBatch {
 }
 
 impl ColumnarParquetBatch {
+    /// pub const fn new.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -98,18 +133,21 @@ impl ColumnarParquetBatch {
         }
     }
 
+    /// Returns the number of rows currently stored in the batch.
     #[inline]
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len
     }
 
+    /// Returns `true` if the batch contains zero rows.
     #[inline]
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Resets the batch row counter to zero without deallocating.
     #[inline]
     pub fn clear(&mut self) {
         self.len = 0;
@@ -243,72 +281,72 @@ impl ColumnarParquetBatch {
 
     /// Flushes the columnar batch to a file with `PAR1` header/footer and FNV-1a 64-bit integrity seal.
     pub fn write_to_file(&self, path: &Path) -> Result<u64, VortexError> {
-        let file = File::create(path).map_err(|_| VortexError::ColumnarIoFailure)?;
+        let file = File::create(path)?;
         let mut w = BufWriter::new(file);
 
         w.write_all(&PARQUET_MAGIC)
-            .map_err(|_| VortexError::ColumnarIoFailure)?;
+            ?;
         let count_u32 = (self.len as u32).to_le_bytes();
         w.write_all(&count_u32)
-            .map_err(|_| VortexError::ColumnarIoFailure)?;
+            ?;
 
         for i in 0..self.len {
             w.write_all(&self.symbol_id[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&[self.event_kind[i], self.side[i]])
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.sequence_id[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.ts_exchange_ns[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.ts_local_ns[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.price_ticks[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.lot_qty[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.best_bid_ticks[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.best_ask_ticks[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.best_bid_qty[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.best_ask_qty[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.mark_price_ticks[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.ofi_bps[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.tfi_bps[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             w.write_all(&self.geom_bps[i].to_le_bytes())
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
         }
 
         let checksum = self.compute_fnv1a64();
         w.write_all(&checksum.to_le_bytes())
-            .map_err(|_| VortexError::ColumnarIoFailure)?;
+            ?;
         w.write_all(&PARQUET_MAGIC)
-            .map_err(|_| VortexError::ColumnarIoFailure)?;
-        w.flush().map_err(|_| VortexError::ColumnarIoFailure)?;
+            ?;
+        w.flush()?;
         Ok(checksum)
     }
 
     /// Reads and verifies a `PAR1` columnar batch from disk.
     pub fn read_from_file(path: &Path) -> Result<Self, VortexError> {
-        let file = File::open(path).map_err(|_| VortexError::ColumnarIoFailure)?;
+        let file = File::open(path)?;
         let mut r = BufReader::new(file);
 
         let mut magic_head = [0_u8; 4];
         r.read_exact(&mut magic_head)
-            .map_err(|_| VortexError::ColumnarIoFailure)?;
+            ?;
         if magic_head != PARQUET_MAGIC {
             return Err(VortexError::ColumnarFormatCorrupted);
         }
 
         let mut count_buf = [0_u8; 4];
         r.read_exact(&mut count_buf)
-            .map_err(|_| VortexError::ColumnarIoFailure)?;
+            ?;
         let count = u32::from_le_bytes(count_buf) as usize;
         if count > COLUMNAR_BATCH_CAP {
             return Err(VortexError::BatchCapacityExceeded);
@@ -323,75 +361,75 @@ impl ColumnarParquetBatch {
             let mut b8 = [0_u8; 8];
 
             r.read_exact(&mut b2)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.symbol_id[i] = u16::from_le_bytes(b2);
 
             r.read_exact(&mut b2)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.event_kind[i] = b2[0];
             batch.side[i] = b2[1];
 
             r.read_exact(&mut b8)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.sequence_id[i] = u64::from_le_bytes(b8);
 
             r.read_exact(&mut b8)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.ts_exchange_ns[i] = i64::from_le_bytes(b8);
 
             r.read_exact(&mut b8)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.ts_local_ns[i] = i64::from_le_bytes(b8);
 
             r.read_exact(&mut b8)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.price_ticks[i] = i64::from_le_bytes(b8);
 
             r.read_exact(&mut b8)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.lot_qty[i] = i64::from_le_bytes(b8);
 
             r.read_exact(&mut b8)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.best_bid_ticks[i] = i64::from_le_bytes(b8);
 
             r.read_exact(&mut b8)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.best_ask_ticks[i] = i64::from_le_bytes(b8);
 
             r.read_exact(&mut b8)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.best_bid_qty[i] = i64::from_le_bytes(b8);
 
             r.read_exact(&mut b8)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.best_ask_qty[i] = i64::from_le_bytes(b8);
 
             r.read_exact(&mut b8)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.mark_price_ticks[i] = i64::from_le_bytes(b8);
 
             r.read_exact(&mut b4)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.ofi_bps[i] = i32::from_le_bytes(b4);
 
             r.read_exact(&mut b4)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.tfi_bps[i] = i32::from_le_bytes(b4);
 
             r.read_exact(&mut b4)
-                .map_err(|_| VortexError::ColumnarIoFailure)?;
+                ?;
             batch.geom_bps[i] = i32::from_le_bytes(b4);
         }
 
         let mut checksum_buf = [0_u8; 8];
         r.read_exact(&mut checksum_buf)
-            .map_err(|_| VortexError::ColumnarIoFailure)?;
+            ?;
         let stored_checksum = u64::from_le_bytes(checksum_buf);
 
         let mut magic_foot = [0_u8; 4];
         r.read_exact(&mut magic_foot)
-            .map_err(|_| VortexError::ColumnarIoFailure)?;
+            ?;
         if magic_foot != PARQUET_MAGIC || batch.compute_fnv1a64() != stored_checksum {
             return Err(VortexError::ColumnarFormatCorrupted);
         }
@@ -403,13 +441,18 @@ impl ColumnarParquetBatch {
 /// 1:1 Accounting Parity Guard (`PARITY_SYNC`) against Bybit UTA V5 wallet equity.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ParitySyncLedger {
+    /// Field initial_equity_1e8.
     pub initial_equity_1e8: i64,
+    /// Field cumulative_net_pnl_1e8.
     pub cumulative_net_pnl_1e8: i64,
+    /// Field cumulative_fees_1e8.
     pub cumulative_fees_1e8: i64,
+    /// Field closed_trades_count.
     pub closed_trades_count: u64,
 }
 
 impl ParitySyncLedger {
+    /// pub const fn new.
     #[inline]
     #[must_use]
     pub const fn new(initial_equity_1e8: i64) -> Self {
@@ -421,6 +464,7 @@ impl ParitySyncLedger {
         }
     }
 
+    /// Records a closed trade gross PnL and fee into the cumulative parity ledger.
     #[inline]
     pub fn record_closed_trade(&mut self, gross_pnl_1e8: i64, fee_1e8: i64) {
         let net = gross_pnl_1e8 - fee_1e8;
@@ -429,6 +473,7 @@ impl ParitySyncLedger {
         self.closed_trades_count += 1;
     }
 
+    /// Verifies that internal accounting matches `exchange_wallet_balance_1e8` within `MAX_PARITY_DRIFT_1E8`.
     #[inline]
     pub const fn verify_exchange_parity(&self, exchange_wallet_balance_1e8: i64) -> Result<i64, VortexError> {
         let expected_internal = self.initial_equity_1e8 + self.cumulative_net_pnl_1e8;

@@ -6,13 +6,13 @@ use core::sync::atomic::Ordering;
 use std::path::Path;
 use std::process::ExitCode;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tungstenite::{connect, Message};
 use vortex_rs::alpha_3factor::OrthogonalFactorState;
 use vortex_rs::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind};
 use vortex_rs::lob_shm::{BookLevel, MappedShmRegion, SymbolLobSnapshot, VortexShmArena, MAX_ACTIVE_PAIRS};
-use vortex_rs::types::{LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
+use vortex_rs::types::{now_epoch_ns, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs};
 
 const BYBIT_PUBLIC_LINEAR_WS: &str = "wss://stream.bybit.com/v5/public/linear";
 const MAX_PARQUET_RING_FILES: u64 = 4_096;
@@ -127,12 +127,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
     },
 ];
 
-fn now_epoch_ns() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_nanos() as i64,
-        Err(_) => 1_762_012_800_000_000_000,
-    }
-}
+
 
 fn find_slot_by_name(name: &str, approved_count: usize) -> Option<(usize, PairSpec)> {
     let mut idx = 0;

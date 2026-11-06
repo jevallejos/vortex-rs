@@ -22,7 +22,9 @@ pub const DEFAULT_LINUX_SHM_PATH: &str = "/dev/shm/vortex_lob.mmap";
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct BookLevel {
+    /// Discrete level price in ticks.
     pub price: PriceTicks,
+    /// Aggregate resting quantity in lots.
     pub qty: LotQty,
 }
 
@@ -30,20 +32,35 @@ pub struct BookLevel {
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SymbolLobSnapshot {
+    /// Field symbol_id.
     pub symbol_id: SymbolId,
+    /// Field is_eligible.
     pub is_eligible: bool,
+    /// Field sequence_id.
     pub sequence_id: u64,
+    /// Field ts_exchange_ns.
     pub ts_exchange_ns: TimestampNs,
+    /// Field ts_local_ns.
     pub ts_local_ns: TimestampNs,
+    /// Field mark_price.
     pub mark_price: PriceTicks,
+    /// Field last_trade_price.
     pub last_trade_price: PriceTicks,
+    /// Field cum_buy_trade_lots.
     pub cum_buy_trade_lots: LotQty,
+    /// Field cum_sell_trade_lots.
     pub cum_sell_trade_lots: LotQty,
+    /// Field realized_vol_5m.
     pub realized_vol_5m: ScaledBps,
+    /// Field factor_ofi.
     pub factor_ofi: BoundedScore,
+    /// Field factor_tfi.
     pub factor_tfi: BoundedScore,
+    /// Field factor_geom.
     pub factor_geom: BoundedScore,
+    /// Field bids.
     pub bids: [BookLevel; LOB_DEPTH],
+    /// Field asks.
     pub asks: [BookLevel; LOB_DEPTH],
 }
 
@@ -55,6 +72,7 @@ impl Default for SymbolLobSnapshot {
 }
 
 impl SymbolLobSnapshot {
+    /// Creates a zero-initialized `SymbolLobSnapshot`.
     #[inline]
     #[must_use]
     pub const fn new_empty() -> Self {
@@ -83,12 +101,14 @@ impl SymbolLobSnapshot {
         }
     }
 
+    /// Clears all 50 bid and ask levels to zero.
     #[inline]
     pub fn clear_book(&mut self) {
         self.bids = [BookLevel::default(); LOB_DEPTH];
         self.asks = [BookLevel::default(); LOB_DEPTH];
     }
 
+    /// Applies a sorted L2 delta or snapshot update to `bids` or `asks`.
     #[inline]
     pub fn apply_level_update(&mut self, side: Side, price: PriceTicks, qty: LotQty) {
         if price.0 <= 0 {
@@ -155,7 +175,9 @@ impl SymbolLobSnapshot {
         }
     }
 
+    /// Returns `(best_bid, best_ask, spread_ticks)` if the book is valid and uncrossed.
     #[inline]
+    #[must_use]
     pub const fn bbo_and_spread_ticks(&self) -> Option<(BookLevel, BookLevel, i64)> {
         let best_bid = self.bids[0];
         let best_ask = self.asks[0];
@@ -190,6 +212,7 @@ impl Default for SeqlockSymbolSlot {
 }
 
 impl SeqlockSymbolSlot {
+    /// pub const fn new.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -199,6 +222,7 @@ impl SeqlockSymbolSlot {
         }
     }
 
+    /// Publishes `snap` into the Seqlock slot using odd/even sequence fencing.
     #[inline]
     pub fn write_snapshot(&self, snap: &SymbolLobSnapshot) {
         let s0 = self.seq.load(Ordering::Relaxed);
@@ -212,6 +236,7 @@ impl SeqlockSymbolSlot {
         self.seq.store(s_odd.wrapping_add(1), Ordering::Release);
     }
 
+    /// Reads a consistent `SymbolLobSnapshot` with up to `max_retries` Seqlock spin attempts.
     #[inline]
     pub fn read_snapshot(&self, max_retries: usize) -> Result<SymbolLobSnapshot, VortexError> {
         for _ in 0..max_retries {
@@ -237,24 +262,43 @@ impl SeqlockSymbolSlot {
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct VortexShmArena {
+    /// Field magic.
     pub magic: u64,
+    /// Field version.
     pub version: u32,
+    /// Field active_pairs.
     pub active_pairs: u32,
+    /// Field heartbeat_ns.
     pub heartbeat_ns: AtomicU64,
+    /// Field exec_state_code.
     pub exec_state_code: AtomicU64,
+    /// Field exec_active_slot.
     pub exec_active_slot: AtomicU64,
+    /// Field exec_active_symbol.
     pub exec_active_symbol: AtomicU64,
+    /// Field exec_side.
     pub exec_side: AtomicU64,
+    /// Field exec_entry_ticks.
     pub exec_entry_ticks: AtomicU64,
+    /// Field exec_peak_ticks.
     pub exec_peak_ticks: AtomicU64,
+    /// Field exec_tp_ticks.
     pub exec_tp_ticks: AtomicU64,
+    /// Field exec_sl_ticks.
     pub exec_sl_ticks: AtomicU64,
+    /// Field exec_resting_since_ns.
     pub exec_resting_since_ns: AtomicU64,
+    /// Field exec_queue_ahead_lots.
     pub exec_queue_ahead_lots: AtomicU64,
+    /// Field exec_armed_count.
     pub exec_armed_count: AtomicU64,
+    /// Field exec_abort_count.
     pub exec_abort_count: AtomicU64,
+    /// Field exec_fill_count.
     pub exec_fill_count: AtomicU64,
+    /// Field exec_closed_count.
     pub exec_closed_count: AtomicU64,
+    /// Field slots.
     pub slots: [SeqlockSymbolSlot; MAX_ACTIVE_PAIRS],
 }
 
@@ -266,6 +310,7 @@ impl Default for VortexShmArena {
 }
 
 impl VortexShmArena {
+    /// pub const fn new.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -301,6 +346,7 @@ impl VortexShmArena {
         }
     }
 
+    /// Returns a reference to the Seqlock slot at `idx`.
     #[inline]
     pub fn slot(&self, idx: usize) -> Result<&SeqlockSymbolSlot, VortexError> {
         self.slots.get(idx).ok_or(VortexError::InvalidSymbolSlot)
@@ -332,6 +378,7 @@ pub struct MappedShmRegion {
 }
 
 impl MappedShmRegion {
+    /// Returns `/dev/shm/vortex_lob.mmap` on Linux or a temp-dir fallback on non-Unix hosts.
     #[must_use]
     pub fn default_shm_path() -> PathBuf {
         let dev_shm = Path::new("/dev/shm");
@@ -342,6 +389,7 @@ impl MappedShmRegion {
         }
     }
 
+    /// Opens or initializes the `MAP_SHARED` shared-memory arena at `path`.
     pub fn open_or_create(path: &Path, _initialize_writer: bool) -> Result<Self, VortexError> {
         let size = core::mem::size_of::<VortexShmArena>();
         let file = OpenOptions::new()
@@ -350,10 +398,10 @@ impl MappedShmRegion {
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(|_| VortexError::ColumnarIoFailure)?;
+            ?;
 
         file.set_len(size as u64)
-            .map_err(|_| VortexError::ColumnarIoFailure)?;
+            ?;
 
         #[cfg(unix)]
         {
@@ -399,6 +447,7 @@ impl MappedShmRegion {
         }
     }
 
+    /// Returns a shared reference to the mapped `VortexShmArena`.
     #[inline]
     #[must_use]
     pub fn arena(&self) -> &VortexShmArena {

@@ -35,12 +35,14 @@ impl ScaledBps {
     /// Bybit UTA V5 VIP-0 Taker fee: 5.50 bps (0.055%).
     pub const BYBIT_VIP0_TAKER_FEE_BPS: Self = Self(550);
 
+    /// Converts whole basis points into `ScaledBps` (`1 bps = 100 units`).
     #[inline]
     #[must_use]
     pub const fn from_whole_bps(bps: i64) -> Self {
         Self(bps * 100)
     }
 
+    /// Returns the raw integer value in `1/100th` of a basis point.
     #[inline]
     #[must_use]
     pub const fn raw(self) -> i64 {
@@ -57,6 +59,7 @@ impl BoundedScore {
     /// Compile-time neutral score (0.0).
     pub const ZERO: Self = Self(0.0);
 
+    /// Clamps a floating-point score into `[-1.0, +1.0]`, mapping `NaN`/`Inf` to `0.0`.
     #[inline]
     #[must_use]
     #[allow(clippy::manual_clamp)]
@@ -73,12 +76,14 @@ impl BoundedScore {
         }
     }
 
+    /// Returns the underlying clamped score in `[-1.0, +1.0]`.
     #[inline]
     #[must_use]
     pub const fn get(self) -> f64 {
         self.0
     }
 
+    /// Scales the normalized score into basis points (`[-10_000, +10_000]`).
     #[inline]
     #[must_use]
     pub fn to_bps_i32(self) -> i32 {
@@ -92,6 +97,7 @@ impl BoundedScore {
 pub struct SymbolId(pub u16);
 
 impl SymbolId {
+    /// Returns the canonical Bybit UTA V5 ticker symbol string.
     #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -114,40 +120,66 @@ impl SymbolId {
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Side {
+    /// Passive买/bid side (`0`).
     Bid = 0,
+    /// Passive卖/ask side (`1`).
     Ask = 1,
 }
 
 /// Domain-level deterministic error catalog (zero panics).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum VortexError {
+    /// Price, tick size, or lot step specification is non-positive.
     InvalidPriceOrTickSpec,
+    /// Input string is not a valid fixed-point ASCII decimal.
     AsciiDecimalParseError,
+    /// Relative tick size exceeds the institutional 1.50 bps ceiling.
     TickBpsExceedsInstitutionalCap {
+        /// Observed relative tick size.
         observed_scaled_bps: ScaledBps,
+        /// Maximum permitted relative tick size.
         max_allowed_scaled_bps: ScaledBps,
     },
+    /// Realized 5-minute volatility is below the minimum structural floor.
     RealizedVolBelowStructuralFloor {
+        /// Observed 5-minute realized volatility.
         observed_vol_5m_scaled_bps: ScaledBps,
+        /// Minimum required volatility.
         min_required_scaled_bps: ScaledBps,
     },
+    /// Expected excursion does not cover 3x round-trip friction.
     FrictionBarrierRejected {
+        /// Predicted excursion in `ScaledBps`.
         expected_excursion_scaled_bps: ScaledBps,
+        /// Required 3x friction barrier in `ScaledBps`.
         required_3x_barrier_scaled_bps: ScaledBps,
     },
+    /// Proposed Stop-Loss violates Bybit `MarkPrice` geometry.
     StopLossGeometryViolation {
+        /// Order side.
         side: Side,
+        /// Proposed Stop-Loss trigger price.
         proposed_sl_ticks: PriceTicks,
+        /// Reference mark/last price.
         reference_mark_ticks: PriceTicks,
     },
+    /// Seqlock read retry budget exhausted due to concurrent writer.
     SharedMemorySeqConflict,
+    /// Requested shared-memory slot index is out of bounds.
     InvalidSymbolSlot,
+    /// Columnar `PAR1` batch capacity (`256`) exceeded.
     BatchCapacityExceeded,
+    /// Disk or shared-memory I/O operation failed.
     ColumnarIoFailure,
+    /// `PAR1` magic bytes or FNV-1a 64-bit checksum mismatch.
     ColumnarFormatCorrupted,
+    /// Accounting drift between internal ledger and exchange wallet exceeded tolerance.
     AccountingParityDrift {
+        /// Expected internal balance (`1e8` scale).
         internal_balance_1e8: i64,
+        /// Reported exchange wallet balance (`1e8` scale).
         exchange_balance_1e8: i64,
+        /// Absolute drift (`1e8` scale).
         drift_1e8: i64,
     },
 }
@@ -158,9 +190,19 @@ impl fmt::Display for VortexError {
     }
 }
 
+impl std::error::Error for VortexError {}
+
+impl From<std::io::Error> for VortexError {
+    #[inline]
+    fn from(_: std::io::Error) -> Self {
+        Self::ColumnarIoFailure
+    }
+}
+
 /// Static specification and microeconomic eligibility guard for a perpetual contract.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PairSpec {
+    /// Canonical symbol identifier.
     pub symbol_id: SymbolId,
     /// Price of 1 tick scaled by 1e8 (e.g., 0.10 USDT -> 10_000_000).
     pub tick_size_1e8: i64,
@@ -249,6 +291,7 @@ impl PairSpec {
         (whole, frac4)
     }
 
+    /// Computes the relative tick size in `ScaledBps` at `mid_price_ticks`.
     #[inline]
     pub const fn compute_tick_scaled_bps(&self, mid_price_ticks: PriceTicks) -> Result<ScaledBps, VortexError> {
         if mid_price_ticks.0 <= 0 || self.tick_size_1e8 <= 0 || self.lot_step_1e8 <= 0 {
@@ -258,6 +301,7 @@ impl PairSpec {
         Ok(ScaledBps(scaled))
     }
 
+    /// Validates that the contract meets institutional tick-size and volatility floors.
     #[inline]
     pub const fn validate_eligibility(
         &self,
@@ -283,6 +327,7 @@ impl PairSpec {
         Ok(tick_bps)
     }
 
+    /// Enforces that `expected_excursion_scaled_bps` is at least 3x round-trip friction.
     #[inline]
     #[allow(clippy::manual_clamp)]
     pub const fn passes_3x_friction_barrier(
@@ -316,6 +361,7 @@ impl PairSpec {
         Ok(ScaledBps(round_trip_cost))
     }
 
+    /// Verifies that `proposed_sl` is strictly outside the 2-tick `MarkPrice` buffer.
     #[inline]
     pub const fn validate_stop_loss_geometry(
         side: Side,
@@ -421,10 +467,15 @@ impl PairSpec {
 
 /// ANSI terminal color and badge constants shared across CLI binaries.
 pub const ANSI_GREEN: &str = "\x1b[1;32m";
+/// ANSI 256-color orange escape sequence.
 pub const ANSI_ORANGE: &str = "\x1b[38;5;208m";
+/// ANSI bold red escape sequence.
 pub const ANSI_RED: &str = "\x1b[1;31m";
+/// ANSI bold yellow escape sequence.
 pub const ANSI_YELLOW: &str = "\x1b[1;33m";
+/// ANSI gray escape sequence.
 pub const ANSI_GRAY: &str = "\x1b[90m";
+/// ANSI reset escape sequence.
 pub const ANSI_RESET: &str = "\x1b[0m";
 
 /// Computes the exact terminal column width of `s`, ignoring ANSI escape codes (`\x1b[...m`)
@@ -483,7 +534,7 @@ pub fn format_auto_aligned_box(sections: &[Vec<String>]) -> Vec<String> {
         for line in sec {
             let w = visual_width_cols(line);
             let pad = max_cols.saturating_sub(w);
-            out.push(format!("\u{2551} {}{} \u{2551}", line, " ".repeat(pad)));
+            out.push(format!("\u{2551} {line}{:pad$} \u{2551}", "", pad = pad));
         }
     }
     out.push(format!("\u{255a}{}\u{255d}", horiz));
@@ -562,6 +613,43 @@ pub const fn spec_for_symbol(sym: SymbolId) -> Option<(usize, PairSpec)> {
         i += 1;
     }
     None
+}
+
+/// Resolves a canonical Bybit ticker string (`"BTCUSDT"`..`"SUIUSDT"`) to its slot index `0..5`.
+#[inline]
+#[must_use]
+pub fn slot_from_symbol_name(sym: &str) -> Option<usize> {
+    match sym {
+        "BTCUSDT" => Some(0),
+        "ETHUSDT" => Some(1),
+        "SOLUSDT" => Some(2),
+        "AVAXUSDT" => Some(3),
+        "TAOUSDT" => Some(4),
+        "SUIUSDT" => Some(5),
+        _ => None,
+    }
+}
+
+/// Parses a side string (`"Ask"` / `"Sell"` vs `"Bid"` / `"Buy"`) into `Side`.
+#[inline]
+#[must_use]
+pub fn side_from_str(raw: &str) -> Side {
+    if raw == "Ask" || raw == "Sell" {
+        Side::Ask
+    } else {
+        Side::Bid
+    }
+}
+
+/// Returns the current UNIX epoch timestamp in nanoseconds.
+#[inline]
+#[must_use]
+pub fn now_epoch_ns() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i64,
+        Err(_) => 1_762_012_800_000_000_000,
+    }
 }
 
 #[cfg(test)]

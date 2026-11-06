@@ -226,46 +226,71 @@ pub fn sign_bybit_v5_hmac_sha256(
     )
 }
 
+/// Normalized Bybit V5 REST API return codes handled by the execution state machine.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BybitRetCode {
+    /// Variant OkZero.
     OkZero,
+    /// Variant SlGeometryError10001.
     SlGeometryError10001,
+    /// Variant InsufficientMargin110007.
     InsufficientMargin110007,
+    /// Variant OrderNotExistsOrAlreadyClosed110017.
     OrderNotExistsOrAlreadyClosed110017,
 }
 
+/// Critical risk guard halt reasons.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HaltReason {
+    /// Variant InsufficientMargin110007.
     InsufficientMargin110007,
+    /// Variant AccountingParityDrift.
     AccountingParityDrift,
+    /// Variant MaxDailyDrawdownBreached.
     MaxDailyDrawdownBreached,
 }
 
+/// Execution mechanism by which a position was closed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClosedTradeKind {
+    /// Variant MakerStructuralTp.
     MakerStructuralTp,
+    /// Variant MakerPassiveUnwind.
     MakerPassiveUnwind,
+    /// Variant ServerMarkPriceStopLoss.
     ServerMarkPriceStopLoss,
 }
 
 /// Exhaustive 11-branch physical sub-cause of position exit for Forensic Vault V2.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum ExitSubReason {
+    /// Variant StructuralTpLimit.
     StructuralTpLimit,
+    /// Variant FreeRideConvexRatchet.
     FreeRideConvexRatchet,
+    /// Variant Zone1ProtectiveRatchet.
     Zone1ProtectiveRatchet,
+    /// Variant FlowReversalUnwind.
     #[default]
     FlowReversalUnwind,
+    /// Variant EarlyHarvestDecay.
     EarlyHarvestDecay,
+    /// Variant AdverseScratchEscape.
     AdverseScratchEscape,
+    /// Variant StrugglingRescue.
     StrugglingRescue,
+    /// Variant ZombieBreakevenEscape.
     ZombieBreakevenEscape,
+    /// Variant StagnantTimerUnwind.
     StagnantTimerUnwind,
+    /// Variant WaldSevereStopLoss.
     WaldSevereStopLoss,
+    /// Variant WaldBaseStopLoss.
     WaldBaseStopLoss,
 }
 
 impl ExitSubReason {
+    /// pub const fn as_str.
     #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -285,84 +310,151 @@ impl ExitSubReason {
     }
 }
 
+/// Exhaustive finite-state machine lifecycle for an order/position.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OrderLifecycleState {
+    /// Variant Idle.
     Idle,
+    /// Variant PlacingEntryMaker.
     PlacingEntryMaker {
+        /// Variant field side.
         side: Side,
+        /// Variant field entry_price.
         entry_price: PriceTicks,
+        /// Variant field qty.
         qty: LotQty,
+        /// Variant field target_excursion.
         target_excursion: ScaledBps,
+        /// Variant field sl_trigger_price.
         sl_trigger_price: PriceTicks,
+        /// Variant field submitted_ts.
         submitted_ts: TimestampNs,
     },
+    /// Variant RestingEntryQueue.
     RestingEntryQueue {
+        /// Variant field side.
         side: Side,
+        /// Variant field entry_price.
         entry_price: PriceTicks,
+        /// Variant field qty.
         qty: LotQty,
+        /// Variant field target_excursion.
         target_excursion: ScaledBps,
+        /// Variant field sl_trigger_price.
         sl_trigger_price: PriceTicks,
+        /// Variant field resting_since_ts.
         resting_since_ts: TimestampNs,
     },
+    /// Variant PositionOpenMakerExit.
     PositionOpenMakerExit {
+        /// Variant field side.
         side: Side,
+        /// Variant field entry_price.
         entry_price: PriceTicks,
+        /// Variant field peak_favorable_price.
         peak_favorable_price: PriceTicks,
+        /// Variant field qty.
         qty: LotQty,
+        /// Variant field tp_maker_price.
         tp_maker_price: PriceTicks,
+        /// Variant field sl_trigger_price.
         sl_trigger_price: PriceTicks,
+        /// Variant field opened_ts.
         opened_ts: TimestampNs,
     },
+    /// Variant EmergencyStopTriggered.
     EmergencyStopTriggered {
+        /// Variant field side.
         side: Side,
+        /// Variant field entry_price.
         entry_price: PriceTicks,
+        /// Variant field exit_price.
         exit_price: PriceTicks,
+        /// Variant field qty.
         qty: LotQty,
+        /// Variant field triggered_ts.
         triggered_ts: TimestampNs,
     },
+    /// Variant HaltedByRiskGuard.
     HaltedByRiskGuard {
+        /// Variant field reason.
         reason: HaltReason,
     },
 }
 
+/// Immutable accounting summary emitted when a position closes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ClosedTradeSummary {
+    /// Field kind.
     pub kind: ClosedTradeKind,
+    /// Field side.
     pub side: Side,
+    /// Field entry_price.
     pub entry_price: PriceTicks,
+    /// Field exit_price.
     pub exit_price: PriceTicks,
+    /// Field gross_scaled_bps.
     pub gross_scaled_bps: ScaledBps,
+    /// Field fee_scaled_bps.
     pub fee_scaled_bps: ScaledBps,
+    /// Field net_scaled_bps.
     pub net_scaled_bps: ScaledBps,
+    /// Field net_pnl_1e8.
     pub net_pnl_1e8: i64,
+    /// Field is_maker_exit.
     pub is_maker_exit: bool,
 }
 
+/// Deterministic 200.0 Hz finite-state machine governing order entry, queue custody, and Maker exits.
 #[derive(Copy, Clone, Debug)]
 pub struct ExecutionFsm {
+    /// Field state.
     pub state: OrderLifecycleState,
+    /// Field notional_per_trade_1e8.
     pub notional_per_trade_1e8: i64,
+    /// Field max_daily_drawdown_1e8.
     pub max_daily_drawdown_1e8: i64,
+    /// Field cooldown_until_ns.
     pub cooldown_until_ns: TimestampNs,
+    /// Field maker_exits_count.
     pub maker_exits_count: u64,
+    /// Field taker_sl_exits_count.
     pub taker_sl_exits_count: u64,
+    /// Field gross_profit_accum_1e8.
     pub gross_profit_accum_1e8: i64,
+    /// Field gross_loss_accum_1e8.
     pub gross_loss_accum_1e8: i64,
+    /// Field learned_mfe_ewma_bps.
     pub learned_mfe_ewma_bps: i64,
+    /// Field learned_mfe_by_slot.
     pub learned_mfe_by_slot: [i64; 6],
+    /// Field active_slot_idx.
     pub active_slot_idx: usize,
+    /// Field last_peak_gross_bps.
     pub last_peak_gross_bps: i64,
+    /// Field max_wald_contraction_pct.
     pub max_wald_contraction_pct: i64,
+    /// Field last_eff_sl_ticks.
     pub last_eff_sl_ticks: PriceTicks,
+    /// Field worst_adverse_price.
     pub worst_adverse_price: PriceTicks,
+    /// Field last_closed_mfe_bps.
     pub last_closed_mfe_bps: i64,
+    /// Field last_closed_mae_bps.
     pub last_closed_mae_bps: i64,
+    /// Field last_closed_peak_ticks.
     pub last_closed_peak_ticks: PriceTicks,
+    /// Field last_closed_worst_ticks.
     pub last_closed_worst_ticks: PriceTicks,
+    /// Field last_closed_wald_pct.
     pub last_closed_wald_pct: i64,
+    /// Field last_exit_sub_reason.
     pub last_exit_sub_reason: ExitSubReason,
+    /// Field last_armed_ts.
     pub last_armed_ts: TimestampNs,
+    /// Field last_opened_ts.
     pub last_opened_ts: TimestampNs,
+    /// Field last_armed_seq_id.
     pub last_armed_seq_id: u64,
 }
 
@@ -374,6 +466,7 @@ impl Default for ExecutionFsm {
 }
 
 impl ExecutionFsm {
+    /// pub const fn new.
     #[inline]
     #[must_use]
     pub const fn new(notional_per_trade_1e8: i64, max_daily_drawdown_1e8: i64) -> Self {
@@ -444,6 +537,7 @@ impl ExecutionFsm {
         (((25_000_000_i64 * 6_000) / vol_c) * mfe_c / 720).clamp(15_000_000, 35_000_000)
     }
 
+    /// pub fn try_arm_maker_entry.
     #[inline]
     pub fn try_arm_maker_entry(
         &mut self,
@@ -509,6 +603,7 @@ impl ExecutionFsm {
         Ok(true)
     }
 
+    /// pub fn on_entry_order_resting.
     #[inline]
     pub fn on_entry_order_resting(&mut self, ts_ns: TimestampNs) -> bool {
         if let OrderLifecycleState::PlacingEntryMaker {
@@ -533,6 +628,7 @@ impl ExecutionFsm {
         false
     }
 
+    /// pub fn check_resting_queue_abort.
     #[inline]
     pub fn check_resting_queue_abort(&mut self, snap: &SymbolLobSnapshot) -> bool {
         if let OrderLifecycleState::RestingEntryQueue {
@@ -623,6 +719,7 @@ impl ExecutionFsm {
         false
     }
 
+    /// pub fn on_entry_filled_maker.
     #[inline]
     pub fn on_entry_filled_maker(&mut self, fill_ts_ns: TimestampNs) -> bool {
         if let OrderLifecycleState::RestingEntryQueue {
@@ -658,6 +755,7 @@ impl ExecutionFsm {
         false
     }
 
+    /// pub fn step_open_position.
     #[inline]
     pub fn step_open_position(
         &mut self,
@@ -1074,6 +1172,7 @@ impl ExecutionFsm {
         None
     }
 
+    /// pub fn on_exchange_retcode.
     #[inline]
     pub fn on_exchange_retcode(
         &mut self,
@@ -1372,6 +1471,7 @@ impl ExecutionFsm {
         self.observe_mfe_sample_for_slot(self.active_slot_idx, raw_observed_gross_bps, is_maker_exit);
     }
 
+    /// pub fn finalize_close.
     #[inline]
     pub fn finalize_close(
         &mut self,
@@ -1485,6 +1585,7 @@ impl ExecutionFsm {
         }
     }
 
+    /// Returns the post-fee Profit Factor scaled by 100 (`999` when gross loss is zero).
     #[inline]
     #[must_use]
     pub const fn net_profit_factor_x100(&self) -> i64 {
@@ -1494,6 +1595,7 @@ impl ExecutionFsm {
         (self.gross_profit_accum_1e8 * 100) / self.gross_loss_accum_1e8
     }
 
+    /// Returns the fraction of Maker exits in basis points (`0..=10_000`).
     #[inline]
     #[must_use]
     pub const fn maker_exit_ratio_bps(&self) -> u64 {
@@ -1544,6 +1646,7 @@ impl Default for OnlineAdaptiveGovernor {
 }
 
 impl OnlineAdaptiveGovernor {
+    /// pub const fn new.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -3587,14 +3690,8 @@ mod tests {
                 let net_bps = val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
                 let is_maker =
                     val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
-                let slot_idx = match sym {
-                    "BTCUSDT" => 0,
-                    "ETHUSDT" => 1,
-                    "SOLUSDT" => 2,
-                    "AVAXUSDT" => 3,
-                    "TAOUSDT" => 4,
-                    "SUIUSDT" => 5,
-                    _ => continue,
+                let Some(slot_idx) = crate::types::slot_from_symbol_name(sym) else {
+                    continue;
                 };
                 let side = if side_s == "Ask" { Side::Ask } else { Side::Bid };
                 let real_entry_ts = if prev_close_ts_ns > 0 {
@@ -3750,14 +3847,8 @@ mod tests {
                 let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let old_net =
                     val.get("net_bps").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-                let slot_idx = match sym {
-                    "BTCUSDT" => 0,
-                    "ETHUSDT" => 1,
-                    "SOLUSDT" => 2,
-                    "AVAXUSDT" => 3,
-                    "TAOUSDT" => 4,
-                    "SUIUSDT" => 5,
-                    _ => continue,
+                let Some(slot_idx) = crate::types::slot_from_symbol_name(sym) else {
+                    continue;
                 };
                 let spec = APPROVED_SPECS[slot_idx];
                 let side = if side_s == "Ask" { Side::Ask } else { Side::Bid };

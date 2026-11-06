@@ -10,39 +10,63 @@ use vortex_rs::alpha_3factor::{OrthogonalFactorState, SignalVerdict};
 use vortex_rs::execution_fsm::{ExecutionFsm, OnlineAdaptiveGovernor, OrderLifecycleState};
 use vortex_rs::forensic_parquet::{ColumnarMarketRow, ColumnarParquetBatch, MarketEventKind, ParitySyncLedger};
 use vortex_rs::lob_shm::{BookLevel, SymbolLobSnapshot};
-use vortex_rs::types::{classify_pnl_badge, spec_for_symbol, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs, ANSI_RESET, APPROVED_SPECS};
+use vortex_rs::types::{classify_pnl_badge, side_from_str, slot_from_symbol_name, spec_for_symbol, BoundedScore, LotQty, PairSpec, PriceTicks, ScaledBps, Side, SymbolId, TimestampNs, ANSI_RESET, APPROVED_SPECS};
 
+/// Simulated one-way network latency between Singapore execution node and Bybit matching engine (25 ms).
 pub const SIMULATED_ONE_WAY_LATENCY_NS: i64 = 25_000_000;
 
+/// Discrete state of a simulated passive `Limit PostOnly` entry order in the L1 FIFO queue.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SimulatedOrderState {
+    /// Variant Inactive.
     Inactive,
+    /// Variant InFlightToExchange.
     InFlightToExchange {
+        /// Variant field side.
         side: Side,
+        /// Variant field limit_price.
         limit_price: PriceTicks,
+        /// Variant field order_qty.
         order_qty: LotQty,
+        /// Variant field arrival_ts_ns.
         arrival_ts_ns: TimestampNs,
     },
+    /// Variant RestingInFifoQueue.
     RestingInFifoQueue {
+        /// Variant field side.
         side: Side,
+        /// Variant field limit_price.
         limit_price: PriceTicks,
+        /// Variant field order_qty.
         order_qty: LotQty,
+        /// Variant field queue_ahead_qty.
         queue_ahead_qty: LotQty,
+        /// Variant field last_observed_l1_qty.
         last_observed_l1_qty: LotQty,
     },
+    /// Variant FilledMaker.
     FilledMaker {
+        /// Variant field side.
         side: Side,
+        /// Variant field fill_price.
         fill_price: PriceTicks,
+        /// Variant field filled_qty.
         filled_qty: LotQty,
+        /// Variant field fill_ts_ns.
         fill_ts_ns: TimestampNs,
     },
+    /// Variant RejectedPostOnlyCross.
     RejectedPostOnlyCross,
 }
 
+/// Deterministic L1 FIFO queue-priority entry simulator.
 #[derive(Copy, Clone, Debug)]
 pub struct FifoQueueSimulator {
+    /// Field state.
     pub state: SimulatedOrderState,
+    /// Field total_maker_fills.
     pub total_maker_fills: u64,
+    /// Field total_post_only_rejects.
     pub total_post_only_rejects: u64,
 }
 
@@ -54,6 +78,7 @@ impl Default for FifoQueueSimulator {
 }
 
 impl FifoQueueSimulator {
+    /// pub const fn new.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -64,6 +89,7 @@ impl FifoQueueSimulator {
         }
     }
 
+    /// pub fn submit_post_only.
     #[inline]
     pub fn submit_post_only(
         &mut self,
@@ -80,6 +106,7 @@ impl FifoQueueSimulator {
         };
     }
 
+    /// pub fn on_market_row.
     #[inline]
     pub fn on_market_row(&mut self, row: &ColumnarMarketRow) {
         match self.state {
@@ -757,15 +784,24 @@ fn replay_captured_live_parquet_segments() {
         pf_x100 / 100, pf_x100 % 100, (ledger.cumulative_fees_1e8 as f64) / 100_000_000.0
     );
 }
+/// Deterministic L1 FIFO queue-priority simulator for passive `Limit PostOnly reduceOnly` exits.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ExitFifoQueueSimulator {
+    /// Field active.
     pub active: bool,
+    /// Field side.
     pub side: Side,
+    /// Field limit_price.
     pub limit_price: PriceTicks,
+    /// Field order_qty.
     pub order_qty: LotQty,
+    /// Field queue_ahead_qty.
     pub queue_ahead_qty: LotQty,
+    /// Field last_observed_l1_qty.
     pub last_observed_l1_qty: LotQty,
+    /// Field peg_attempt.
     pub peg_attempt: usize,
+    /// Field last_peg_ts_ns.
     pub last_peg_ts_ns: TimestampNs,
 }
 
@@ -777,6 +813,7 @@ impl Default for ExitFifoQueueSimulator {
 }
 
 impl ExitFifoQueueSimulator {
+    /// pub const fn new.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -792,6 +829,7 @@ impl ExitFifoQueueSimulator {
         }
     }
 
+    /// pub fn arm_or_repeg.
     #[inline]
     pub fn arm_or_repeg(
         &mut self,
@@ -812,6 +850,7 @@ impl ExitFifoQueueSimulator {
         }
     }
 
+    /// pub fn on_market_row.
     #[inline]
     pub fn on_market_row(&mut self, row: &ColumnarMarketRow) -> Option<PriceTicks> {
         if !self.active {
@@ -1051,6 +1090,7 @@ fn evaluate_v2_record_time_machine(rec: &V2ForensicRecord) -> (i64, &'static str
     (rec.old_net_bps_x100, "KEPT_MAKER_GREEN_CLOSE (1:1 Parity)")
 }
 
+/// Runs the counterfactual Time-Machine V2 and 70/30 Walk-Forward Out-of-Sample audit.
 pub fn run_forensic_time_machine_audit() -> (i64, i64, u64) {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
@@ -1080,16 +1120,10 @@ pub fn run_forensic_time_machine_audit() -> (i64, i64, u64) {
                 let ex_t = val.get("exit_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
                 let net_bps = val.get("net_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let is_mkr = val.get("maker_exit").and_then(|v| v.as_bool()).unwrap_or(true);
-                let slot_idx = match sym {
-                    "BTCUSDT" => 0,
-                    "ETHUSDT" => 1,
-                    "SOLUSDT" => 2,
-                    "AVAXUSDT" => 3,
-                    "TAOUSDT" => 4,
-                    "SUIUSDT" => 5,
-                    _ => continue,
+                let Some(slot_idx) = slot_from_symbol_name(sym) else {
+                    continue;
                 };
-                let side = if side_s == "Ask" { Side::Ask } else { Side::Bid };
+                let side = side_from_str(side_s);
                 let check_ts = if prev_ts > 0 { prev_ts + 2_000_000_000 } else { close_ts - 60_000_000_000 };
                 let veto = gov.audit_historical_entry_veto(slot_idx, side, en_t, check_ts);
                 let is_train = idx <= 155;
@@ -1192,6 +1226,7 @@ pub fn run_forensic_time_machine_audit() -> (i64, i64, u64) {
     (old_sum_x100, new_sum_x100, losses_blocked)
 }
 
+/// Computes and prints the 3 microstructure trend regime and multi-horizon L2 markout tables.
 pub fn run_microstructure_trend_and_markout_stats() {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
@@ -1341,6 +1376,7 @@ pub fn run_microstructure_trend_and_markout_stats() {
     println!("==========================================================================================================");
 }
 
+/// Verifies 70% Train / 30% Blind OOS walk-forward performance over `ColumnarParquetBatch` slices.
 pub fn run_parquet_walk_forward_70_30_split_verifier(
     batches: &[ColumnarParquetBatch],
 ) -> (u64, u64, i64, i64) {
