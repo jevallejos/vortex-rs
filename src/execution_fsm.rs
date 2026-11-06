@@ -363,6 +363,7 @@ pub struct ExecutionFsm {
     pub last_exit_sub_reason: ExitSubReason,
     pub last_armed_ts: TimestampNs,
     pub last_opened_ts: TimestampNs,
+    pub last_armed_seq_id: u64,
 }
 
 impl Default for ExecutionFsm {
@@ -400,6 +401,7 @@ impl ExecutionFsm {
             last_exit_sub_reason: ExitSubReason::FlowReversalUnwind,
             last_armed_ts: TimestampNs(0),
             last_opened_ts: TimestampNs(0),
+            last_armed_seq_id: 0,
         }
     }
 
@@ -431,6 +433,15 @@ impl ExecutionFsm {
         } else {
             raw
         }
+    }
+
+    /// Computes the elastic pre-flight confirmation window `[15ms..35ms]` scaled by volatility and slot MFE.
+    #[inline]
+    #[must_use]
+    pub fn elastic_preflight_window_ns(&self, sym: SymbolId, realized_vol_5m: ScaledBps) -> i64 {
+        let vol_c = realized_vol_5m.raw().clamp(4_000, 12_500);
+        let mfe_c = self.slot_learned_mfe_bps(sym).clamp(560, 1_200);
+        (((25_000_000_i64 * 6_000) / vol_c) * mfe_c / 720).clamp(15_000_000, 35_000_000)
     }
 
     #[inline]
@@ -486,6 +497,7 @@ impl ExecutionFsm {
             snap.mark_price,
         )?;
         self.last_armed_ts = snap.ts_local_ns;
+        self.last_armed_seq_id = snap.sequence_id;
         self.state = OrderLifecycleState::PlacingEntryMaker {
             side,
             entry_price,
@@ -2219,6 +2231,90 @@ impl OnlineAdaptiveGovernor {
         candidate_snap: &SymbolLobSnapshot,
         btc_leader_snap: &SymbolLobSnapshot,
     ) -> bool {
+        self.authorizes_adaptive_entry_with_hawkes_eta(
+            slot_idx,
+            side,
+            candidate_snap,
+            btc_leader_snap,
+            1_000,
+        )
+    }
+
+    /// Evaluates whether an armed `PlacingEntryMaker` order sustains structural, kinematic,
+    /// SL-geometry, L1-depth, and BTC-leader invariants at `t_1` with sequence-indexed Hawkes attenuation.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_preflight_entry_sustaining(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        entry_price: PriceTicks,
+        sl_trigger_price: PriceTicks,
+        armed_seq_id: u64,
+        candidate_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+    ) -> bool {
+        if slot_idx >= crate::types::APPROVED_SPECS.len() {
+            return false;
+        }
+        let post_only_crossed = match side {
+            Side::Bid => {
+                candidate_snap.asks[0].price.0 > 0
+                    && entry_price.0 >= candidate_snap.asks[0].price.0
+            }
+            Side::Ask => {
+                candidate_snap.bids[0].price.0 > 0
+                    && entry_price.0 <= candidate_snap.bids[0].price.0
+            }
+        };
+        if post_only_crossed {
+            return false;
+        }
+        if PairSpec::validate_stop_loss_geometry(
+            side,
+            sl_trigger_price,
+            candidate_snap.last_trade_price,
+            candidate_snap.mark_price,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let x_ofi = candidate_snap.factor_ofi.get();
+        let x_tfi = candidate_snap.factor_tfi.get();
+        if (x_ofi >= 0.35 && x_tfi <= -0.05) || (x_ofi <= -0.35 && x_tfi >= 0.05) {
+            return false;
+        }
+        let delta_seq = candidate_snap.sequence_id.saturating_sub(armed_seq_id).min(3) as i64;
+        let eta_permille = (1_000 - 32 * delta_seq).clamp(904, 1_000);
+        let eta_f = (eta_permille as f64) / 1_000.0;
+        let (s_ofi, s_tfi) = match side {
+            Side::Bid => (x_ofi, x_tfi),
+            Side::Ask => (-x_ofi, -x_tfi),
+        };
+        if s_ofi < 0.25 * eta_f || s_tfi < 0.20 * eta_f {
+            return false;
+        }
+        self.authorizes_adaptive_entry_with_hawkes_eta(
+            slot_idx,
+            side,
+            candidate_snap,
+            btc_leader_snap,
+            eta_permille,
+        )
+    }
+
+    #[inline]
+    #[must_use]
+    fn authorizes_adaptive_entry_with_hawkes_eta(
+        &self,
+        slot_idx: usize,
+        side: Side,
+        candidate_snap: &SymbolLobSnapshot,
+        btc_leader_snap: &SymbolLobSnapshot,
+        eta_permille: i64,
+    ) -> bool {
         let entry_ticks = if candidate_snap.bids[0].price.0 > 0 && candidate_snap.asks[0].price.0 > 0 {
             (candidate_snap.bids[0].price.0 + candidate_snap.asks[0].price.0) / 2
         } else {
@@ -2484,15 +2580,17 @@ impl OnlineAdaptiveGovernor {
                 candidate_snap.bids[0].qty.0.max(0),
             ),
         };
-        let total_l1_q = own_l1_q + opp_l1_q;
-        if total_l1_q > 0 {
-            let tfi_exc =
-                (candidate_snap.factor_tfi.get().abs() - candidate_snap.factor_ofi.get().abs())
-                    .max(0.0);
-            let max_q_permille = 720 + ((tfi_exc * 100.0) as i64).min(60);
-            if (own_l1_q * 1_000) / total_l1_q > max_q_permille {
-                return false;
-            }
+        if (own_l1_q + opp_l1_q) > 0
+            && !crate::types::APPROVED_SPECS[slot_idx].passes_l1_queue_depth_and_wall_guard(
+                PriceTicks(entry_ticks),
+                candidate_snap.realized_vol_5m,
+                own_l1_q,
+                opp_l1_q,
+                candidate_snap.factor_ofi.get().abs(),
+                candidate_snap.factor_tfi.get().abs(),
+            )
+        {
+            return false;
         }
 
         let cand_comp =
@@ -2546,7 +2644,9 @@ impl OnlineAdaptiveGovernor {
         let adaptive_threshold = (0.45 + 0.08 * sl_s + debt_penalty + global_penalty
             + staircase_penalty - drift_bonus - edge_bonus)
             .clamp(0.42, 0.80);
-        cand_comp >= adaptive_threshold
+        let eff_threshold = (adaptive_threshold * (eta_permille.clamp(904, 1_000) as f64) / 1_000.0)
+            .max(0.38);
+        cand_comp >= eff_threshold
     }
 }
 #[cfg(test)]
@@ -4049,5 +4149,57 @@ mod tests {
         snap.factor_geom = BoundedScore::new_clamped(-0.57);
         assert!(gov.authorizes_adaptive_entry(0, Side::Ask, &snap, &snap));
         println!("[VECTOR 1 ELASTIC X_MIN AUDIT] Signed Bid/Ask & X_min [6..95] certified!");
+    }
+
+    #[test]
+    fn test_stage36_vector2_preflight_sustaining_and_hawkes_hysteresis() {
+        let mut gov = OnlineAdaptiveGovernor::new();
+        gov.price_sample_count[0] = 25;
+        gov.price_sample_count[1] = 25;
+        let base_t = 800_000_i64;
+        let base_px = base_t * 10_000;
+        gov.ewma_slow_px_1e4[0] = base_px;
+        gov.ewma_fast_px_1e4[0] = base_px + 1_928_000;
+        let win_t = base_t + 8;
+        let sl_t = PriceTicks(win_t - 1_800);
+        let mut snap = SymbolLobSnapshot {
+            symbol_id: SymbolId(1),
+            sequence_id: 100,
+            ts_local_ns: TimestampNs(600_000_000_000),
+            mark_price: PriceTicks(win_t),
+            last_trade_price: PriceTicks(win_t),
+            realized_vol_5m: ScaledBps(9_000),
+            factor_ofi: BoundedScore::new_clamped(0.45),
+            factor_tfi: BoundedScore::new_clamped(0.46),
+            factor_geom: BoundedScore::new_clamped(0.50),
+            ..SymbolLobSnapshot::default()
+        };
+        snap.bids[0] = BookLevel { price: PriceTicks(win_t), qty: LotQty(5_000) };
+        snap.asks[0] = BookLevel { price: PriceTicks(win_t + 1), qty: LotQty(5_000) };
+        assert!(gov.authorizes_adaptive_entry(0, Side::Bid, &snap, &snap));
+        // 1. Spoof pull at t_1 = +25ms (Geom drops to 0.11 < min_geom_floor) -> BLOCKED!
+        let mut snap_geom_drop = snap;
+        snap_geom_drop.sequence_id = 102;
+        snap_geom_drop.factor_geom = BoundedScore::new_clamped(0.11);
+        assert!(!gov.verify_preflight_entry_sustaining(
+            0, Side::Bid, PriceTicks(win_t), sl_t, 100, &snap_geom_drop, &snap
+        ));
+        // 2. SL geometry violated at t_1 (mark_price dips to sl_t + 1) -> BLOCKED!
+        let mut snap_sl_bad = snap;
+        snap_sl_bad.mark_price = PriceTicks(sl_t.0 + 1);
+        assert!(!gov.verify_preflight_entry_sustaining(
+            0, Side::Bid, PriceTicks(win_t), sl_t, 100, &snap_sl_bad, &snap
+        ));
+        // 3. Quiet L2 Hawkes decay over 2 frames (seq 100 -> 102: OFI=0.36, TFI=0.38, SNR=0.4005)
+        // Cold entry fails (0.4005 < 0.420), but pre-flight sustaining PASSES via eta=936!
+        let mut snap_quiet = snap;
+        snap_quiet.sequence_id = 102;
+        snap_quiet.factor_ofi = BoundedScore::new_clamped(0.36);
+        snap_quiet.factor_tfi = BoundedScore::new_clamped(0.38);
+        assert!(!gov.authorizes_adaptive_entry(0, Side::Bid, &snap_quiet, &snap_quiet));
+        assert!(gov.verify_preflight_entry_sustaining(
+            0, Side::Bid, PriceTicks(win_t), sl_t, 100, &snap_quiet, &snap_quiet
+        ));
+        println!("[VECTOR 2 PREFLIGHT GATE AUDIT] Hawkes hysteresis & structural guards certified!");
     }
 }

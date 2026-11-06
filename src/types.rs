@@ -392,6 +392,31 @@ impl PairSpec {
             raw_lots
         }
     }
+
+    /// Unified scale-invariant L1 queue depth floor and elastic wall guard.
+    #[inline]
+    #[must_use]
+    pub fn passes_l1_queue_depth_and_wall_guard(
+        &self,
+        entry_price: PriceTicks,
+        realized_vol_5m: ScaledBps,
+        own_q: i64,
+        opp_q: i64,
+        abs_ofi: f64,
+        abs_tfi: f64,
+    ) -> bool {
+        let min_l1_q = self.min_resting_l1_lots(entry_price, realized_vol_5m);
+        let vol_c = realized_vol_5m.raw().clamp(4_000, 12_500);
+        let tfi_bonus_lots = (abs_tfi.clamp(0.0, 1.0) * 4_000.0) as i64;
+        let max_wall_lots = (8_000 + ((vol_c * 2) / 3) + tfi_bonus_lots).clamp(10_000, 18_000);
+        if own_q < min_l1_q || own_q > max_wall_lots {
+            return false;
+        }
+        let tot_q = (own_q + opp_q).max(1);
+        let tfi_exc = (abs_tfi - abs_ofi).max(0.0);
+        let max_q_permille = 720 + ((tfi_exc * 100.0) as i64).min(60);
+        (own_q * 1_000) / tot_q <= max_q_permille
+    }
 }
 
 /// ANSI terminal color and badge constants shared across CLI binaries.

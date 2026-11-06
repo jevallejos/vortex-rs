@@ -510,42 +510,26 @@ fn replay_captured_live_parquet_segments() {
                                 side,
                                 entry_price,
                                 qty,
+                                sl_trigger_price,
                                 submitted_ts,
                                 ..
                             } if row.symbol_id == active_sym => {
-                                if snap.ts_local_ns.0.saturating_sub(submitted_ts.0)
-                                    >= SIMULATED_ONE_WAY_LATENCY_NS
-                                {
-                                    let post_only_crossed = match side {
-                                        Side::Bid => {
-                                            snap.asks[0].price.0 > 0
-                                                && entry_price.0 >= snap.asks[0].price.0
-                                        }
-                                        Side::Ask => {
-                                            snap.bids[0].price.0 > 0
-                                                && entry_price.0 <= snap.bids[0].price.0
-                                        }
-                                    };
-                                    let signal_still_valid = matches!(
-                                        evaluator.evaluate_entry_signal(&spec, &snap),
-                                        Ok(SignalVerdict::AuthorizeMakerEntry { side: s_now, .. }) if s_now == side
-                                    );
-                                    let (own_q, opp_q) = match side {
-                                        Side::Bid => (snap.bids[0].qty.0.max(0), snap.asks[0].qty.0.max(0)),
-                                        Side::Ask => (snap.asks[0].qty.0.max(0), snap.bids[0].qty.0.max(0)),
-                                    };
-                                    let tot_q = (own_q + opp_q).max(1);
-                                    let tfi_exc =
-                                        (snap.factor_tfi.get().abs() - snap.factor_ofi.get().abs()).max(0.0);
-                                    let max_q_permille = 720 + ((tfi_exc * 100.0) as i64).min(60);
-                                    let queue_wall_blocked =
-                                        own_q > 12_000 || (own_q * 1_000) / tot_q > max_q_permille;
-                                    let min_l1_q = spec.min_resting_l1_lots(entry_price, snap.realized_vol_5m);
-                                    if post_only_crossed
-                                        || !signal_still_valid
-                                        || own_q < min_l1_q
-                                        || queue_wall_blocked
-                                    {
+                                let elapsed_pre_ns = snap.ts_local_ns.0.saturating_sub(submitted_ts.0);
+                                let req_pre_ns = fsm
+                                    .elastic_preflight_window_ns(spec.symbol_id, snap.realized_vol_5m)
+                                    .min(SIMULATED_ONE_WAY_LATENCY_NS);
+                                if elapsed_pre_ns >= req_pre_ns {
+                                    let preflight_ok = elapsed_pre_ns <= 500_000_000
+                                        && adaptive_gov.verify_preflight_entry_sustaining(
+                                            active_slot,
+                                            side,
+                                            entry_price,
+                                            sl_trigger_price,
+                                            fsm.last_armed_seq_id,
+                                            &snap,
+                                            &btc_leader_snap,
+                                        );
+                                    if !preflight_ok {
                                         fsm.state = OrderLifecycleState::Idle;
                                     } else {
                                         signals_armed += 1;

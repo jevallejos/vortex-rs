@@ -2713,43 +2713,64 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 ..
             } => {
                 if let Ok(slot) = arena.slot(active_slot) {
-                    if let Ok(snap) = slot.read_snapshot(4) {
-                        if snap.ts_local_ns.0.saturating_sub(submitted_ts.0) < 25_000_000 {
+                    let snap = cached_snaps[active_slot];
+                    if snap.sequence_id > 0 {
+                        let spec = APPROVED_SPECS[active_slot];
+                        let btc_now = cached_snaps[0];
+                        let ref_now_ns = snap.ts_local_ns.0.max(btc_now.ts_local_ns.0);
+                        let elapsed_pre_ns = ref_now_ns.saturating_sub(submitted_ts.0);
+                        let req_pre_ns =
+                            fsm.elastic_preflight_window_ns(spec.symbol_id, snap.realized_vol_5m);
+                        if elapsed_pre_ns < req_pre_ns {
                             continue;
                         }
-                        let spec = APPROVED_SPECS[active_slot];
                         let l1_price_intact = match side {
                             Side::Bid => snap.bids[0].price.0 == entry_price.0,
                             Side::Ask => snap.asks[0].price.0 == entry_price.0,
                         };
-                        let post_only_crossed = !l1_price_intact
-                            || match side {
-                                Side::Bid => snap.asks[0].price.0 > 0 && entry_price.0 >= snap.asks[0].price.0,
-                                Side::Ask => snap.bids[0].price.0 > 0 && entry_price.0 <= snap.bids[0].price.0,
-                            };
-                        let signal_still_valid = matches!(
-                            evaluator.evaluate_entry_signal(&spec, &snap),
-                            Ok(SignalVerdict::AuthorizeMakerEntry { side: s_now, .. }) if s_now == side
-                        );
-                        let (own_q, opp_q) = match side {
-                            Side::Bid => (snap.bids[0].qty.0.max(0), snap.asks[0].qty.0.max(0)),
-                            Side::Ask => (snap.asks[0].qty.0.max(0), snap.bids[0].qty.0.max(0)),
-                        };
-                        let tot_q = (own_q + opp_q).max(1);
-                        let tfi_exc =
-                            (snap.factor_tfi.get().abs() - snap.factor_ofi.get().abs()).max(0.0);
-                        let max_q_permille = 720 + ((tfi_exc * 100.0) as i64).min(60);
-                        let queue_wall_blocked = own_q > 12_000 || (own_q * 1_000) / tot_q > max_q_permille;
-                        let min_l1_q = spec.min_resting_l1_lots(entry_price, snap.realized_vol_5m);
-                        if post_only_crossed
-                            || !signal_still_valid
-                            || own_q < min_l1_q
-                            || queue_wall_blocked
-                        {
+                        let preflight_ok = elapsed_pre_ns <= 500_000_000
+                            && l1_price_intact
+                            && adaptive_gov.verify_preflight_entry_sustaining(
+                                active_slot,
+                                side,
+                                entry_price,
+                                sl_trigger_price,
+                                fsm.last_armed_seq_id,
+                                &snap,
+                                &btc_now,
+                            );
+                        if !preflight_ok {
                             fsm.state = OrderLifecycleState::Idle;
                             arena.exec_state_code.store(0, Ordering::Release);
+                            arena.exec_entry_ticks.store(0, Ordering::Release);
+                            arena.exec_peak_ticks.store(0, Ordering::Release);
+                            arena.exec_tp_ticks.store(0, Ordering::Release);
+                            arena.exec_sl_ticks.store(0, Ordering::Release);
                             continue;
                         }
+                        let (ew_e, w_s, sl_s, w_st, dr_b, ex_b, ch_b, db_b) =
+                            adaptive_gov.extended_entry_diagnostics(
+                                active_slot,
+                                side,
+                                &snap,
+                                entry_price.0,
+                            );
+                        entry_forensic.ofi_in_bps = snap.factor_ofi.to_bps_i32();
+                        entry_forensic.tfi_in_bps = snap.factor_tfi.to_bps_i32();
+                        entry_forensic.geom_in_bps = snap.factor_geom.to_bps_i32();
+                        entry_forensic.snr_in_bps =
+                            (OrthogonalFactorState::snr_composite_score(&snap).abs() * 10_000.0) as i64;
+                        entry_forensic.vol5m_in_bps = snap.realized_vol_5m.raw();
+                        entry_forensic.btc_comp_in_bps =
+                            (OrthogonalFactorState::snr_composite_score(&btc_now) * 10_000.0) as i64;
+                        entry_forensic.gov_ewma_bps = ew_e;
+                        entry_forensic.win_streak = w_s;
+                        entry_forensic.sl_streak = sl_s;
+                        entry_forensic.wave_step = w_st;
+                        entry_forensic.drift_bps = dr_b;
+                        entry_forensic.ext_bps = ex_b;
+                        entry_forensic.chased_bps = ch_b;
+                        entry_forensic.cum_slot_debt_bps = db_b;
 
                         if let Some(ref client) = live_client {
                             let in_debt = adaptive_gov.is_in_scar_debt(active_slot, side);
