@@ -2321,7 +2321,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         s += 1;
                         continue;
                     }
-                    if extra_sessions.len() >= 5 {
+                    if extra_sessions.len() >= 6 {
                         s += 1;
                         continue;
                     }
@@ -2362,7 +2362,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         }
                                         let sc =
                                             OrthogonalFactorState::snr_composite_score(&snap).abs();
-                                        if extra_sessions.len() >= 4 && sc < 0.68 {
+                                        if extra_sessions.len() >= 6 && sc < 0.68 {
                                             s += 1;
                                             continue;
                                         }
