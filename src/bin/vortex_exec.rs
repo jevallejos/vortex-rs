@@ -406,7 +406,9 @@ impl BybitV5LiveClient {
             if Some(sym) == tracked_symbol {
                 continue;
             }
-            self.cancel_all_symbol_orders(sym);
+            if !self.get_open_position_size(sym).0 {
+                self.cancel_all_symbol_orders(sym);
+            }
         }
         if tracked_symbol.is_none() {
             if let Some((open_sym, open_qty, open_side_str, avg_px_str)) = self.get_any_account_open_position() {
@@ -528,6 +530,58 @@ impl BybitV5LiveClient {
     /// - Returns `true` ONLY when Bybit confirms `0.00` open position size.
     /// - If `force_market_if_unfilled` is true (e.g., on Stop-Loss), sweeps any remaining size with `Market reduceOnly`.
     #[allow(clippy::too_many_arguments)]
+    fn try_arm_partial_harvest_50pct(
+        &self,
+        spec: &PairSpec,
+        open_side: Side,
+        fav_px: PriceTicks,
+    ) -> bool {
+        let sym = spec.symbol_id.name();
+        let (is_op, p_qty) = self.get_open_position_size(sym);
+        if !is_op {
+            return false;
+        }
+        let half_opt = match (spec.symbol_id.0, p_qty.as_str()) {
+            (2, "0.02") => Some("0.01"),
+            (3, "0.2") => Some("0.1"),
+            (4, "2.6") => Some("1.3"),
+            (5, "0.1") => Some("0.05"),
+            (6, "25") => Some("12"),
+            _ => None,
+        };
+        let Some(hq) = half_opt else {
+            return false;
+        };
+        let cl_s = match open_side {
+            Side::Bid => "Sell",
+            Side::Ask => "Buy",
+        };
+        let (hw, hf) = spec.format_price_usdt_parts(fav_px);
+        let p1 = format!(
+            "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",",
+            sym, cl_s
+        );
+        let p2 = format!(
+            "\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",",
+            hq
+        );
+        let p3 = format!(
+            "\"price\":\"{}.{:04}\",\"reduceOnly\":true,\"positionIdx\":0}}",
+            hw, hf
+        );
+        let body = format!("{}{}{}", p1, p2, p3);
+        if let Some(resp) = self.post_v5("/v5/order/create", &body) {
+            if resp.get("retCode").and_then(|v| v.as_i64()) == Some(0) {
+                println!(
+                    "{}\u{1f7e2} [SESSION #3 PARTIAL HARVEST 50%] {} {} qty={} @ {}.{:04}{}",
+                    ANSI_GREEN, sym, cl_s, hq, hw, hf, ANSI_RESET
+                );
+                return true;
+            }
+        }
+        false
+    }
+
     fn arm_patient_green_exit(
         &self,
         spec: &PairSpec,
@@ -1949,6 +2003,20 @@ fn print_live_shm_hud() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[derive(Copy, Clone, Debug)]
+struct ParallelOpenSession {
+    slot_idx: usize,
+    state: OrderLifecycleState,
+    last_pegged_exit_price: PriceTicks,
+    exit_peg_attempts: u32,
+    entry_forensic: ForensicEntrySnapshot,
+    is_third_partial: bool,
+    partial_harvest_done: bool,
+    worst_adverse_price: PriceTicks,
+    last_opened_ts: TimestampNs,
+    last_armed_ts: TimestampNs,
+}
+
 fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let shm_path = MappedShmRegion::default_shm_path();
     let region = match MappedShmRegion::open_or_create(&shm_path, false) {
@@ -1982,6 +2050,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut exit_peg_attempts: u32 = 0;
     let mut entry_forensic = ForensicEntrySnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
+    let mut extra_sessions: Vec<ParallelOpenSession> = Vec::with_capacity(2);
+    let mut is_third_partial = false;
+    let mut partial_harvest_done = false;
+    let mut mux_tick: u64 = 0;
     rehydrate_shadow_ledger(&mut ledger, &mut fsm, &mut adaptive_gov, arena);
 
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
@@ -2072,7 +2144,79 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     }
 
     if let Some(ref client) = live_client {
-        client.adopt_or_clean_exchange_positions(tracked_sym_on_startup, &mut fsm, arena, &mut active_slot, &tg_tx);
+        client.adopt_or_clean_exchange_positions(
+            tracked_sym_on_startup,
+            &mut fsm,
+            arena,
+            &mut active_slot,
+            &tg_tx,
+        );
+        if matches!(fsm.state, OrderLifecycleState::PositionOpenMakerExit { .. }) {
+            for (s_i, sp_spec) in APPROVED_SPECS.iter().enumerate() {
+                if s_i == active_slot || extra_sessions.len() >= 2 {
+                    continue;
+                }
+                let s_name = sp_spec.symbol_id.name();
+                let (has_p2, _, side_p2) = client.get_open_position_info(s_name);
+                if has_p2 {
+                    let q_str = format!("category=linear&symbol={}", s_name);
+                    let avg_t = client
+                        .get_v5("/v5/position/list", &q_str)
+                        .and_then(|v| {
+                            v.get("result")?
+                                .get("list")?
+                                .as_array()?
+                                .first()?
+                                .get("avgPrice")?
+                                .as_str()
+                                .map(str::to_owned)
+                        })
+                        .and_then(|ap| sp_spec.parse_price_ticks(&ap).ok())
+                        .unwrap_or(PriceTicks(sp_spec.tick_size_1e8));
+                    if avg_t.0 > 0 {
+                        let ad_s2 = if side_p2 == "Sell" { Side::Ask } else { Side::Bid };
+                        let tp_d2 = ((avg_t.0 * 4_500) / 1_000_000).max(2);
+                        let sl_d2 = ((avg_t.0 * 18_000) / 1_000_000).max(4);
+                        let (tp2, sl2) = match ad_s2 {
+                            Side::Bid => (
+                                PriceTicks(avg_t.0 + tp_d2),
+                                PriceTicks((avg_t.0 - sl_d2).max(1)),
+                            ),
+                            Side::Ask => (
+                                PriceTicks((avg_t.0 - tp_d2).max(1)),
+                                PriceTicks(avg_t.0 + sl_d2),
+                            ),
+                        };
+                        let now2 = TimestampNs(now_epoch_ns());
+                        let is_s3 = !extra_sessions.is_empty();
+                        extra_sessions.push(ParallelOpenSession {
+                            slot_idx: s_i,
+                            state: OrderLifecycleState::PositionOpenMakerExit {
+                                side: ad_s2,
+                                entry_price: avg_t,
+                                peak_favorable_price: avg_t,
+                                qty: LotQty(10),
+                                tp_maker_price: tp2,
+                                sl_trigger_price: sl2,
+                                opened_ts: now2,
+                            },
+                            last_pegged_exit_price: PriceTicks(0),
+                            exit_peg_attempts: 0,
+                            entry_forensic: ForensicEntrySnapshot::default(),
+                            is_third_partial: is_s3,
+                            partial_harvest_done: false,
+                            worst_adverse_price: avg_t,
+                            last_opened_ts: now2,
+                            last_armed_ts: now2,
+                        });
+                        println!(
+                            "{}\u{1f7e2} [PARALLEL SESSION ADOPTED] {} {:?} @ {}t{}",
+                            ANSI_GREEN, s_name, ad_s2, avg_t.0, ANSI_RESET
+                        );
+                    }
+                }
+            }
+        }
     }
 
     println!(
@@ -2102,10 +2246,64 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
             p_slot += 1;
         }
 
+        mux_tick = mux_tick.wrapping_add(1);
+        let fsm_is_open = matches!(fsm.state, OrderLifecycleState::PositionOpenMakerExit { .. });
+        let fsm_is_idle = matches!(fsm.state, OrderLifecycleState::Idle);
+        if fsm_is_open {
+            let cur_s = ParallelOpenSession {
+                slot_idx: active_slot,
+                state: fsm.state,
+                last_pegged_exit_price,
+                exit_peg_attempts,
+                entry_forensic,
+                is_third_partial,
+                partial_harvest_done,
+                worst_adverse_price: fsm.worst_adverse_price,
+                last_opened_ts: fsm.last_opened_ts,
+                last_armed_ts: fsm.last_armed_ts,
+            };
+            if extra_sessions.len() < 2 && (mux_tick & 3) == 0 {
+                extra_sessions.push(cur_s);
+                fsm.state = OrderLifecycleState::Idle;
+                last_pegged_exit_price = PriceTicks(0);
+                exit_peg_attempts = 0;
+                is_third_partial = false;
+                partial_harvest_done = false;
+            } else if !extra_sessions.is_empty() {
+                extra_sessions.push(cur_s);
+                let sp = extra_sessions.remove(0);
+                active_slot = sp.slot_idx;
+                fsm.active_slot_idx = sp.slot_idx;
+                fsm.state = sp.state;
+                last_pegged_exit_price = sp.last_pegged_exit_price;
+                exit_peg_attempts = sp.exit_peg_attempts;
+                entry_forensic = sp.entry_forensic;
+                is_third_partial = sp.is_third_partial;
+                partial_harvest_done = sp.partial_harvest_done;
+                fsm.worst_adverse_price = sp.worst_adverse_price;
+                fsm.last_opened_ts = sp.last_opened_ts;
+                fsm.last_armed_ts = sp.last_armed_ts;
+            }
+        } else if fsm_is_idle && !extra_sessions.is_empty() && (mux_tick & 3) != 0 {
+            let sp = extra_sessions.remove(0);
+            active_slot = sp.slot_idx;
+            fsm.active_slot_idx = sp.slot_idx;
+            fsm.state = sp.state;
+            last_pegged_exit_price = sp.last_pegged_exit_price;
+            exit_peg_attempts = sp.exit_peg_attempts;
+            entry_forensic = sp.entry_forensic;
+            is_third_partial = sp.is_third_partial;
+            partial_harvest_done = sp.partial_harvest_done;
+            fsm.worst_adverse_price = sp.worst_adverse_price;
+            fsm.last_opened_ts = sp.last_opened_ts;
+            fsm.last_armed_ts = sp.last_armed_ts;
+        }
         match fsm.state {
             OrderLifecycleState::Idle => {
-                arena.exec_state_code.store(0, Ordering::Release);
-                arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                if extra_sessions.is_empty() {
+                    arena.exec_state_code.store(0, Ordering::Release);
+                    arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                }
 
                 let btc_leader_snap = cached_snaps[0];
 
@@ -2120,6 +2318,14 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 while s < APPROVED_SPECS.len() {
                     let spec = APPROVED_SPECS[s];
                     let snap = cached_snaps[s];
+                    if extra_sessions.iter().any(|p| p.slot_idx == s) {
+                        s += 1;
+                        continue;
+                    }
+                    if extra_sessions.len() >= 2 && s < 2 {
+                        s += 1;
+                        continue;
+                    }
                     if snap.sequence_id > 0 {
                         {
                             if snap.sequence_id == last_seen_seq[s] {
@@ -2161,6 +2367,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                     {
                         active_slot = b_slot;
                         exit_peg_attempts = 0;
+                        is_third_partial = extra_sessions.len() >= 2;
+                        partial_harvest_done = false;
                         if let OrderLifecycleState::PlacingEntryMaker {
                             side: a_side,
                             entry_price: a_px,
@@ -2775,12 +2983,52 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     Ordering::Release,
                                 );
                             }
+                            arena.exec_active_slot.store(active_slot as u64, Ordering::Release);
+                            arena.exec_active_symbol.store(
+                                u64::from(APPROVED_SPECS[active_slot].symbol_id.0),
+                                Ordering::Release,
+                            );
+                            arena.exec_side.store(open_side as u64, Ordering::Release);
+                            arena.exec_entry_ticks.store(
+                                open_entry_price.0 as u64,
+                                Ordering::Release,
+                            );
+                            arena.exec_tp_ticks.store(open_tp_price.0 as u64, Ordering::Release);
+                            arena.exec_state_code.store(3, Ordering::Release);
                             let hold_el = snap.ts_local_ns.0.saturating_sub(open_since_ts.0);
                             let g_px = ExecutionFsm::dynamic_maker_floor_price(
                                 open_side,
                                 open_entry_price,
                                 ScaledBps(500),
                             );
+                            if is_third_partial && !partial_harvest_done {
+                                let cur_diff = match open_side {
+                                    Side::Bid => snap.bids[0].price.0 - open_entry_price.0,
+                                    Side::Ask => open_entry_price.0 - snap.asks[0].price.0,
+                                };
+                                let cur_g_bps = (cur_diff.saturating_mul(1_000_000))
+                                    / open_entry_price.0.max(1);
+                                if cur_g_bps >= 520 {
+                                    if let Some(ref client) = live_client {
+                                        let spec = APPROVED_SPECS[active_slot];
+                                        let fav_px = match open_side {
+                                            Side::Bid => {
+                                                PriceTicks(snap.asks[0].price.0.max(g_px.0))
+                                            }
+                                            Side::Ask => PriceTicks(
+                                                snap.bids[0].price.0.min(g_px.0).max(1),
+                                            ),
+                                        };
+                                        if client.try_arm_partial_harvest_50pct(
+                                            &spec,
+                                            open_side,
+                                            fav_px,
+                                        ) {
+                                            partial_harvest_done = true;
+                                        }
+                                    }
+                                }
+                            }
                             let safe_passive = match open_side {
                                 Side::Bid => {
                                     snap.bids[0].price.0 > 0 && snap.bids[0].price.0 < g_px.0
