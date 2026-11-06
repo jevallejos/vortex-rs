@@ -2092,6 +2092,14 @@ impl OnlineAdaptiveGovernor {
             return Some("VETO_INVALID_SLOT");
         }
         let d = Self::dir_idx(side);
+        if self.price_sample_count[slot_idx] >= 60 {
+            if self.sl_streak[slot_idx][d] >= 2
+                && self.cum_net_bps_x100[slot_idx][d] <= -4_200
+            {
+                return Some("VETO_DEEP_SCAR_DEBT_QUARANTINE");
+            }
+            return None;
+        }
         if check_ts_ns < self.directional_cooldown_until_ns[slot_idx][d] {
             return Some("VETO_SLOT_COOLDOWN");
         }
@@ -2573,6 +2581,25 @@ impl OnlineAdaptiveGovernor {
         let btc_vol = btc_leader_snap.realized_vol_5m.raw().max(3_500);
         if self.price_sample_count[slot_idx] < 20 {
             return false;
+        }
+        if self.price_sample_count[slot_idx] >= 60 {
+            let s_geom = match side {
+                Side::Bid => candidate_snap.factor_geom.get(),
+                Side::Ask => -candidate_snap.factor_geom.get(),
+            };
+            let c_comp =
+                crate::alpha_3factor::OrthogonalFactorState::snr_composite_score(candidate_snap)
+                    .abs();
+            let eta_scale = (eta_permille.clamp(900, 1_000) as f64) / 1_000.0;
+            let btc_ok = if slot_idx > 0 {
+                match side {
+                    Side::Bid => btc_leader_snap.factor_ofi.get() >= -0.15,
+                    Side::Ask => btc_leader_snap.factor_ofi.get() <= 0.15,
+                }
+            } else {
+                true
+            };
+            return s_geom >= 0.08 && c_comp >= (0.32 * eta_scale) && btc_ok;
         }
         let now_ts = candidate_snap.ts_local_ns.0;
         let signed_geom = match side {

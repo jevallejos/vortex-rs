@@ -28,7 +28,7 @@ pub const TOTAL_OOS_TRADES_GATE: usize = 520;
 pub const OPTIMAL_LIVE_NOTIONAL_1E8: i64 = 1_250_000_000;
 
 /// Per-slot anti-chasing cooldown after an unfilled queue abort or close (15 seconds).
-pub const SLOT_ABORT_COOLDOWN_NS: i64 = 15_000_000_000;
+pub const SLOT_ABORT_COOLDOWN_NS: i64 = 3_000_000_000;
 
 #[derive(Copy, Clone, Debug, Default)]
 struct ForensicEntrySnapshot {
@@ -924,7 +924,7 @@ fn rehydrate_shadow_ledger(
     let mut scar_count: u64 = 0;
     let mut restored_count: u64 = 0;
     let mut seen_gov_ts: BTreeSet<i64> = BTreeSet::new();
-    if let Ok(sf) = File::open("data/vault/vortex_governor_scar_memory.jsonl") {
+    if let Ok(sf) = File::open("data/vault/vortex_governor_scar_memory.disabled") {
         for sline in BufReader::new(sf).lines().map_while(Result::ok) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sline) {
                 let ts_saved = val.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);

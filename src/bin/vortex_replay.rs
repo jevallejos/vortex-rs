@@ -318,7 +318,7 @@ fn replay_captured_live_parquet_segments() {
     let mut shadow_history: Vec<(i64, usize, Side, i64, i64, i64, bool)> = Vec::new();
     let mut shadow_cursor: usize = 0;
     for hist_path in [
-        "data/vault/vortex_governor_scar_memory.jsonl",
+        "data/vault/vortex_governor_scar_memory.disabled",
         "data/vault/vortex_shadow_trades.jsonl",
     ] {
         if let Ok(sf) = std::fs::File::open(hist_path) {
