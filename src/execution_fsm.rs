@@ -1927,25 +1927,32 @@ impl OnlineAdaptiveGovernor {
                 && mean_reverted
             {
                 self.wave_anchor_px_1e4[slot_idx][dir] = 0;
-                self.last_exit_px_1e4[slot_idx][dir] = 0;
                 self.wave_step_count[slot_idx][dir] = 0;
                 self.win_streak[slot_idx][dir] = 0;
             }
+            let debt_abs = (-self.cum_net_bps_x100[slot_idx][dir]).max(0);
+            let sl_s = i64::from(self.sl_streak[slot_idx][dir].min(4));
+            let elastic_scar_heal_ns = (900_000_000_000 * sl_s * sl_s)
+                + ((debt_abs - 3_000).max(0) * 18_000_000_000);
             if self.price_sample_count[slot_idx] >= 60
-                && self.sl_streak[slot_idx][dir] >= 1
                 && self.last_sl_ts_ns > 0
                 && now_ns > self.last_sl_ts_ns
-                && now_ns.saturating_sub(self.last_sl_ts_ns) > 900_000_000_000
                 && mean_reverted
             {
-                self.sl_streak[slot_idx][dir] = 0;
-                self.cum_net_bps_x100[slot_idx][dir] =
-                    (self.cum_net_bps_x100[slot_idx][dir] / 2).max(-1_200);
-                self.ewma_net_bps_x100[slot_idx][dir] =
-                    ((self.ewma_net_bps_x100[slot_idx][dir] + 160) / 2).max(80);
-                self.global_dir_sl_streak[dir] = 0;
-                self.global_dir_debt_bps_x100[dir] =
-                    (self.global_dir_debt_bps_x100[dir] / 2).max(-1_500);
+                let since_sl = now_ns.saturating_sub(self.last_sl_ts_ns);
+                if since_sl > 900_000_000_000 {
+                    self.global_dir_sl_streak[dir] = 0;
+                    self.global_dir_debt_bps_x100[dir] =
+                        (self.global_dir_debt_bps_x100[dir] / 2).max(-1_500);
+                }
+                if self.sl_streak[slot_idx][dir] >= 1 && since_sl > elastic_scar_heal_ns {
+                    self.sl_streak[slot_idx][dir] =
+                        self.sl_streak[slot_idx][dir].saturating_sub(1);
+                    self.cum_net_bps_x100[slot_idx][dir] =
+                        (self.cum_net_bps_x100[slot_idx][dir] / 2).max(-1_200);
+                    self.ewma_net_bps_x100[slot_idx][dir] =
+                        ((self.ewma_net_bps_x100[slot_idx][dir] + 160) / 2).max(80);
+                }
             }
             dir += 1;
         }
@@ -2101,7 +2108,8 @@ impl OnlineAdaptiveGovernor {
                 return Some("VETO_GLOBAL_WAVE_OR_SL_BREATHER");
             }
         }
-        if self.last_sl_ts_ns > self.last_global_win_ts_ns
+        if self.price_sample_count[slot_idx] == 0
+            && self.last_sl_ts_ns > self.last_global_win_ts_ns
             && check_ts_ns.saturating_sub(self.last_sl_ts_ns) >= 7_200_000_000_000
             && self.win_streak[slot_idx][d] == 0
         {
@@ -4501,6 +4509,27 @@ mod tests {
         gov.ewma_slow_px_1e4[0] = base_px - 180_000;
         gov.ewma_fast_px_1e4[0] = base_px + 1_650_000;
         assert!(gov.authorizes_adaptive_entry(0, Side::Bid, &snap, &snap));
-        println!("[POST-SL 2H DEADLOCK AUDIT] 1Hz healing & live entry certified!");
+        // Deep multi-SL scar on ETHUSDT Bid (S4#07 -48.42 + S5#01 -37.22 -> sl_s=2, debt=-8515)
+        // MUST remain locked in VETO_DEEP_SCAR_DEBT_QUARANTINE at +6.7h (blocking PAR1 #3 loss)!
+        gov.observe_closed_trade(1, Side::Bid, ScaledBps(-4_842), false, TimestampNs(t_sl));
+        let t_sl2 = TimestampNs(t_sl + 10_000_000_000);
+        gov.observe_closed_trade(1, Side::Bid, ScaledBps(-3_722), false, t_sl2);
+        let mut eth_s = snap;
+        eth_s.symbol_id = SymbolId(2);
+        eth_s.bids[0].price = PriceTicks(223_344);
+        eth_s.asks[0].price = PriceTicks(223_345);
+        let mut j = 0_i64;
+        while j < 65 {
+            eth_s.ts_local_ns = TimestampNs(t_6h_later + j * 1_100_000_000);
+            gov.observe_market_price(1, &eth_s);
+            j += 1;
+        }
+        assert_eq!(
+            gov.audit_historical_entry_veto(1, Side::Bid, 223_344, eth_s.ts_local_ns.0),
+            Some("VETO_DEEP_SCAR_DEBT_QUARANTINE")
+        );
+        let btc_v = gov.audit_historical_entry_veto(0, Side::Bid, base_t, eth_s.ts_local_ns.0);
+        assert_eq!(btc_v, None);
+        println!("[ELASTIC SCAR HEAL AUDIT] BTC unlocked (2/2 WIN) & ETH deep scar quarantined!");
     }
 }
