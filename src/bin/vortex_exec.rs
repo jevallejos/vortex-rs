@@ -535,8 +535,11 @@ impl BybitV5LiveClient {
         entry_price: PriceTicks,
         last_pegged_price: &mut PriceTicks,
     ) {
-        let green_px =
-            ExecutionFsm::defensive_zero_loss_maker_exit_price(open_side, entry_price);
+        let green_px = ExecutionFsm::dynamic_maker_floor_price(
+            open_side,
+            entry_price,
+            ScaledBps(500),
+        );
         if last_pegged_price.0 == green_px.0 {
             return;
         }
@@ -2773,9 +2776,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 );
                             }
                             let hold_el = snap.ts_local_ns.0.saturating_sub(open_since_ts.0);
-                            let g_px = ExecutionFsm::defensive_zero_loss_maker_exit_price(
+                            let g_px = ExecutionFsm::dynamic_maker_floor_price(
                                 open_side,
                                 open_entry_price,
+                                ScaledBps(500),
                             );
                             let safe_passive = match open_side {
                                 Side::Bid => {
@@ -2783,7 +2787,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 }
                                 Side::Ask => snap.asks[0].price.0 > g_px.0,
                             };
-                            if hold_el >= 10_000_000_000 && safe_passive {
+                            if hold_el >= 60_000_000_000 && safe_passive {
                                 if let Some(ref client) = live_client {
                                     let spec = APPROVED_SPECS[active_slot];
                                     client.arm_patient_green_exit(

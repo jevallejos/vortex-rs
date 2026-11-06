@@ -1079,7 +1079,7 @@ impl ExecutionFsm {
             let pure_green_floor =
                 Self::compute_gross_scaled_bps(side, entry_price, quantum_floor_px)
                     .raw()
-                    .max(fee_barrier_bps + 1);
+                    .max(fee_barrier_bps + 50);
             let zero_loss_scratch_floor = pure_green_floor;
             let mfe_excess = (learned_mfe - fee_barrier_bps).max(0);
             let cur_mae_raw = Self::compute_gross_scaled_bps(
@@ -1181,9 +1181,10 @@ impl ExecutionFsm {
             let rescue_gross_bps =
                 current_gross_bps.raw().max(maker_l1_gross.min(trade_ref_gross));
             let patient_green_recovery = !in_trend_free_ride_zone
-                && ((hold_elapsed >= impulse_immunity_ns && cur_mae_raw <= -200)
+                && ((hold_elapsed >= impulse_immunity_ns && cur_mae_raw <= -250)
                     || hold_elapsed >= elastic_stagnant_ns)
-                && rescue_gross_bps >= pure_green_floor;
+                && rescue_gross_bps >= pure_green_floor
+                && (!strong_trend_continuation || rescue_gross_bps >= structural_win_floor);
             let scratch_escape = patient_green_recovery
                 || (!in_trend_free_ride_zone
                     && hold_elapsed >= elastic_scratch_ns
@@ -1254,11 +1255,17 @@ impl ExecutionFsm {
                 } else {
                     ExitSubReason::StagnantTimerUnwind
                 };
-                let exit_px_final = if current_gross_bps.raw() >= pure_green_floor {
-                    Self::clamp_defensive_zero_loss_floor(side, entry_price, bbo_exit_price)
+                let raw_exit_cand = if current_gross_bps.raw() >= pure_green_floor {
+                    bbo_exit_price
                 } else {
-                    Self::clamp_defensive_zero_loss_floor(side, entry_price, maker_l1_px)
+                    maker_l1_px
                 };
+                let exit_px_final = Self::clamp_continuous_maker_floor(
+                    side,
+                    entry_price,
+                    raw_exit_cand,
+                    ScaledBps(pure_green_floor),
+                );
                 return Some(self.finalize_close(
                     ClosedTradeKind::MakerPassiveUnwind,
                     side,
@@ -4609,10 +4616,10 @@ mod tests {
         snap.factor_tfi = BoundedScore::new_clamped(-0.99);
         assert!(fsm.step_open_position(&snap, &mut ledger).is_none());
         snap.ts_local_ns = TimestampNs(4_200_000_000_000);
-        snap.mark_price = PriceTicks(756_908);
-        snap.last_trade_price = PriceTicks(756_908);
-        snap.bids[0].price = PriceTicks(756_908);
-        snap.asks[0].price = PriceTicks(756_909);
+        snap.mark_price = PriceTicks(757_050);
+        snap.last_trade_price = PriceTicks(757_050);
+        snap.bids[0].price = PriceTicks(757_050);
+        snap.asks[0].price = PriceTicks(757_051);
         snap.factor_ofi = BoundedScore::new_clamped(0.65);
         snap.factor_tfi = BoundedScore::new_clamped(0.80);
         let green_exit = fsm.step_open_position(&snap, &mut ledger);
