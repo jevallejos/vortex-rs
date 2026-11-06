@@ -1965,12 +1965,16 @@ fn print_live_shm_hud() -> ExitCode {
     let aborts = arena.exec_abort_count.load(Ordering::Acquire);
     let fills = arena.exec_fill_count.load(Ordering::Acquire);
     let closed = arena.exec_closed_count.load(Ordering::Acquire);
+    let drain_lock = Path::new("data/vault/DRAIN_MODE.lock").exists();
     let (st_col, st_icon, state_label) = match state_code {
+        0 if drain_lock => (ANSI_GREEN, "\u{1f7e2}", "DRAINING_WAIT_SYNC"),
         0 => (ANSI_GRAY, "\u{26aa}", "IDLE (SCANNING)"),
         1 => (ANSI_YELLOW, "\u{1f7e1}", "PLACING_MAKER"),
         2 => (ANSI_YELLOW, "\u{1f7e1}", "RESTING_L1_QUEUE"),
+        3 if drain_lock => (ANSI_GREEN, "\u{1f7e2}", "DRAINING_OPEN_SESSIONS"),
         3 => (ANSI_YELLOW, "\u{1f7e1}", "POSITION_OPEN_MAKER_TP"),
         4 => (ANSI_RED, "\u{1f534}", "EMERGENCY_SL"),
+        6 => (ANSI_GREEN, "\u{1f7e2}", "DRAIN_COMPLETE_STOPPED"),
         _ => (ANSI_RED, "\u{1f7e3}", "HALTED_ON_LOSS"),
     };
     let (disp_en, disp_pk, disp_tp, disp_sl) = if state_code == 0 {
@@ -2246,6 +2250,23 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         }
 
         mux_tick = mux_tick.wrapping_add(1);
+        let drain_active = Path::new("data/vault/DRAIN_MODE.lock").exists()
+            || ledger.closed_trades_count >= 200;
+        if drain_active
+            && matches!(
+                fsm.state,
+                OrderLifecycleState::PlacingEntryMaker { .. }
+                    | OrderLifecycleState::RestingEntryQueue { .. }
+            )
+        {
+            if let Some(ref client) = live_client {
+                let sym_c = APPROVED_SPECS[active_slot].symbol_id.name();
+                if !client.get_open_position_size(sym_c).0 {
+                    client.cancel_all_symbol_orders(sym_c);
+                }
+            }
+            fsm.state = OrderLifecycleState::Idle;
+        }
         let fsm_is_open = matches!(fsm.state, OrderLifecycleState::PositionOpenMakerExit { .. });
         let fsm_is_idle = matches!(fsm.state, OrderLifecycleState::Idle);
         if fsm_is_open {
@@ -2261,7 +2282,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 last_opened_ts: fsm.last_opened_ts,
                 last_armed_ts: fsm.last_armed_ts,
             };
-            if extra_sessions.len() < 5 && (mux_tick & 3) == 0 {
+            if !drain_active && extra_sessions.len() < 5 && (mux_tick & 3) == 0 {
                 extra_sessions.push(cur_s);
                 fsm.state = OrderLifecycleState::Idle;
                 last_pegged_exit_price = PriceTicks(0);
@@ -2283,7 +2304,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 fsm.last_opened_ts = sp.last_opened_ts;
                 fsm.last_armed_ts = sp.last_armed_ts;
             }
-        } else if fsm_is_idle && !extra_sessions.is_empty() && (mux_tick & 3) != 0 {
+        } else if fsm_is_idle
+            && !extra_sessions.is_empty()
+            && (drain_active || (mux_tick & 3) != 0)
+        {
             let sp = extra_sessions.remove(0);
             active_slot = sp.slot_idx;
             fsm.active_slot_idx = sp.slot_idx;
@@ -2299,6 +2323,38 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         }
         match fsm.state {
             OrderLifecycleState::Idle => {
+                if drain_active {
+                    if let Some(ref client) = live_client {
+                        client.adopt_or_clean_exchange_positions(
+                            None,
+                            &mut fsm,
+                            arena,
+                            &mut active_slot,
+                            &tg_tx,
+                        );
+                        if matches!(
+                            fsm.state,
+                            OrderLifecycleState::PositionOpenMakerExit { .. }
+                        ) {
+                            is_third_partial = active_slot >= 1;
+                            partial_harvest_done = false;
+                            continue;
+                        }
+                    }
+                    arena.exec_state_code.store(6, Ordering::Release);
+                    arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                    println!(
+                        "{}\u{1f7e2} [BYBIT V5 DRAIN COMPLETE] 0 open positions remaining - 100% capital in Wallet. Cleanly stopping daemon!{}",
+                        ANSI_GREEN, ANSI_RESET
+                    );
+                    if let Some(ref tx) = tg_tx {
+                        let _ = tx.try_send(String::from(
+                            "\u{1f7e2} [VORTEX-L2 DRENAJE COMPLETADO]\n0 posiciones abiertas en Bybit.\n100% capital liquido en Billetera (Wallet == Equity).\nMotor detenido limpiamente para implementar las 4 mejoras.",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                    return ExitCode::SUCCESS;
+                }
                 if extra_sessions.is_empty() {
                     arena.exec_state_code.store(0, Ordering::Release);
                     arena.exec_queue_ahead_lots.store(0, Ordering::Release);
