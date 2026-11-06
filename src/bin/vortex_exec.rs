@@ -429,6 +429,11 @@ impl BybitV5LiveClient {
                                     Side::Bid => (PriceTicks(entry_t.0 + tp_d), PriceTicks((entry_t.0 - sl_d).max(1))),
                                     Side::Ask => (PriceTicks((entry_t.0 - tp_d).max(1)), PriceTicks(entry_t.0 + sl_d)),
                                 };
+                                let clr_sl = format!(
+                                    "{{\"category\":\"linear\",\"symbol\":\"{}\",\"stopLoss\":\"0\",\"positionIdx\":0}}",
+                                    open_sym
+                                );
+                                let _ = self.post_v5("/v5/position/trading-stop", &clr_sl);
                                 let now_ns = TimestampNs(now_epoch_ns());
                                 *active_slot = slot_idx;
                                 fsm.active_slot_idx = slot_idx;
@@ -488,9 +493,10 @@ impl BybitV5LiveClient {
             Side::Ask => "Sell",
         };
         let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, in_scar_debt);
+        let _ = (sw, sf);
         let body = format!(
-            "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",\"price\":\"{}.{:04}\",\"stopLoss\":\"{}.{:04}\",\"slTriggerBy\":\"MarkPrice\",\"positionIdx\":0}}",
-            symbol, bybit_side, qty_str, ew, ef, sw, sf
+            "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",\"price\":\"{}.{:04}\",\"positionIdx\":0}}",
+            symbol, bybit_side, qty_str, ew, ef
         );
         match self.post_v5("/v5/order/create", &body) {
             Some(resp) => {
@@ -584,10 +590,7 @@ impl BybitV5LiveClient {
         let open_side = summary.side;
         let entry_price = summary.entry_price;
         let candidate_exit = summary.exit_price;
-        let force_market_if_unfilled = matches!(
-            summary.kind,
-            ClosedTradeKind::ServerMarkPriceStopLoss
-        );
+        let force_market_if_unfilled = false;
         let close_side = match open_side {
             Side::Bid => "Sell",
             Side::Ask => "Buy",
@@ -2522,6 +2525,11 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         let saved_ledger = ledger;
 
                         if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
+                            if !summary.is_maker_exit || summary.net_scaled_bps.raw() <= 0 {
+                                fsm = saved_fsm;
+                                ledger = saved_ledger;
+                                continue;
+                            }
                             let spec = APPROVED_SPECS[active_slot];
                             let default_clamped_px = if !summary.is_maker_exit {
                                 summary.exit_price
@@ -2765,14 +2773,17 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 );
                             }
                             let hold_el = snap.ts_local_ns.0.saturating_sub(open_since_ts.0);
+                            let g_px = ExecutionFsm::defensive_zero_loss_maker_exit_price(
+                                open_side,
+                                open_entry_price,
+                            );
                             let safe_passive = match open_side {
                                 Side::Bid => {
-                                    snap.asks[0].price.0 > 0
-                                        && snap.asks[0].price.0 < open_entry_price.0
+                                    snap.bids[0].price.0 > 0 && snap.bids[0].price.0 < g_px.0
                                 }
-                                Side::Ask => snap.bids[0].price.0 > open_entry_price.0,
+                                Side::Ask => snap.asks[0].price.0 > g_px.0,
                             };
-                            if hold_el >= 25_000_000_000 && safe_passive {
+                            if hold_el >= 10_000_000_000 && safe_passive {
                                 if let Some(ref client) = live_client {
                                     let spec = APPROVED_SPECS[active_slot];
                                     client.arm_patient_green_exit(

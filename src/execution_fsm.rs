@@ -1076,10 +1076,11 @@ impl ExecutionFsm {
                 ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
             let quantum_floor_px =
                 Self::defensive_zero_loss_maker_exit_price(side, entry_price);
-            let zero_loss_scratch_floor =
+            let pure_green_floor =
                 Self::compute_gross_scaled_bps(side, entry_price, quantum_floor_px)
                     .raw()
                     .max(fee_barrier_bps + 1);
+            let zero_loss_scratch_floor = pure_green_floor;
             let mfe_excess = (learned_mfe - fee_barrier_bps).max(0);
             let cur_mae_raw = Self::compute_gross_scaled_bps(
                 side,
@@ -1182,7 +1183,7 @@ impl ExecutionFsm {
             let patient_green_recovery = !in_trend_free_ride_zone
                 && ((hold_elapsed >= impulse_immunity_ns && cur_mae_raw <= -200)
                     || hold_elapsed >= elastic_stagnant_ns)
-                && rescue_gross_bps >= zero_loss_scratch_floor;
+                && rescue_gross_bps >= pure_green_floor;
             let scratch_escape = patient_green_recovery
                 || (!in_trend_free_ride_zone
                     && hold_elapsed >= elastic_scratch_ns
@@ -1253,8 +1254,8 @@ impl ExecutionFsm {
                 } else {
                     ExitSubReason::StagnantTimerUnwind
                 };
-                let exit_px_final = if current_gross_bps.raw() >= zero_loss_scratch_floor {
-                    bbo_exit_price
+                let exit_px_final = if current_gross_bps.raw() >= pure_green_floor {
+                    Self::clamp_defensive_zero_loss_floor(side, entry_price, bbo_exit_price)
                 } else {
                     Self::clamp_defensive_zero_loss_floor(side, entry_price, maker_l1_px)
                 };

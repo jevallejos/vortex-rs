@@ -659,6 +659,11 @@ fn replay_captured_live_parquet_segments() {
                                 let saved_fsm = fsm;
                                 let saved_ledger = ledger;
                                 if let Some(mut summary) = fsm.step_open_position(&snap, &mut ledger) {
+                                    if !summary.is_maker_exit || summary.net_scaled_bps.raw() <= 0 {
+                                        fsm = saved_fsm;
+                                        ledger = saved_ledger;
+                                        continue;
+                                    }
                                     if summary.is_maker_exit {
                                         let def_px =
                                             ExecutionFsm::defensive_zero_loss_maker_exit_price(
