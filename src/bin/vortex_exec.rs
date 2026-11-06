@@ -522,6 +522,54 @@ impl BybitV5LiveClient {
     /// - Returns `true` ONLY when Bybit confirms `0.00` open position size.
     /// - If `force_market_if_unfilled` is true (e.g., on Stop-Loss), sweeps any remaining size with `Market reduceOnly`.
     #[allow(clippy::too_many_arguments)]
+    fn arm_patient_green_exit(
+        &self,
+        spec: &PairSpec,
+        open_side: Side,
+        entry_price: PriceTicks,
+        last_pegged_price: &mut PriceTicks,
+    ) {
+        let green_px =
+            ExecutionFsm::defensive_zero_loss_maker_exit_price(open_side, entry_price);
+        if last_pegged_price.0 == green_px.0 {
+            return;
+        }
+        let sym = spec.symbol_id.name();
+        let (is_open, pos_qty) = self.get_open_position_size(sym);
+        if !is_open {
+            return;
+        }
+        let close_s = match open_side {
+            Side::Bid => "Sell",
+            Side::Ask => "Buy",
+        };
+        self.cancel_all_symbol_orders(sym);
+        let (xw, xf) = spec.format_price_usdt_parts(green_px);
+        let p1 = format!(
+            "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",",
+            sym, close_s
+        );
+        let p2 = format!(
+            "\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",",
+            pos_qty
+        );
+        let p3 = format!(
+            "\"price\":\"{}.{:04}\",\"reduceOnly\":true,\"positionIdx\":0}}",
+            xw, xf
+        );
+        let body = format!("{}{}{}", p1, p2, p3);
+        if let Some(resp) = self.post_v5("/v5/order/create", &body) {
+            if resp.get("retCode").and_then(|v| v.as_i64()) == Some(0) {
+                *last_pegged_price = green_px;
+                println!(
+                    "{}\u{1f7e2} [PATIENT GREEN EXIT ARMED] {} {} qty={} @ {}.{:04} ({}t){}",
+                    ANSI_GREEN, sym, close_s, pos_qty, xw, xf, green_px.0, ANSI_RESET
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn execute_verified_close_step(
         &self,
         arena: &VortexShmArena,
@@ -2440,12 +2488,34 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 opened_ts: open_since_ts,
             } => {
                 if arena.slot(active_slot).is_ok() {
-                    let snap = cached_snaps[active_slot];
+                    let mut snap = cached_snaps[active_slot];
                     if snap.sequence_id > 0 {
                         if snap.sequence_id == last_seen_seq[active_slot] {
                             continue;
                         }
                         last_seen_seq[active_slot] = snap.sequence_id;
+                        if last_pegged_exit_price.0 > 0 && (snap.sequence_id & 63) == 0 {
+                            if let Some(ref client) = live_client {
+                                let sym_n = APPROVED_SPECS[active_slot].symbol_id.name();
+                                let (still_open, _) = client.get_open_position_size(sym_n);
+                                if !still_open {
+                                    let px_g = last_pegged_exit_price;
+                                    snap.last_trade_price = px_g;
+                                    snap.mark_price = px_g;
+                                    match open_side {
+                                        Side::Bid => {
+                                            snap.bids[0].price = px_g;
+                                            snap.asks[0].price = PriceTicks(px_g.0 + 1);
+                                        }
+                                        Side::Ask => {
+                                            snap.bids[0].price =
+                                                PriceTicks((px_g.0 - 1).max(1));
+                                            snap.asks[0].price = px_g;
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         // Save state snapshot before step_open_position in case Bybit close is not yet filled
                         let saved_fsm = fsm;
@@ -2693,6 +2763,25 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     fsm.last_eff_sl_ticks.0 as u64,
                                     Ordering::Release,
                                 );
+                            }
+                            let hold_el = snap.ts_local_ns.0.saturating_sub(open_since_ts.0);
+                            let safe_passive = match open_side {
+                                Side::Bid => {
+                                    snap.asks[0].price.0 > 0
+                                        && snap.asks[0].price.0 < open_entry_price.0
+                                }
+                                Side::Ask => snap.bids[0].price.0 > open_entry_price.0,
+                            };
+                            if hold_el >= 25_000_000_000 && safe_passive {
+                                if let Some(ref client) = live_client {
+                                    let spec = APPROVED_SPECS[active_slot];
+                                    client.arm_patient_green_exit(
+                                        &spec,
+                                        open_side,
+                                        open_entry_price,
+                                        &mut last_pegged_exit_price,
+                                    );
+                                }
                             }
                         }
                     }

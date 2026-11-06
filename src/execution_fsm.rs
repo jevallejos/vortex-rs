@@ -577,8 +577,12 @@ impl ExecutionFsm {
             + (target_raw.max(0) / 2)
             + ((vol_raw - 8_000).max(0) / 30))
             .clamp(2_150, 2_750);
-        let elastic_sl_bps =
-            ((vol_raw * 26 + target_raw * 10 + slot_mfe_cap * 18) / 100).clamp(2_100, learned_sl_cap);
+        let base_sl_raw = (vol_raw * 26 + target_raw * 10 + slot_mfe_cap * 18) / 100;
+        let elastic_sl_bps = if vol_raw > 6_000 {
+            (14_000 + (vol_raw / 2) + slot_mfe_cap).clamp(16_000, 22_000)
+        } else {
+            base_sl_raw.clamp(2_100, learned_sl_cap)
+        };
         let sl_distance_ticks = ((entry_price.0 * elastic_sl_bps) / 1_000_000).max(4);
         let proposed_sl = match side {
             Side::Bid => PriceTicks(entry_price.0 - sl_distance_ticks),
@@ -894,7 +898,8 @@ impl ExecutionFsm {
         let wald_grace_ns = (immunity_ns * 3).clamp(75_000_000_000, 120_000_000_000);
         let wald_collapse_trigger =
             -1_200 - (snap.realized_vol_5m.raw() - 8_500).max(0);
-        let severe_adverse_collapse = hold_ns >= STAGNANT_PROFIT_HOLD_NS
+        let severe_adverse_collapse = snap.realized_vol_5m.raw() <= 6_000
+            && hold_ns >= STAGNANT_PROFIT_HOLD_NS
             && peak_gross_now == 0
             && adv_p >= 0.70
             && cur_gross_now < wald_collapse_trigger;
@@ -1174,13 +1179,18 @@ impl ExecutionFsm {
                 Self::compute_gross_scaled_bps(side, entry_price, ref_trade_price).raw();
             let rescue_gross_bps =
                 current_gross_bps.raw().max(maker_l1_gross.min(trade_ref_gross));
-            let scratch_escape = !in_trend_free_ride_zone
-                && hold_elapsed >= elastic_scratch_ns
-                && rescue_gross_bps >= zero_loss_scratch_floor
-                && (joint_adverse
-                    || deep_joint_adverse
-                    || proactive_stagnant_escape
-                    || (flow_conviction <= -0.18 && signed_tfi <= -0.05));
+            let patient_green_recovery = !in_trend_free_ride_zone
+                && ((hold_elapsed >= impulse_immunity_ns && cur_mae_raw <= -200)
+                    || hold_elapsed >= elastic_stagnant_ns)
+                && rescue_gross_bps >= zero_loss_scratch_floor;
+            let scratch_escape = patient_green_recovery
+                || (!in_trend_free_ride_zone
+                    && hold_elapsed >= elastic_scratch_ns
+                    && rescue_gross_bps >= zero_loss_scratch_floor
+                    && (joint_adverse
+                        || deep_joint_adverse
+                        || proactive_stagnant_escape
+                        || (flow_conviction <= -0.18 && signed_tfi <= -0.05)));
             let struggling_rescue = !in_trend_free_ride_zone
                 && ((hold_elapsed >= elastic_struggle_ns
                     && joint_adverse
@@ -4531,5 +4541,58 @@ mod tests {
         let btc_v = gov.audit_historical_entry_veto(0, Side::Bid, base_t, eth_s.ts_local_ns.0);
         assert_eq!(btc_v, None);
         println!("[ELASTIC SCAR HEAL AUDIT] BTC unlocked (2/2 WIN) & ETH deep scar quarantined!");
+    }
+
+    #[test]
+    fn test_stage36_patient_green_hold_survives_deep_red_over_1h_and_exits_green() {
+        let spec = crate::types::APPROVED_SPECS[0];
+        let mut fsm = ExecutionFsm::new(1_250_000_000, 1_250_000_000);
+        let mut ledger = ParitySyncLedger::new(5_000_000_000);
+        let mut snap = SymbolLobSnapshot {
+            symbol_id: SymbolId(1),
+            is_eligible: true,
+            sequence_id: 1,
+            ts_exchange_ns: TimestampNs(1_000_000_000),
+            ts_local_ns: TimestampNs(1_000_000_000),
+            mark_price: PriceTicks(756_604),
+            last_trade_price: PriceTicks(756_604),
+            realized_vol_5m: ScaledBps(10_965),
+            factor_ofi: BoundedScore::new_clamped(0.48),
+            factor_tfi: BoundedScore::new_clamped(0.50),
+            factor_geom: BoundedScore::new_clamped(0.67),
+            ..SymbolLobSnapshot::default()
+        };
+        snap.bids[0] = BookLevel { price: PriceTicks(756_604), qty: LotQty(1_800) };
+        snap.asks[0] = BookLevel { price: PriceTicks(756_605), qty: LotQty(1_800) };
+        let verdict = SignalVerdict::AuthorizeMakerEntry {
+            side: Side::Bid,
+            target_excursion_scaled_bps: ScaledBps(4_500),
+            estimated_cost_rt_scaled_bps: ScaledBps(480),
+        };
+        assert_eq!(fsm.try_arm_maker_entry(&spec, &snap, verdict, LotQty(10)), Ok(true));
+        assert!(fsm.on_entry_order_resting(TimestampNs(1_025_000_000)));
+        assert!(fsm.on_entry_filled_maker(TimestampNs(1_050_000_000)));
+        snap.ts_local_ns = TimestampNs(274_000_000_000);
+        snap.mark_price = PriceTicks(754_500);
+        snap.last_trade_price = PriceTicks(754_500);
+        snap.bids[0].price = PriceTicks(754_500);
+        snap.asks[0].price = PriceTicks(754_501);
+        snap.factor_ofi = BoundedScore::new_clamped(-0.83);
+        snap.factor_tfi = BoundedScore::new_clamped(-0.99);
+        assert!(fsm.step_open_position(&snap, &mut ledger).is_none());
+        snap.ts_local_ns = TimestampNs(4_200_000_000_000);
+        snap.mark_price = PriceTicks(756_908);
+        snap.last_trade_price = PriceTicks(756_908);
+        snap.bids[0].price = PriceTicks(756_908);
+        snap.asks[0].price = PriceTicks(756_909);
+        snap.factor_ofi = BoundedScore::new_clamped(0.65);
+        snap.factor_tfi = BoundedScore::new_clamped(0.80);
+        let green_exit = fsm.step_open_position(&snap, &mut ledger);
+        assert!(green_exit.is_some());
+        if let Some(s) = green_exit {
+            assert!(s.is_maker_exit);
+            assert!(s.net_scaled_bps.raw() > 0);
+        }
+        println!("[PATIENT GREEN HOLD AUDIT] Survived -27.80 bps & exited GREEN at 1h10m!");
     }
 }
