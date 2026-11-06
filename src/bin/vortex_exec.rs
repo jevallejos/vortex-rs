@@ -2187,7 +2187,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             ),
                         };
                         let now2 = TimestampNs(now_epoch_ns());
-                        let is_s3 = !extra_sessions.is_empty();
+                        let is_s3 = s_i >= 1;
                         extra_sessions.push(ParallelOpenSession {
                             slot_idx: s_i,
                             state: OrderLifecycleState::PositionOpenMakerExit {
@@ -2344,28 +2344,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         &snap,
                                         &btc_leader_snap,
                                     ) {
-                                        let same_dir = extra_sessions
-                                            .iter()
-                                            .filter(|p| {
-                                                matches!(
-                                                    p.state,
-                                                    OrderLifecycleState::PositionOpenMakerExit {
-                                                        side: p_s,
-                                                        ..
-                                                    } if p_s == side
-                                                )
-                                            })
-                                            .count();
-                                        if same_dir >= 4 {
-                                            s += 1;
-                                            continue;
-                                        }
                                         let sc =
                                             OrthogonalFactorState::snr_composite_score(&snap).abs();
-                                        if extra_sessions.len() >= 6 && sc < 0.68 {
-                                            s += 1;
-                                            continue;
-                                        }
                                         let is_better = match best_cand {
                                             Some((_, _, _, _, best_sc)) => sc > best_sc,
                                             None => true,
