@@ -679,7 +679,8 @@ impl BybitV5LiveClient {
                     }
                 } else if let Ok(slot) = arena.slot(active_slot) {
                     if let Ok(s) = slot.read_snapshot(4) {
-                        let eff_sl = fsm.last_eff_sl_ticks.0;
+                        let _ = fsm.last_eff_sl_ticks.0;
+                        let eff_sl = 0_i64;
                         let v_c = s.realized_vol_5m.raw().clamp(4_000, 12_500);
                         let v_tol = (v_c / 40).clamp(100, 300);
                         let tol_t = ((entry_price.0 * v_tol) / 1_000_000).max(2);
