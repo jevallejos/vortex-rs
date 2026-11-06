@@ -1156,22 +1156,18 @@ fn build_consolidated_executive_sections(
         }
     };
     let total = wins + scratches + losses;
-    let filled_25 = ((total.min(25) * 20) / 25) as usize;
-    let filled_50 = ((total.min(50) * 20) / 50) as usize;
+    let filled_200 = ((total.min(200) * 20) / 200) as usize;
     let goal_usdt = 65.0_f64;
     let pct_65 = ((eq_usdt / goal_usdt) * 100.0).clamp(0.0, 100.0);
     let filled_65 = (((pct_65 * 20.0) / 100.0).round() as usize).min(20);
     let rem_usdt = (goal_usdt - eq_usdt).max(0.0);
-    let rem_25 = 25_u64.saturating_sub(total);
-    let pct_25 = (((total as f64) * 100.0) / 25.0).min(100.0);
-    let pct_50 = (((total as f64) * 100.0) / 50.0).min(100.0);
-    let mut bar_25 = String::with_capacity(60);
-    let mut bar_50 = String::with_capacity(60);
+    let rem_200 = 200_u64.saturating_sub(total);
+    let pct_200 = (((total as f64) * 100.0) / 200.0).min(100.0);
+    let mut bar_200 = String::with_capacity(60);
     let mut bar_65 = String::with_capacity(60);
     let mut b_i = 0_usize;
     while b_i < 20 {
-        bar_25.push(if b_i < filled_25 { '\u{2588}' } else { '\u{2591}' });
-        bar_50.push(if b_i < filled_50 { '\u{2588}' } else { '\u{2591}' });
+        bar_200.push(if b_i < filled_200 { '\u{2588}' } else { '\u{2591}' });
         bar_65.push(if b_i < filled_65 { '\u{2588}' } else { '\u{2591}' });
         b_i += 1;
     }
@@ -1255,12 +1251,8 @@ fn build_consolidated_executive_sections(
             ANSI_YELLOW, ANSI_RESET
         ),
         format!(
-            "  \u{2022} Meta 25 (Dash) : [{}] {:>2}/25 ({:>5.1}%) \u{2502} Faltan: {:>2} tiros (Dashboard Web)",
-            bar_25, total, pct_25, rem_25
-        ),
-        format!(
-            "  \u{2022} Meta 50 (Evol) : [{}] {:>2}/50 ({:>5.1}%) \u{2502} Salidas Maker : {:>6.1}%",
-            bar_50, total, pct_50, mkr_pct
+            "  \u{2022} Meta 200 (Evol): [{}] {:>3}/200 ({:>5.1}%) \u{2502} Faltan: {:>3} tiros \u{2502} Salidas Maker: {:>5.1}%",
+            bar_200, total, pct_200, rem_200, mkr_pct
         ),
         format!(
             "  \u{2022} Meta 65 USDT   : [{}] {:>7.4}/65.00 ({:>5.1}%) \u{2502} Faltan: {:>7.4} USDT",
