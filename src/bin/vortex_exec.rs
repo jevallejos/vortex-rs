@@ -579,7 +579,7 @@ impl BybitV5LiveClient {
         if let Some(resp) = self.post_v5("/v5/order/create", &body) {
             if resp.get("retCode").and_then(|v| v.as_i64()) == Some(0) {
                 println!(
-                    "{}\u{1f7e2} [SESSION #3/#4/#5 PARTIAL HARVEST 50%] {} {} qty={} @ {}.{:04}{}",
+                    "{}\u{1f7e2} [6-SESSION PARTIAL HARVEST 50%] {} {} qty={} @ {}.{:04}{}",
                     ANSI_GREEN, sym, cl_s, hq, hw, hf, ANSI_RESET
                 );
                 return true;
@@ -2049,7 +2049,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut exit_peg_attempts: u32 = 0;
     let mut entry_forensic = ForensicEntrySnapshot::default();
     let mut slot_cooldown_until_ns = [0_i64; 6];
-    let mut extra_sessions: Vec<ParallelOpenSession> = Vec::with_capacity(4);
+    let mut extra_sessions: Vec<ParallelOpenSession> = Vec::with_capacity(5);
     let mut is_third_partial = false;
     let mut partial_harvest_done = false;
     let mut mux_tick: u64 = 0;
@@ -2152,7 +2152,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         );
         if matches!(fsm.state, OrderLifecycleState::PositionOpenMakerExit { .. }) {
             for (s_i, sp_spec) in APPROVED_SPECS.iter().enumerate() {
-                if s_i == active_slot || extra_sessions.len() >= 4 {
+                if s_i == active_slot || extra_sessions.len() >= 5 {
                     continue;
                 }
                 let s_name = sp_spec.symbol_id.name();
@@ -2261,7 +2261,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 last_opened_ts: fsm.last_opened_ts,
                 last_armed_ts: fsm.last_armed_ts,
             };
-            if extra_sessions.len() < 4 && (mux_tick & 3) == 0 {
+            if extra_sessions.len() < 5 && (mux_tick & 3) == 0 {
                 extra_sessions.push(cur_s);
                 fsm.state = OrderLifecycleState::Idle;
                 last_pegged_exit_price = PriceTicks(0);
@@ -2321,7 +2321,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         s += 1;
                         continue;
                     }
-                    if extra_sessions.len() >= 2 && s == 0 {
+                    if extra_sessions.len() >= 5 {
                         s += 1;
                         continue;
                     }
@@ -2344,8 +2344,28 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         &snap,
                                         &btc_leader_snap,
                                     ) {
+                                        let same_dir = extra_sessions
+                                            .iter()
+                                            .filter(|p| {
+                                                matches!(
+                                                    p.state,
+                                                    OrderLifecycleState::PositionOpenMakerExit {
+                                                        side: p_s,
+                                                        ..
+                                                    } if p_s == side
+                                                )
+                                            })
+                                            .count();
+                                        if same_dir >= 4 {
+                                            s += 1;
+                                            continue;
+                                        }
                                         let sc =
                                             OrthogonalFactorState::snr_composite_score(&snap).abs();
+                                        if extra_sessions.len() >= 4 && sc < 0.68 {
+                                            s += 1;
+                                            continue;
+                                        }
                                         let is_better = match best_cand {
                                             Some((_, _, _, _, best_sc)) => sc > best_sc,
                                             None => true,
@@ -2366,7 +2386,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                     {
                         active_slot = b_slot;
                         exit_peg_attempts = 0;
-                        is_third_partial = extra_sessions.len() >= 2;
+                        is_third_partial = b_slot >= 1;
                         partial_harvest_done = false;
                         if let OrderLifecycleState::PlacingEntryMaker {
                             side: a_side,
