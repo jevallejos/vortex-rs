@@ -870,7 +870,7 @@ fn rehydrate_shadow_ledger(
     arena: &VortexShmArena,
 ) {
     prewarm_mfe_from_seed(fsm);
-    prewarm_governor_prices_from_parquet(adaptive_gov);
+    let mut scar_count: u64 = 0;
     let mut restored_count: u64 = 0;
     let mut seen_gov_ts: BTreeSet<i64> = BTreeSet::new();
     if let Ok(sf) = File::open("data/vault/vortex_governor_scar_memory.jsonl") {
@@ -882,15 +882,8 @@ fn rehydrate_shadow_ledger(
                     let is_maker = val.get("maker_exit").and_then(serde_json::Value::as_bool).unwrap_or(true);
                     let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
                     let side_str = val.get("side").and_then(serde_json::Value::as_str).unwrap_or("Bid");
-                    let slot_opt = match sym_str {
-                        "BTCUSDT" => Some(0),
-                        "ETHUSDT" => Some(1),
-                        "SOLUSDT" => Some(2),
-                        "AVAXUSDT" => Some(3),
-                        "TAOUSDT" => Some(4),
-                        "SUIUSDT" => Some(5),
-                        _ => None,
-                    };
+                    scar_count += 1;
+                    let slot_opt = slot_from_symbol_name(sym_str);
                     if let Some(s_idx) = slot_opt {
                         let s_side = side_from_str(side_str);
                         let en_t = val.get("entry_ticks").and_then(serde_json::Value::as_i64).unwrap_or(0);
@@ -909,13 +902,7 @@ fn rehydrate_shadow_ledger(
         }
     }
     let file_path = Path::new("data/vault/vortex_shadow_trades.jsonl");
-    let file = match File::open(file_path) {
-        Ok(f) => f,
-        Err(_) => {
-            arena.exec_closed_count.store(0, Ordering::Release);
-            return;
-        }
-    };
+    if let Ok(file) = File::open(file_path) {
     let reader = BufReader::new(file);
     for line in reader.lines().map_while(Result::ok) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -965,13 +952,16 @@ fn rehydrate_shadow_ledger(
             restored_count += 1;
         }
     }
+    }
+    prewarm_governor_prices_from_parquet(adaptive_gov);
     arena
         .exec_closed_count
         .store(restored_count, Ordering::Release);
     println!(
-        "{}🟢 [JSONL REHYDRATE] Restored {} clean trades (CumNetPnL: {:+.4} USDT | PF: {:.2}){}",
+        "{}🟢 [JSONL REHYDRATE] Restored {} trades & {} scars (CumNetPnL: {:+.4} USDT | PF: {:.2}){}",
         ANSI_GREEN,
         restored_count,
+        scar_count,
         (ledger.cumulative_net_pnl_1e8 as f64) / 100_000_000.0,
         (fsm.net_profit_factor_x100() as f64) / 100.0,
         ANSI_RESET
