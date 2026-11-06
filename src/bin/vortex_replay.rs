@@ -945,9 +945,13 @@ const V2_BYBIT_BENCHMARK: [V2ForensicRecord; 42] = [
 ];
 
 fn evaluate_v2_record_time_machine(rec: &V2ForensicRecord) -> (i64, &'static str) {
+    let sgn = match rec.side {
+        Side::Bid => 1_i64,
+        Side::Ask => -1_i64,
+    };
     let abs_geom = rec.geom_in_x100.abs();
-    let abs_drift = rec.drift_bps_x100.abs();
-    let abs_ext = rec.ext_bps_x100.abs();
+    let signed_drift = sgn * rec.drift_bps_x100;
+    let signed_ext = sgn * rec.ext_bps_x100;
     if abs_geom < 15 {
         return (0, "VETO_LOW_L2_GEOM_VACUUM (<0.15)");
     }
@@ -960,6 +964,13 @@ fn evaluate_v2_record_time_machine(rec: &V2ForensicRecord) -> (i64, &'static str
     } else {
         183_i64
     };
+    let min_self_ext = ((rec.vol5m_in_bps / 520)
+        + ((180 - rec_ewma).max(0) / 10)
+        - (((abs_geom - 20).max(0) * 2) / 3))
+        .clamp(6, 95);
+    if signed_drift <= 0 || signed_ext < min_self_ext {
+        return (0, "VETO_SIGNED_EQUILIBRIUM_BREAKDOWN (ext < X_min)");
+    }
     let rec_chased_neg = rec.entry_ticks == 759_315;
     let unanchored_rally = if rec.entry_ticks == 225_754 {
         (4_011 - 1_182) / 14
@@ -969,9 +980,9 @@ fn evaluate_v2_record_time_machine(rec: &V2ForensicRecord) -> (i64, &'static str
         0
     };
     let leader_opp_pen = if rec.entry_ticks == 225_754 { (414 / 8) + 35 } else { 0 };
-    let ext_crowd_pen = ((abs_ext * 16) - (abs_drift * 10)).max(0) / 10;
+    let ext_crowd_pen = ((signed_ext * 16) - (signed_drift * 10)).max(0) / 10;
     let dyn_kin_m = ((rec_ewma / 4) - ((rec.vol5m_in_bps - 10_000).max(0) / 600)).clamp(18, 52);
-    if abs_ext > abs_drift + dyn_kin_m {
+    if signed_ext > signed_drift + dyn_kin_m {
         return (0, "VETO_KINEMATIC_OVER_EXTENSION (|ext|>|drift|)");
     }
     let base_v_d = rec.vol5m_in_bps / 120;
@@ -980,18 +991,20 @@ fn evaluate_v2_record_time_machine(rec: &V2ForensicRecord) -> (i64, &'static str
     let gm_rel = ((abs_geom - 45).max(0) * 3) / 2;
     let learned_mfe_est = 400 + rec_ewma.clamp(80, 260);
     let climax_ext_cap = (200 + rec_ewma.max(0) - ((rec.vol5m_in_bps - 10_000).max(0) / 60)).clamp(175, 360);
-    let ext_headroom = (climax_ext_cap - abs_ext).max(0);
-    let climax_pen = (abs_ext - climax_ext_cap).max(0) * 15;
-    let kin_energy = (abs_drift - abs_ext) + (abs_drift - (learned_mfe_est / 2)).max(0).min(ext_headroom);
+    let ext_headroom = (climax_ext_cap - signed_ext).max(0);
+    let climax_pen = (signed_ext - climax_ext_cap).max(0) * 15;
+    let eq_support_pen = (min_self_ext - signed_ext).max(0) * 6;
+    let kin_energy = (signed_drift - signed_ext) + (signed_drift - (learned_mfe_est / 2)).max(0).min(ext_headroom);
     let req_kin_energy = (((learned_mfe_est * 19) / 100)
         + ((160 - rec_ewma).max(0) / 2)
         + ((rec.vol5m_in_bps - 9_500).max(0) / 200)
         + unanchored_rally
         + leader_opp_pen
-        + climax_pen)
+        + climax_pen
+        + eq_support_pen)
         .clamp(112, 480);
     let dyn_min_d = (base_v_d + ewma_pen + w_brk_pen + unanchored_rally + ext_crowd_pen + leader_opp_pen - gm_rel).clamp(35, 520);
-    if abs_drift < dyn_min_d || kin_energy < req_kin_energy {
+    if signed_drift < dyn_min_d || kin_energy < req_kin_energy {
         return (0, "VETO_KINEMATIC_ENERGY_SURFACE (E_kin < E_min)");
     }
     if rec.old_net_bps_x100 < -50 {

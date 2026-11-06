@@ -1652,8 +1652,10 @@ fn format_red_loss_forensic_box_json_line(
     let hold_ms = ((ts_ns.saturating_sub(opened_ts)).max(1)) / 1_000_000;
     let hold_s = (hold_ms as f64) / 1_000.0;
     let blocked_by_immunity = mfe_raw >= 401 && hold_ms < 20_000;
-    let d_abs = entry_forensic.drift_bps.abs();
-    let e_abs = entry_forensic.ext_bps.abs();
+    let (d_abs, e_abs) = match summary.side {
+        Side::Bid => (entry_forensic.drift_bps, entry_forensic.ext_bps),
+        Side::Ask => (-entry_forensic.drift_bps, -entry_forensic.ext_bps),
+    };
     let kin_accel_net_bps = ((d_abs - e_abs) as f64) / 100.0;
     let l_edge_c = entry_forensic.gov_ewma_bps.clamp(-200, 400);
     let mfe_est = 400 + l_edge_c.clamp(80, 260);

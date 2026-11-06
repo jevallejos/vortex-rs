@@ -2301,8 +2301,24 @@ impl OnlineAdaptiveGovernor {
                 return false;
             }
         }
-        let abs_d_now = self_drift_bps.abs();
-        let geom_pct = (candidate_snap.factor_geom.get().abs() * 100.0).round() as i64;
+        let (signed_drift, signed_ext, signed_btc_drift, signed_btc_ext) = match side {
+            Side::Bid => (self_drift_bps, self_ext_bps, btc_drift_bps, btc_ext_bps),
+            Side::Ask => (-self_drift_bps, -self_ext_bps, -btc_drift_bps, -btc_ext_bps),
+        };
+        let sym_debt_abs = (-self.cum_net_bps_x100[slot_idx][d]).max(0);
+        let abort_p = i64::from(self.abort_streak[slot_idx][d].min(4));
+        let geom_pct = (signed_geom * 100.0).round() as i64;
+        let min_self_ext = ((self_vol / 520)
+            + ((180 - learned_edge).max(0) / 10)
+            + (sym_debt_abs / 80)
+            + (abort_p * 8)
+            - (((geom_pct - 20).max(0) * 2) / 3))
+            .clamp(6, 95);
+        let btc_edge = self.ewma_net_bps_x100[0][d].clamp(-200, 400);
+        let min_btc_ext = ((btc_vol / 650) - (btc_edge.max(0) / 25)).clamp(4, 35);
+        if signed_drift <= 0 || signed_ext < min_self_ext {
+            return false;
+        }
         let anc_1e4 = self.wave_anchor_px_1e4[slot_idx][d];
         let chased_from_origin = if self.wave_step_count[slot_idx][d] >= 1 && anc_1e4 > 0 && cur_en_1e4 > 0 {
             match side {
@@ -2323,7 +2339,7 @@ impl OnlineAdaptiveGovernor {
         };
         let learned_range_2x = 2 * (400 + learned_edge.clamp(80, 260));
         let unanchored_rally_pen = (dist_from_prev_same_bps - learned_range_2x).max(0) / 14;
-        let ext_crowd_pen = ((self_ext_bps.abs() * 16) - (abs_d_now * 10)).max(0) / 10;
+        let ext_crowd_pen = ((signed_ext * 16) - (signed_drift * 10)).max(0) / 10;
         let leader_opp_debt_pen = if slot_idx > 0 {
             (self.cum_net_bps_x100[0][1 - d].max(0) / 8)
                 + (self.wave_step_count[0][1 - d] as i64) * 35
@@ -2348,10 +2364,11 @@ impl OnlineAdaptiveGovernor {
         let climax_ext_cap = (200 + learned_edge.max(0)
             - ((self_vol - 10_000).max(0) / 60))
             .clamp(175, 360);
-        let ext_headroom = (climax_ext_cap - self_ext_bps.abs()).max(0);
-        let climax_pen = (self_ext_bps.abs() - climax_ext_cap).max(0) * 15;
-        let net_kin_accel = abs_d_now - self_ext_bps.abs();
-        let excess_vel_bonus = (abs_d_now - (learned_mfe_est / 2))
+        let ext_headroom = (climax_ext_cap - signed_ext).max(0);
+        let climax_pen = (signed_ext - climax_ext_cap).max(0) * 15;
+        let eq_support_pen = (min_self_ext - signed_ext).max(0) * 6;
+        let net_kin_accel = signed_drift - signed_ext;
+        let excess_vel_bonus = (signed_drift - (learned_mfe_est / 2))
             .max(0)
             .min(ext_headroom);
         let kin_energy = net_kin_accel + excess_vel_bonus;
@@ -2362,7 +2379,8 @@ impl OnlineAdaptiveGovernor {
             + structural_breakdown_pen
             + l2_absorption_pen
             + leader_opp_debt_pen
-            + climax_pen)
+            + climax_pen
+            + eq_support_pen)
             .clamp(112, 520);
         let leader_l2_divergent = slot_idx > 0
             && match side {
@@ -2384,7 +2402,7 @@ impl OnlineAdaptiveGovernor {
             - geom_relief)
             .clamp(35, 520);
         if self.price_sample_count[slot_idx] >= 5
-            && (abs_d_now < dynamic_min_drift
+            && (signed_drift < dynamic_min_drift
                 || kin_energy < req_kin_energy
                 || leader_l2_divergent)
         {
@@ -2394,7 +2412,7 @@ impl OnlineAdaptiveGovernor {
         if self.wave_step_count[slot_idx][1 - d] >= 1
             && opp_exit_1e4 > 0
             && cur_en_1e4 > 0
-            && self_drift_bps.abs() < 600
+            && signed_drift < 600
         {
             let opp_breakout_bps = match side {
                 Side::Bid => ((opp_exit_1e4 - cur_en_1e4).saturating_mul(1_000_000)) / opp_exit_1e4,
@@ -2407,7 +2425,6 @@ impl OnlineAdaptiveGovernor {
                 return false;
             }
         }
-        let sym_debt_abs = (-self.cum_net_bps_x100[slot_idx][d]).max(0);
         let since_sl_ns = candidate_snap.ts_local_ns.0.saturating_sub(self.last_sl_ts_ns);
         let elastic_sl_quarantine_ns =
             (sym_debt_abs.saturating_mul(250_000_000)).clamp(600_000_000_000, 900_000_000_000);
@@ -2415,11 +2432,10 @@ impl OnlineAdaptiveGovernor {
             && (sym_debt_abs >= 1_200 || learned_edge <= -100)
             && (since_sl_ns <= elastic_sl_quarantine_ns
                 || candidate_snap.factor_tfi.get().abs() < 0.60
-                || candidate_snap.factor_geom.get().abs() < 0.24)
+                || signed_geom < 0.24)
         {
             return false;
         }
-        let abort_p = i64::from(self.abort_streak[slot_idx][d].min(4));
         let base_drift = (((240 - learned_edge).max(90)) * self_vol) / 45_000;
         let min_trend_drift = (base_drift + (sym_debt_abs / 120) + (abort_p * 6)).max(15);
         let vol_damp = (self_vol - 6_500).max(0) / 35;
@@ -2433,51 +2449,30 @@ impl OnlineAdaptiveGovernor {
             - (abort_p * 25)
             - vol_damp)
             .clamp(180, 340);
-        let abs_drift = self_drift_bps.abs();
-        let abs_ext = self_ext_bps.abs();
-        let geom_sup = candidate_snap.factor_geom.get().abs();
         let fatigue_ext_cap = ((self_vol / 38) + (learned_edge / 3)).clamp(210, 340);
         let dyn_kin_margin =
             ((learned_edge.max(0) / 4) - ((self_vol - 10_000).max(0) / 600)).clamp(18, 52);
-        let step0_ext_cap = (abs_drift + dyn_kin_margin).min(fatigue_ext_cap);
-        if abs_ext > step0_ext_cap
+        let step0_ext_cap = (signed_drift + dyn_kin_margin).min(fatigue_ext_cap);
+        if signed_ext > step0_ext_cap
             || (self.wave_step_count[slot_idx][d] >= 1
-                && (learned_edge < 160 || geom_sup < 0.16)
-                && abs_ext > abs_drift)
+                && (learned_edge < 160 || signed_geom < 0.16)
+                && signed_ext > signed_drift)
         {
             return false;
         }
         let slot_stair_locked =
             self.win_streak[slot_idx][d] >= 1 && self.global_dir_win_streak[d] >= 2;
-        match side {
-            Side::Bid => {
-                if self_drift_bps < min_trend_drift
-                    || !(-20..=max_self_ext).contains(&self_ext_bps)
-                {
-                    return false;
-                }
-                if slot_idx > 0
-                    && (btc_drift_bps < 0
-                        || !(0..=max_btc_ext).contains(&btc_ext_bps)
-                        || slot_stair_locked)
-                {
-                    return false;
-                }
-            }
-            Side::Ask => {
-                if self_drift_bps > -min_trend_drift
-                    || !(-max_self_ext..=20).contains(&self_ext_bps)
-                {
-                    return false;
-                }
-                if slot_idx > 0
-                    && (btc_drift_bps > 0
-                        || !(-max_btc_ext..=0).contains(&btc_ext_bps)
-                        || slot_stair_locked)
-                {
-                    return false;
-                }
-            }
+        if signed_drift < min_trend_drift
+            || !(min_self_ext..=max_self_ext).contains(&signed_ext)
+        {
+            return false;
+        }
+        if slot_idx > 0
+            && (signed_btc_drift <= 0
+                || !(min_btc_ext..=max_btc_ext).contains(&signed_btc_ext)
+                || slot_stair_locked)
+        {
+            return false;
         }
         let (own_l1_q, opp_l1_q) = match side {
             Side::Bid => (
@@ -4013,5 +4008,46 @@ mod tests {
             k += 1;
         }
         assert_eq!(gov.sl_streak[0][1], 0);
+    }
+
+    #[test]
+    fn test_stage36_vector1_signed_kinematic_and_elastic_min_ext_floor() {
+        let mut gov = OnlineAdaptiveGovernor::new();
+        gov.price_sample_count[0] = 25;
+        let base_t = 800_000_i64;
+        let base_px = base_t * 10_000;
+        gov.ewma_slow_px_1e4[0] = base_px;
+        gov.ewma_fast_px_1e4[0] = base_px + 1_928_000;
+        let mut snap = SymbolLobSnapshot {
+            symbol_id: SymbolId(1),
+            ts_local_ns: TimestampNs(600_000_000_000),
+            realized_vol_5m: ScaledBps(9_000),
+            factor_ofi: BoundedScore::new_clamped(0.55),
+            factor_tfi: BoundedScore::new_clamped(0.65),
+            factor_geom: BoundedScore::new_clamped(0.25),
+            ..SymbolLobSnapshot::default()
+        };
+        let dump_t = base_t - 15;
+        snap.bids[0] = BookLevel { price: PriceTicks(dump_t), qty: LotQty(5_000) };
+        snap.asks[0] = BookLevel { price: PriceTicks(dump_t + 1), qty: LotQty(5_000) };
+        assert!(!gov.authorizes_adaptive_entry(0, Side::Bid, &snap, &snap));
+        let weak_t = base_t + 10;
+        snap.bids[0].price = PriceTicks(weak_t);
+        snap.asks[0].price = PriceTicks(weak_t + 1);
+        assert!(!gov.authorizes_adaptive_entry(0, Side::Bid, &snap, &snap));
+        let win_t = base_t + 8;
+        snap.bids[0].price = PriceTicks(win_t);
+        snap.asks[0].price = PriceTicks(win_t + 1);
+        snap.factor_geom = BoundedScore::new_clamped(0.57);
+        assert!(gov.authorizes_adaptive_entry(0, Side::Bid, &snap, &snap));
+        gov.ewma_fast_px_1e4[0] = base_px - 1_928_000;
+        let ask_win_t = base_t - 8;
+        snap.bids[0].price = PriceTicks(ask_win_t);
+        snap.asks[0].price = PriceTicks(ask_win_t + 1);
+        snap.factor_ofi = BoundedScore::new_clamped(-0.55);
+        snap.factor_tfi = BoundedScore::new_clamped(-0.65);
+        snap.factor_geom = BoundedScore::new_clamped(-0.57);
+        assert!(gov.authorizes_adaptive_entry(0, Side::Ask, &snap, &snap));
+        println!("[VECTOR 1 ELASTIC X_MIN AUDIT] Signed Bid/Ask & X_min [6..95] certified!");
     }
 }
