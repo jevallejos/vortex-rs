@@ -133,17 +133,270 @@ fn load_env_var_with_fallback(keys: &[&str]) -> Option<String> {
     None
 }
 
+struct BybitConnPool {
+    rest_tls: Option<native_tls::TlsStream<std::net::TcpStream>>,
+    ws_trade: Option<(
+        tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+        std::time::Instant,
+    )>,
+}
+
+impl core::fmt::Debug for BybitConnPool {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BybitConnPool")
+            .field("rest_connected", &self.rest_tls.is_some())
+            .field("ws_trade_connected", &self.ws_trade.is_some())
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BybitV5LiveClient {
     api_key: String,
     api_secret: String,
+    pool: std::sync::Arc<std::sync::Mutex<BybitConnPool>>,
 }
 
 impl BybitV5LiveClient {
+    fn new_with_pool(api_key: String, api_secret: String) -> Self {
+        Self {
+            api_key,
+            api_secret,
+            pool: std::sync::Arc::new(std::sync::Mutex::new(BybitConnPool {
+                rest_tls: None,
+                ws_trade: None,
+            })),
+        }
+    }
+
     fn from_env_readonly() -> Option<Self> {
         let api_key = load_env_var_with_fallback(&["BYBIT_API_KEY", "API_KEY"])?;
         let api_secret = load_env_var_with_fallback(&["BYBIT_API_SECRET", "API_SECRET"])?;
-        Some(Self { api_key, api_secret })
+        Some(Self::new_with_pool(api_key, api_secret))
+    }
+
+    fn open_keepalive_tls() -> Option<native_tls::TlsStream<std::net::TcpStream>> {
+        use std::net::ToSocketAddrs;
+        let addr = "api.bybit.com:443".to_socket_addrs().ok()?.next()?;
+        let tcp = std::net::TcpStream::connect_timeout(
+            &addr,
+            Duration::from_millis(2_500),
+        )
+        .ok()?;
+        let _ = tcp.set_nodelay(true);
+        let _ = tcp.set_read_timeout(Some(Duration::from_millis(3_000)));
+        let _ = tcp.set_write_timeout(Some(Duration::from_millis(3_000)));
+        let connector = native_tls::TlsConnector::new().ok()?;
+        connector.connect("api.bybit.com", tcp).ok()
+    }
+
+    fn read_http11_body(
+        stream: &mut native_tls::TlsStream<std::net::TcpStream>,
+    ) -> Option<(Vec<u8>, bool)> {
+        use std::io::Read;
+        let mut raw = Vec::with_capacity(4_096);
+        let mut tmp = [0_u8; 4_096];
+        let hdr_end = loop {
+            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+            if raw.len() > 65_536 {
+                return None;
+            }
+            let n = stream.read(&mut tmp).ok()?;
+            if n == 0 {
+                return None;
+            }
+            raw.extend_from_slice(&tmp[..n]);
+        };
+        let body_start = hdr_end + 4;
+        let hdr_ascii = String::from_utf8_lossy(&raw[..hdr_end]).to_ascii_lowercase();
+        let conn_close = hdr_ascii.contains("connection: close");
+        let mut content_len: Option<usize> = None;
+        for line in hdr_ascii.lines() {
+            if let Some(rest) = line.strip_prefix("content-length:") {
+                content_len = rest.trim().parse::<usize>().ok();
+            }
+        }
+        if let Some(cl) = content_len {
+            while raw.len() < body_start + cl {
+                let n = stream.read(&mut tmp).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                raw.extend_from_slice(&tmp[..n]);
+            }
+            return Some((raw[body_start..body_start + cl].to_vec(), conn_close));
+        }
+        if hdr_ascii.contains("transfer-encoding: chunked") {
+            let mut out = Vec::with_capacity(2_048);
+            let mut pos = body_start;
+            loop {
+                let line_end = loop {
+                    if let Some(rel) = raw[pos..].windows(2).position(|w| w == b"\r\n") {
+                        break pos + rel;
+                    }
+                    let n = stream.read(&mut tmp).ok()?;
+                    if n == 0 {
+                        return None;
+                    }
+                    raw.extend_from_slice(&tmp[..n]);
+                };
+                let sz_str = core::str::from_utf8(&raw[pos..line_end])
+                    .ok()?
+                    .split(';')
+                    .next()?
+                    .trim();
+                let chunk_sz = usize::from_str_radix(sz_str, 16).ok()?;
+                pos = line_end + 2;
+                if chunk_sz == 0 {
+                    return Some((out, conn_close));
+                }
+                while raw.len() < pos + chunk_sz + 2 {
+                    let n = stream.read(&mut tmp).ok()?;
+                    if n == 0 {
+                        return None;
+                    }
+                    raw.extend_from_slice(&tmp[..n]);
+                }
+                out.extend_from_slice(&raw[pos..pos + chunk_sz]);
+                pos += chunk_sz + 2;
+            }
+        }
+        None
+    }
+
+    fn exec_keepalive_http11(&self, raw_req: &str) -> Option<serde_json::Value> {
+        let mut guard = self.pool.lock().ok()?;
+        let mut attempt = 0_usize;
+        while attempt < 2 {
+            if guard.rest_tls.is_none() {
+                guard.rest_tls = Self::open_keepalive_tls();
+            }
+            if let Some(ref mut tls) = guard.rest_tls {
+                if tls.write_all(raw_req.as_bytes()).is_ok() && tls.flush().is_ok() {
+                    if let Some((body, close_flag)) = Self::read_http11_body(tls) {
+                        if close_flag {
+                            guard.rest_tls = None;
+                        }
+                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
+                            return Some(val);
+                        }
+                    }
+                }
+            }
+            guard.rest_tls = None;
+            attempt += 1;
+        }
+        None
+    }
+
+    fn open_authenticated_ws_trade(
+        &self,
+    ) -> Option<(
+        tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+        std::time::Instant,
+    )> {
+        let (mut ws, _) = tungstenite::connect("wss://stream.bybit.com/v5/trade").ok()?;
+        match ws.get_ref() {
+            tungstenite::stream::MaybeTlsStream::Plain(s) => {
+                let _ = s.set_nodelay(true);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(2_000)));
+                let _ = s.set_write_timeout(Some(Duration::from_millis(2_000)));
+            }
+            tungstenite::stream::MaybeTlsStream::NativeTls(tls) => {
+                let s = tls.get_ref();
+                let _ = s.set_nodelay(true);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(2_000)));
+                let _ = s.set_write_timeout(Some(Duration::from_millis(2_000)));
+            }
+            _ => {}
+        }
+        let exp_ms = (now_epoch_ns() / 1_000_000) + 10_000;
+        let exp_str = exp_ms.to_string();
+        let sig_bytes = sign_bybit_v5_hmac_sha256(
+            "GET/realtime",
+            "",
+            "",
+            &exp_str,
+            &self.api_secret,
+        );
+        let sig_str = core::str::from_utf8(&sig_bytes).unwrap_or("");
+        let auth_msg = format!(
+            "{{\"op\":\"auth\",\"args\":[\"{}\",{},\"{}\"]}}",
+            self.api_key, exp_ms, sig_str
+        );
+        ws.send(tungstenite::Message::Text(auth_msg)).ok()?;
+        let mut tries = 0_usize;
+        while tries < 4 {
+            tries += 1;
+            match ws.read().ok()? {
+                tungstenite::Message::Text(txt) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        if v.get("op").and_then(|x| x.as_str()) == Some("auth") {
+                            let rc = v.get("retCode").and_then(|x| x.as_i64()).unwrap_or(-1);
+                            if rc == 0 {
+                                return Some((ws, std::time::Instant::now()));
+                            }
+                            return None;
+                        }
+                    }
+                }
+                tungstenite::Message::Ping(p) => {
+                    let _ = ws.send(tungstenite::Message::Pong(p));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn try_ws_trade_order_create(
+        &self,
+        ts_ms: &str,
+        json_body: &str,
+    ) -> Option<serde_json::Value> {
+        let mut guard = self.pool.lock().ok()?;
+        if let Some((_, last_t)) = guard.ws_trade.as_ref() {
+            if last_t.elapsed() >= Duration::from_secs(18) {
+                guard.ws_trade = None;
+            }
+        }
+        if guard.ws_trade.is_none() {
+            guard.ws_trade = self.open_authenticated_ws_trade();
+        }
+        let (ref mut ws, ref mut last_t) = guard.ws_trade.as_mut()?;
+        let frame = format!(
+            "{{\"header\":{{\"X-BAPI-TIMESTAMP\":\"{}\",\"X-BAPI-RECV-WINDOW\":\"5000\"}},\"op\":\"order.create\",\"args\":[{}]}}",
+            ts_ms, json_body
+        );
+        if ws.send(tungstenite::Message::Text(frame)).is_err() {
+            guard.ws_trade = None;
+            return None;
+        }
+        let mut reads = 0_usize;
+        while reads < 6 {
+            reads += 1;
+            match ws.read() {
+                Ok(tungstenite::Message::Text(txt)) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                        if v.get("op").and_then(|x| x.as_str()) == Some("order.create") {
+                            *last_t = std::time::Instant::now();
+                            return Some(v);
+                        }
+                    }
+                }
+                Ok(tungstenite::Message::Ping(p)) => {
+                    let _ = ws.send(tungstenite::Message::Pong(p));
+                }
+                _ => {
+                    guard.ws_trade = None;
+                    return None;
+                }
+            }
+        }
+        guard.ws_trade = None;
+        None
     }
 
     fn query_unified_usdt_wallet(&self) -> Option<(f64, f64, f64, f64)> {
@@ -226,16 +479,17 @@ impl BybitV5LiveClient {
             (Some(k), Some(s)) => (k, s),
             _ => {
                 println!(
-                    "{}🔴 [BYBIT V5 LIVE] --live-capital requested but BYBIT_API_KEY / BYBIT_API_SECRET missing.{}",
+                    "{}\u{1f534} [BYBIT V5 LIVE] API keys missing.{}",
                     ANSI_RED, ANSI_RESET
                 );
                 return None;
             }
         };
-        let client = Self {
-            api_key: key,
-            api_secret: secret,
-        };
+        let client = Self::new_with_pool(key, secret);
+        if let Ok(mut g) = client.pool.lock() {
+            g.rest_tls = Self::open_keepalive_tls();
+            g.ws_trade = client.open_authenticated_ws_trade();
+        }
         for spec in APPROVED_SPECS {
             let sym = spec.symbol_id.name();
             let lev_body = format!(
@@ -245,19 +499,42 @@ impl BybitV5LiveClient {
             let _ = client.post_v5("/v5/position/set-leverage", &lev_body);
         }
         println!(
-            "{}🟢 [BYBIT V5 LIVE CAPITAL ARMED] Voragine V0.3 Global Account Lock + Per-Slot MFE + Deep L2/L3 Peg + dQ/dt Shield + Live Adopt + 36/36 Governor (Voragine V0.3.2) active.{}",
+            "{}\u{1f7e2} [BYBIT V5 LIVE CAPITAL ARMED] Persistent WS Trade API + TLS Keep-Alive + 4 Institutional Upgrades active.{}",
             ANSI_GREEN, ANSI_RESET
         );
         Some(client)
     }
+
     fn post_v5(&self, path: &str, json_body: &str) -> Option<serde_json::Value> {
         let ts_ms = (now_epoch_ns() / 1_000_000).to_string();
+        if path == "/v5/order/create" {
+            if let Some(ws_resp) = self.try_ws_trade_order_create(&ts_ms, json_body) {
+                return Some(ws_resp);
+            }
+        }
         let recv_win = "5000";
-        let sig_bytes =
-            sign_bybit_v5_hmac_sha256(&ts_ms, &self.api_key, recv_win, json_body, &self.api_secret);
+        let sig_bytes = sign_bybit_v5_hmac_sha256(
+            &ts_ms,
+            &self.api_key,
+            recv_win,
+            json_body,
+            &self.api_secret,
+        );
         let sig_str = core::str::from_utf8(&sig_bytes).unwrap_or("");
+        let raw_req = format!(
+            "POST {} HTTP/1.1\r\nHost: api.bybit.com\r\nConnection: keep-alive\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-BAPI-API-KEY: {}\r\nX-BAPI-TIMESTAMP: {}\r\nX-BAPI-RECV-WINDOW: {}\r\nX-BAPI-SIGN: {}\r\n\r\n{}",
+            path,
+            json_body.len(),
+            self.api_key,
+            ts_ms,
+            recv_win,
+            sig_str,
+            json_body
+        );
+        if let Some(v) = self.exec_keepalive_http11(&raw_req) {
+            return Some(v);
+        }
         let url = format!("https://api.bybit.com{}", path);
-
         let output = Command::new("curl")
             .args([
                 "-sS",
@@ -282,18 +559,28 @@ impl BybitV5LiveClient {
             ])
             .output()
             .ok()?;
-
         serde_json::from_slice(&output.stdout).ok()
     }
 
     fn get_v5(&self, path: &str, query_str: &str) -> Option<serde_json::Value> {
         let ts_ms = (now_epoch_ns() / 1_000_000).to_string();
         let recv_win = "5000";
-        let sig_bytes =
-            sign_bybit_v5_hmac_sha256(&ts_ms, &self.api_key, recv_win, query_str, &self.api_secret);
+        let sig_bytes = sign_bybit_v5_hmac_sha256(
+            &ts_ms,
+            &self.api_key,
+            recv_win,
+            query_str,
+            &self.api_secret,
+        );
         let sig_str = core::str::from_utf8(&sig_bytes).unwrap_or("");
+        let raw_req = format!(
+            "GET {}?{} HTTP/1.1\r\nHost: api.bybit.com\r\nConnection: keep-alive\r\nX-BAPI-API-KEY: {}\r\nX-BAPI-TIMESTAMP: {}\r\nX-BAPI-RECV-WINDOW: {}\r\nX-BAPI-SIGN: {}\r\n\r\n",
+            path, query_str, self.api_key, ts_ms, recv_win, sig_str
+        );
+        if let Some(v) = self.exec_keepalive_http11(&raw_req) {
+            return Some(v);
+        }
         let url = format!("https://api.bybit.com{}?{}", path, query_str);
-
         let output = Command::new("curl")
             .args([
                 "-sS",
@@ -314,7 +601,6 @@ impl BybitV5LiveClient {
             ])
             .output()
             .ok()?;
-
         serde_json::from_slice(&output.stdout).ok()
     }
 
@@ -1967,12 +2253,16 @@ fn print_live_shm_hud() -> ExitCode {
     let aborts = arena.exec_abort_count.load(Ordering::Acquire);
     let fills = arena.exec_fill_count.load(Ordering::Acquire);
     let closed = arena.exec_closed_count.load(Ordering::Acquire);
+    let drain_lock = Path::new("data/vault/DRAIN_MODE.lock").exists();
     let (st_col, st_icon, state_label) = match state_code {
+        0 if drain_lock => (ANSI_GREEN, "\u{1f7e2}", "DRAINING_WAIT_SYNC"),
         0 => (ANSI_GRAY, "\u{26aa}", "IDLE (SCANNING)"),
         1 => (ANSI_YELLOW, "\u{1f7e1}", "PLACING_MAKER"),
         2 => (ANSI_YELLOW, "\u{1f7e1}", "RESTING_L1_QUEUE"),
+        3 if drain_lock => (ANSI_GREEN, "\u{1f7e2}", "DRAINING_OPEN_SESSIONS"),
         3 => (ANSI_YELLOW, "\u{1f7e1}", "POSITION_OPEN_MAKER_TP"),
         4 => (ANSI_RED, "\u{1f534}", "EMERGENCY_SL"),
+        6 => (ANSI_GREEN, "\u{1f7e2}", "DRAIN_COMPLETE_STOPPED"),
         _ => (ANSI_RED, "\u{1f7e3}", "HALTED_ON_LOSS"),
     };
     let (disp_en, disp_pk, disp_tp, disp_sl) = if state_code == 0 {
@@ -2250,6 +2540,23 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         }
 
         mux_tick = mux_tick.wrapping_add(1);
+        let drain_active = Path::new("data/vault/DRAIN_MODE.lock").exists()
+            || ledger.closed_trades_count >= 200;
+        if drain_active
+            && matches!(
+                fsm.state,
+                OrderLifecycleState::PlacingEntryMaker { .. }
+                    | OrderLifecycleState::RestingEntryQueue { .. }
+            )
+        {
+            if let Some(ref client) = live_client {
+                let sym_c = APPROVED_SPECS[active_slot].symbol_id.name();
+                if !client.get_open_position_size(sym_c).0 {
+                    client.cancel_all_symbol_orders(sym_c);
+                }
+            }
+            fsm.state = OrderLifecycleState::Idle;
+        }
         let fsm_is_open = matches!(fsm.state, OrderLifecycleState::PositionOpenMakerExit { .. });
         let fsm_is_idle = matches!(fsm.state, OrderLifecycleState::Idle);
         if fsm_is_open {
@@ -2265,7 +2572,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 last_opened_ts: fsm.last_opened_ts,
                 last_armed_ts: fsm.last_armed_ts,
             };
-            if extra_sessions.len() < 5 && (mux_tick & 3) == 0 {
+            if !drain_active && extra_sessions.len() < 5 && (mux_tick & 3) == 0 {
                 extra_sessions.push(cur_s);
                 fsm.state = OrderLifecycleState::Idle;
                 last_pegged_exit_price = PriceTicks(0);
@@ -2287,7 +2594,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 fsm.last_opened_ts = sp.last_opened_ts;
                 fsm.last_armed_ts = sp.last_armed_ts;
             }
-        } else if fsm_is_idle && !extra_sessions.is_empty() && (mux_tick & 3) != 0 {
+        } else if fsm_is_idle
+            && !extra_sessions.is_empty()
+            && (drain_active || (mux_tick & 3) != 0)
+        {
             let sp = extra_sessions.remove(0);
             active_slot = sp.slot_idx;
             fsm.active_slot_idx = sp.slot_idx;
@@ -2303,6 +2613,38 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         }
         match fsm.state {
             OrderLifecycleState::Idle => {
+                if drain_active {
+                    if let Some(ref client) = live_client {
+                        client.adopt_or_clean_exchange_positions(
+                            None,
+                            &mut fsm,
+                            arena,
+                            &mut active_slot,
+                            &tg_tx,
+                        );
+                        if matches!(
+                            fsm.state,
+                            OrderLifecycleState::PositionOpenMakerExit { .. }
+                        ) {
+                            is_third_partial = active_slot >= 1;
+                            partial_harvest_done = false;
+                            continue;
+                        }
+                    }
+                    arena.exec_state_code.store(6, Ordering::Release);
+                    arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                    println!(
+                        "{}\u{1f7e2} [BYBIT V5 DRAIN COMPLETE] 0 open positions remaining - 100% capital in Wallet. Cleanly stopping daemon!{}",
+                        ANSI_GREEN, ANSI_RESET
+                    );
+                    if let Some(ref tx) = tg_tx {
+                        let _ = tx.try_send(String::from(
+                            "\u{1f7e2} [VORTEX-L2 DRENAJE COMPLETADO]\n0 posiciones abiertas en Bybit.\n100% capital liquido en Billetera (Wallet == Equity).",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                    return ExitCode::SUCCESS;
+                }
                 if extra_sessions.is_empty() {
                     arena.exec_state_code.store(0, Ordering::Release);
                     arena.exec_queue_ahead_lots.store(0, Ordering::Release);
@@ -2348,8 +2690,29 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         &snap,
                                         &btc_leader_snap,
                                     ) {
-                                        let sc =
+                                        let same_dir = extra_sessions
+                                            .iter()
+                                            .filter(|p| {
+                                                matches!(
+                                                    p.state,
+                                                    OrderLifecycleState::PositionOpenMakerExit {
+                                                        side: p_s,
+                                                        ..
+                                                    } if p_s == side
+                                                )
+                                            })
+                                            .count();
+                                        let opp_dir =
+                                            extra_sessions.len().saturating_sub(same_dir);
+                                        let raw_sc =
                                             OrthogonalFactorState::snr_composite_score(&snap).abs();
+                                        let sc = if opp_dir > same_dir {
+                                            raw_sc * 1.35
+                                        } else if same_dir >= 4 && opp_dir == 0 {
+                                            raw_sc * 0.85
+                                        } else {
+                                            raw_sc
+                                        };
                                         let is_better = match best_cand {
                                             Some((_, _, _, _, best_sc)) => sc > best_sc,
                                             None => true,

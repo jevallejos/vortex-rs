@@ -170,6 +170,23 @@ case "${1:-live}" in
     oos|-o)
         cd "${VORTEX_DIR}" && "${BIN_DIR}/vortex_exec"
         ;;
+    drain|drenar)
+        mkdir -p "${VORTEX_DIR}/data/vault"
+        touch "${VORTEX_DIR}/data/vault/DRAIN_MODE.lock"
+        echo "🟢 [MODO DRENAJE ACTIVADO] Custodiando en verde hasta 0 posiciones..."
+        sleep 1
+        "${BIN_DIR}/vortex_exec" --live
+        ;;
+    normal|resume|undrain)
+        rm -f "${VORTEX_DIR}/data/vault/DRAIN_MODE.lock"
+        rm -f "${VORTEX_DIR}/data/vault/HALTED_ON_LOSS.lock"
+        if ! systemctl is-active --quiet vortex-exec.service; then
+            sudo systemctl start vortex-exec.service
+            sleep 1
+        fi
+        echo "🟢 [MODO NORMAL RESTAURADO] Drenaje desactivado. 6/6 sesiones activas."
+        "${BIN_DIR}/vortex_exec" --live
+        ;;
     all)
         cd "${VORTEX_DIR}"
         "${BIN_DIR}/vortex_tap"
