@@ -592,14 +592,9 @@ impl BybitV5LiveClient {
         &self,
         spec: &PairSpec,
         open_side: Side,
-        entry_price: PriceTicks,
+        green_px: PriceTicks,
         last_pegged_price: &mut PriceTicks,
     ) {
-        let green_px = ExecutionFsm::dynamic_maker_floor_price(
-            open_side,
-            entry_price,
-            ScaledBps(500),
-        );
         if last_pegged_price.0 == green_px.0 {
             return;
         }
@@ -1273,6 +1268,13 @@ fn build_consolidated_executive_sections(
         format!(
             "  \u{2022} Profit Factor  :       {:>8.2}       \u{2502} Expectativa/Tiro    : {:>+8.2} bps  ({:>+8.4} USDT)",
             pf_val, exp_bps, exp_usdt
+        ),
+        format!(
+            "  \u{2022} Fondo Saneam.  : Reserva (30%): {:>+6.2} bps ({:>+7.4} USDT) \u{2502} Blindado (70%): {:>+6.2} bps ({:>+7.4} USDT)",
+            total_net_bps.max(0.0) * 0.30,
+            net_usdt.max(0.0) * 0.30,
+            total_net_bps.max(0.0) * 0.70,
+            net_usdt.max(0.0) * 0.70
         ),
     ];
     let sec_micro = vec![
@@ -2054,6 +2056,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut partial_harvest_done = false;
     let mut mux_tick: u64 = 0;
     rehydrate_shadow_ledger(&mut ledger, &mut fsm, &mut adaptive_gov, arena);
+    let mut sinking_fund_scaled_bps: i64 =
+        ((ledger.cumulative_net_pnl_1e8.max(0) / 1_250) * 30) / 100;
 
     let saved_state_code = arena.exec_state_code.load(Ordering::Acquire);
     let mut tracked_sym_on_startup: Option<&'static str> = None;
@@ -2712,7 +2716,35 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 let sym_n = APPROVED_SPECS[active_slot].symbol_id.name();
                                 let (still_open, _) = client.get_open_position_size(sym_n);
                                 if !still_open {
-                                    let px_g = last_pegged_exit_price;
+                                    let std_px = ExecutionFsm::dynamic_maker_floor_price(
+                                        open_side,
+                                        open_entry_price,
+                                        ScaledBps(500),
+                                    );
+                                    let raw_d = match open_side {
+                                        Side::Bid => {
+                                            last_pegged_exit_price.0 - open_entry_price.0
+                                        }
+                                        Side::Ask => {
+                                            open_entry_price.0 - last_pegged_exit_price.0
+                                        }
+                                    };
+                                    let real_g_bps = (raw_d.saturating_mul(1_000_000))
+                                        / open_entry_price.0.max(1);
+                                    if real_g_bps < 500 && !partial_harvest_done {
+                                        let used_s = (500 - real_g_bps).max(0);
+                                        sinking_fund_scaled_bps =
+                                            (sinking_fund_scaled_bps - used_s).max(0);
+                                    }
+                                    let px_g = match open_side {
+                                        Side::Bid => {
+                                            PriceTicks(last_pegged_exit_price.0.max(std_px.0))
+                                        }
+                                        Side::Ask => PriceTicks(
+                                            last_pegged_exit_price.0.min(std_px.0).max(1),
+                                        ),
+                                    };
+                                    last_pegged_exit_price = px_g;
                                     snap.last_trade_price = px_g;
                                     snap.mark_price = px_g;
                                     match open_side {
@@ -2840,6 +2872,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 snap.ts_local_ns,
                             );
 
+                            if summary.net_scaled_bps.raw() > 0 {
+                                sinking_fund_scaled_bps = sinking_fund_scaled_bps
+                                    .saturating_add((summary.net_scaled_bps.raw() * 30) / 100);
+                            }
                             slot_cooldown_until_ns[active_slot] =
                                 snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
                             last_pegged_exit_price = PriceTicks(0);
@@ -3028,11 +3064,41 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     }
                                 }
                             }
+                            let base_runner_bps = if partial_harvest_done {
+                                340_i64
+                            } else {
+                                500_i64
+                            };
+                            let sub_bps = if hold_el >= 900_000_000_000 {
+                                sinking_fund_scaled_bps.clamp(0, 3_500)
+                            } else {
+                                0_i64
+                            };
+                            let eff_floor_bps = base_runner_bps - sub_bps;
+                            let eff_delta_t =
+                                (open_entry_price.0 * eff_floor_bps) / 1_000_000;
+                            let raw_t_px = match open_side {
+                                Side::Bid => {
+                                    PriceTicks((open_entry_price.0 + eff_delta_t).max(1))
+                                }
+                                Side::Ask => {
+                                    PriceTicks((open_entry_price.0 - eff_delta_t).max(1))
+                                }
+                            };
+                            let target_exit_px = match open_side {
+                                Side::Bid => {
+                                    PriceTicks(raw_t_px.0.max(snap.asks[0].price.0))
+                                }
+                                Side::Ask => PriceTicks(
+                                    raw_t_px.0.min(snap.bids[0].price.0).max(1),
+                                ),
+                            };
                             let safe_passive = match open_side {
                                 Side::Bid => {
-                                    snap.bids[0].price.0 > 0 && snap.bids[0].price.0 < g_px.0
+                                    snap.bids[0].price.0 > 0
+                                        && snap.bids[0].price.0 < target_exit_px.0
                                 }
-                                Side::Ask => snap.asks[0].price.0 > g_px.0,
+                                Side::Ask => snap.asks[0].price.0 > target_exit_px.0,
                             };
                             if hold_el >= 60_000_000_000 && safe_passive {
                                 if let Some(ref client) = live_client {
@@ -3040,7 +3106,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     client.arm_patient_green_exit(
                                         &spec,
                                         open_side,
-                                        open_entry_price,
+                                        target_exit_px,
                                         &mut last_pegged_exit_price,
                                     );
                                 }
