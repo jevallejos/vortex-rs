@@ -421,7 +421,7 @@ fn run_live_bybit_ws_loop(
         s += 1;
     }
 
-    let subscribe_payload = r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","publicTrade.BTCUSDT","orderbook.50.ETHUSDT","publicTrade.ETHUSDT","orderbook.50.SOLUSDT","publicTrade.SOLUSDT","orderbook.50.AVAXUSDT","publicTrade.AVAXUSDT","orderbook.50.TAOUSDT","publicTrade.TAOUSDT","orderbook.50.SUIUSDT","publicTrade.SUIUSDT","orderbook.50.ORDIUSDT","publicTrade.ORDIUSDT","orderbook.50.PENDLEUSDT","publicTrade.PENDLEUSDT","orderbook.50.WIFUSDT","publicTrade.WIFUSDT"]}"#;
+    let subscribe_payload = r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","publicTrade.BTCUSDT","orderbook.50.ETHUSDT","publicTrade.ETHUSDT","orderbook.50.SOLUSDT","publicTrade.SOLUSDT","orderbook.50.AVAXUSDT","publicTrade.AVAXUSDT","orderbook.50.TAOUSDT","publicTrade.TAOUSDT","orderbook.50.SUIUSDT","publicTrade.SUIUSDT","orderbook.50.ORDIUSDT","publicTrade.ORDIUSDT","orderbook.50.PENDLEUSDT","publicTrade.PENDLEUSDT","orderbook.50.WIFUSDT","publicTrade.WIFUSDT","orderbook.50.LINKUSDT","publicTrade.LINKUSDT","orderbook.50.NEARUSDT","publicTrade.NEARUSDT","orderbook.50.LTCUSDT","publicTrade.LTCUSDT"]}"#;
     let _ = std::fs::create_dir_all("data/lakehouse_par1");
     let mut parquet_seq: u64 = discover_max_parquet_seq();
     println!(
@@ -432,7 +432,7 @@ fn run_live_bybit_ws_loop(
 
     loop {
         println!(
-            "[BYBIT V5 WS] Connecting to {} (6 institutional pairs)...",
+            "[BYBIT V5 WS] Connecting to {} (12 institutional pairs)...",
             BYBIT_PUBLIC_LINEAR_WS
         );
         match connect(BYBIT_PUBLIC_LINEAR_WS) {
