@@ -3230,7 +3230,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     let real_g_bps = (raw_d.saturating_mul(1_000_000))
                                         / open_entry_price.0.max(1);
                                     if real_g_bps < 500 && !partial_harvest_done {
-                                        let used_s = (500 - real_g_bps).max(0);
+                                        let used_s = (500 - real_g_bps).max(0) + 30;
                                         sinking_fund_scaled_bps =
                                             (sinking_fund_scaled_bps - used_s).max(0);
                                     }
@@ -3266,8 +3266,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     let sp_a = APPROVED_SPECS[active_slot];
                                     let cur_l = sp_a.parse_lot_qty(&cur_sz_s).unwrap_or(LotQty(0)).0;
                                     let nom_l = sp_a.parse_lot_qty(full_q).unwrap_or(LotQty(0)).0;
-                                    if cur_l > 0 && cur_l <= (nom_l / 2).max(1) {
+                                    let el_now = snap.ts_local_ns.0.saturating_sub(open_since_ts.0);
+                                    if cur_l > 0 && cur_l <= (nom_l / 2).max(1) && el_now < 300_000_000_000 {
                                         partial_harvest_done = true;
+                                        sinking_fund_scaled_bps = (sinking_fund_scaled_bps + 15).min(3_500);
                                         last_pegged_exit_price = PriceTicks(0);
                                         println!(
                                             "{}\u{1f7e2} [PARTIAL LEG FILLED] {} remaining qty={} (2nd half uncapped for Free-Ride & +3.40 bps floor!){}",
@@ -3390,7 +3392,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
 
                             if summary.net_scaled_bps.raw() > 0 {
                                 sinking_fund_scaled_bps = sinking_fund_scaled_bps
-                                    .saturating_add((summary.net_scaled_bps.raw() * 30) / 100);
+                                    .saturating_add((summary.net_scaled_bps.raw() * 30) / 100)
+                                    .min(3_500);
                             }
                             slot_cooldown_until_ns[active_slot] =
                                 snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
@@ -3790,25 +3793,6 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         arena.exec_resting_since_ns.store(fresh_snap.ts_local_ns.0 as u64, Ordering::Release);
                         arena.exec_queue_ahead_lots.store(resting_queue_ahead.0 as u64, Ordering::Release);
                         arena.exec_armed_count.fetch_add(1, Ordering::Release);
-                        if live_client.is_none() {
-                            if let Some(ref tx) = tg_tx {
-                                let (aw, af) = spec.format_price_usdt_parts(entry_price);
-                                let (sw, sf) = spec.format_price_usdt_parts(sl_trigger_price);
-                                let msg = format!(
-                                    "\u{1F9EA} [VORTEX-L2 PAPER-TRUE QUEUE ARMED]\nSymbol: {} ({:?}) | Queue Ahead: {} lots\nEntry L1: {}.{:04} USDT | SL: {}.{:04} USDT\nOFI: {:+.2} | TFI: {:+.2}",
-                                    snap.symbol_id.name(),
-                                    side,
-                                    resting_queue_ahead.0,
-                                    aw,
-                                    af,
-                                    sw,
-                                    sf,
-                                    snap.factor_ofi.get(),
-                                    snap.factor_tfi.get()
-                                );
-                                let _ = tx.try_send(msg);
-                            }
-                        }
 
                         println!(
                             "{}🟡 [QUEUE ARMED] {} {:?} resting at L1 after 25ms PostOnly check (Queue ahead: {} lots | Seq: {} | OFI: {:+.2} | TFI: {:+.2}){}",

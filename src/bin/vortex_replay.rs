@@ -1290,14 +1290,8 @@ pub fn run_microstructure_trend_and_markout_stats() {
                 let sym = val.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
                 let net_bps = val.get("net_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let is_mkr = val.get("maker_exit").and_then(|v| v.as_bool()).unwrap_or(true);
-                let s_idx = match sym {
-                    "BTCUSDT" => 0,
-                    "ETHUSDT" => 1,
-                    "SOLUSDT" => 2,
-                    "AVAXUSDT" => 3,
-                    "TAOUSDT" => 4,
-                    "SUIUSDT" => 5,
-                    _ => continue,
+                let Some(s_idx) = slot_from_symbol_name(sym) else {
+                    continue;
                 };
                 slot_trades[s_idx] += 1;
                 if is_mkr && net_bps >= 0.0 {
