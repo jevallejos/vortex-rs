@@ -318,7 +318,6 @@ fn replay_captured_live_parquet_segments() {
     let mut shadow_history: Vec<(i64, usize, Side, i64, i64, i64, bool)> = Vec::new();
     let mut shadow_cursor: usize = 0;
     for hist_path in [
-        "data/vault/vortex_governor_scar_memory.disabled",
         "data/vault/vortex_shadow_trades.jsonl",
     ] {
         if let Ok(sf) = std::fs::File::open(hist_path) {
@@ -335,17 +334,8 @@ fn replay_captured_live_parquet_segments() {
                     let side_s = val.get("side").and_then(|v| v.as_str()).unwrap_or("Bid");
                     let en_t = val.get("entry_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
                     let ex_t = val.get("exit_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let slot_opt = match sym_s {
-                        "BTCUSDT" => Some(0),
-                        "ETHUSDT" => Some(1),
-                        "SOLUSDT" => Some(2),
-                        "AVAXUSDT" => Some(3),
-                        "TAOUSDT" => Some(4),
-                        "SUIUSDT" => Some(5),
-                        _ => None,
-                    };
-                    if let Some(s_i) = slot_opt {
-                        let s_side = if side_s == "Ask" { Side::Ask } else { Side::Bid };
+                    if let Some(s_i) = slot_from_symbol_name(sym_s) {
+                        let s_side = side_from_str(side_s);
                         let net_sc = (net_bps * 100.0).round() as i64;
                         shadow_history.push((ts_s, s_i, s_side, en_t, ex_t, net_sc, is_mkr));
                     }
@@ -366,16 +356,7 @@ fn replay_captured_live_parquet_segments() {
                 }
                 let net_s = (net_bps * 100.0).round() as i64;
                 let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
-                let s_opt = match sym_str {
-                    "BTCUSDT" => Some(0),
-                    "ETHUSDT" => Some(1),
-                    "SOLUSDT" => Some(2),
-                    "AVAXUSDT" => Some(3),
-                    "TAOUSDT" => Some(4),
-                    "SUIUSDT" => Some(5),
-                    _ => None,
-                };
-                if let Some(si) = s_opt {
+                if let Some(si) = slot_from_symbol_name(sym_str) {
                     fsm.observe_mfe_sample_for_slot(si, net_s + 400, true);
                 }
             }
