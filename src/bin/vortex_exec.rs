@@ -56,71 +56,20 @@ struct ForensicEntrySnapshot {
 
 
 
-#[inline]const fn compute_optimal_50usdt_wallet_qty_str(
-    symbol_id: SymbolId,
-    in_scar_debt: bool,
-) -> &'static str {
+#[inline]const fn compute_optimal_50usdt_wallet_qty_str(symbol_id: SymbolId, in_scar_debt: bool) -> &'static str {
     match symbol_id.0 {
         1 => "0.001",
+        2 => if in_scar_debt { "0.01" } else { "0.02" },
+        3 => if in_scar_debt { "0.1" } else { "0.2" },
+        4 => if in_scar_debt { "1.4" } else { "2.6" },
+        5 => if in_scar_debt { "0.05" } else { "0.1" },
+        6 => if in_scar_debt { "14" } else { "25" },
+        7 => if in_scar_debt { "3.2" } else { "6.4" },
+        8 => if in_scar_debt { "6" } else { "12" },
+        9 => if in_scar_debt { "60" } else { "125" },
         10 => if in_scar_debt { "0.9" } else { "1.8" },
         11 => if in_scar_debt { "2.6" } else { "5.0" },
         12 => if in_scar_debt { "0.2" } else { "0.3" },
-        2 => {
-            if in_scar_debt {
-                "0.01"
-            } else {
-                "0.02"
-            }
-        }
-        3 => {
-            if in_scar_debt {
-                "0.1"
-            } else {
-                "0.2"
-            }
-        }
-        4 => {
-            if in_scar_debt {
-                "1.4"
-            } else {
-                "2.6"
-            }
-        }
-        5 => {
-            if in_scar_debt {
-                "0.05"
-            } else {
-                "0.1"
-            }
-        }
-        6 => {
-            if in_scar_debt {
-                "14"
-            } else {
-                "25"
-            }
-        }
-        7 => {
-            if in_scar_debt {
-                "3.2"
-            } else {
-                "6.4"
-            }
-        }
-        8 => {
-            if in_scar_debt {
-                "6"
-            } else {
-                "12"
-            }
-        }
-        9 => {
-            if in_scar_debt {
-                "60"
-            } else {
-                "125"
-            }
-        }
         _ => "1",
     }
 }
@@ -3057,8 +3006,17 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     entry_price.0,
                                     snap.ts_local_ns,
                                 );
-                                slot_cooldown_until_ns[active_slot] =
-                                    snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
+                                slot_cooldown_until_ns[active_slot] = if (arena.exec_side.load(Ordering::Acquire) == 0
+                                && snap.factor_ofi.get() >= 0.30
+                                && snap.factor_tfi.get() >= 0.35)
+                                || (arena.exec_side.load(Ordering::Acquire) != 0
+                                    && snap.factor_ofi.get() <= -0.30
+                                    && snap.factor_tfi.get() <= -0.35)
+                            {
+                                snap.ts_local_ns.0
+                            } else {
+                                snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS
+                            };
                                 arena.exec_abort_count.fetch_add(1, Ordering::Release);
                                 arena.exec_state_code.store(0, Ordering::Release);
                                 arena.exec_queue_ahead_lots.store(0, Ordering::Release);
@@ -3102,8 +3060,17 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                             entry_price.0,
                                             snap.ts_local_ns,
                                         );
-                                        slot_cooldown_until_ns[active_slot] =
-                                            snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
+                                        slot_cooldown_until_ns[active_slot] = if (arena.exec_side.load(Ordering::Acquire) == 0
+                                && snap.factor_ofi.get() >= 0.30
+                                && snap.factor_tfi.get() >= 0.35)
+                                || (arena.exec_side.load(Ordering::Acquire) != 0
+                                    && snap.factor_ofi.get() <= -0.30
+                                    && snap.factor_tfi.get() <= -0.35)
+                            {
+                                snap.ts_local_ns.0
+                            } else {
+                                snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS
+                            };
                                         arena.exec_abort_count.fetch_add(1, Ordering::Release);
                                         arena.exec_state_code.store(0, Ordering::Release);
                                         arena.exec_queue_ahead_lots.store(0, Ordering::Release);
@@ -3444,8 +3411,17 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     .saturating_add((summary.net_scaled_bps.raw() * sf_rate) / 100)
                                     .min(3_500);
                             }
-                            slot_cooldown_until_ns[active_slot] =
-                                snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS;
+                            slot_cooldown_until_ns[active_slot] = if (arena.exec_side.load(Ordering::Acquire) == 0
+                                && snap.factor_ofi.get() >= 0.30
+                                && snap.factor_tfi.get() >= 0.35)
+                                || (arena.exec_side.load(Ordering::Acquire) != 0
+                                    && snap.factor_ofi.get() <= -0.30
+                                    && snap.factor_tfi.get() <= -0.35)
+                            {
+                                snap.ts_local_ns.0
+                            } else {
+                                snap.ts_local_ns.0 + SLOT_ABORT_COOLDOWN_NS
+                            };
                             last_pegged_exit_price = PriceTicks(0);
                             arena.exec_closed_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(0, Ordering::Release);

@@ -1272,7 +1272,7 @@ pub fn run_microstructure_trend_and_markout_stats() {
         b += 1;
     }
     println!("----------------------------------------------------------------------------------------------------------");
-    println!("[2. PER-SYMBOL STRUCTURAL TREND & OPTIMAL MFE HORIZON PROFILE (6 INSTITUTIONAL SLOTS)]");
+    println!("[2. PER-SYMBOL STRUCTURAL TREND & OPTIMAL MFE HORIZON PROFILE (12 INSTITUTIONAL SLOTS)]");
     println!("----------------------------------------------------------------------------------------------------------");
     println!(
         "{:<4} | {:<8} | {:>6} | {:>8} | {:>9} | {:>11} | {:>12} | {:>13}",

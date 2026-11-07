@@ -105,7 +105,7 @@ BIN_DIR="/home/ubuntu/vortex-rs/bin"
 
 case "${1:-live}" in
     360)
-        echo "=== [1. VORTEX LIVE HUD (SHM v9)] ==="
+        echo "=== [1. VORTEX LIVE HUD (SHM v11)] ==="
         "${BIN_DIR}/vortex_exec" --live
         echo "=== [2. BYBIT V5 LIVE ORDERS & QUEUE TELEMETRY] ==="
         journalctl -u vortex-exec.service -n 35 --no-pager | grep -E "BYBIT V5|QUEUE|FILL|CLOSE|VETO|REHYDRATE|ORPHAN|ADOPT|DUPLICATE" || true
