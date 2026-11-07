@@ -1524,7 +1524,7 @@ fn build_consolidated_executive_sections(
     };
     let total = wins + scratches + losses;
     let filled_200 = ((total.min(200) * 20) / 200) as usize;
-    let goal_usdt = 65.0_f64;
+    let goal_usdt = 95.0_f64;
     let pct_65 = ((eq_usdt / goal_usdt) * 100.0).clamp(0.0, 100.0);
     let filled_65 = (((pct_65 * 20.0) / 100.0).round() as usize).min(20);
     let rem_usdt = (goal_usdt - eq_usdt).max(0.0);
