@@ -928,7 +928,31 @@ impl BybitV5LiveClient {
             Side::Bid => "Buy",
             Side::Ask => "Sell",
         };
-        let qty_str = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, in_scar_debt);
+        let qty_str = {
+            let base_q = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, in_scar_debt);
+            let b_lots = spec.parse_lot_qty(base_q).unwrap_or(LotQty(1)).0;
+            let bonus_pm = if !in_scar_debt && gov_diag.2 == 0 && gov_diag.0 >= 190 {
+                let ew_b = (gov_diag.0 - 180).clamp(0, 280);
+                let st_b = i64::from(gov_diag.1.min(6)) * 45;
+                (ew_b + st_b).clamp(0, 500)
+            } else {
+                0
+            };
+            let c_lots = if spec.symbol_id.0 >= 2 && bonus_pm >= 100 {
+                ((b_lots * (1_000 + bonus_pm)) / 1_000).max(b_lots)
+            } else {
+                b_lots
+            };
+            let sc = c_lots.saturating_mul(spec.lot_step_1e8);
+            let wh = sc / 100_000_000;
+            let fr = sc - (wh * 100_000_000);
+            if fr == 0 {
+                format!("{}", wh)
+            } else {
+                let s_f = format!("{:08}", fr);
+                format!("{}.{}", wh, s_f.trim_end_matches('0'))
+            }
+        };
         let _ = (sw, sf);
         let body = format!(
             "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",\"price\":\"{}.{:04}\",\"positionIdx\":0}}",
@@ -2788,26 +2812,34 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         &snap,
                                         &btc_leader_snap,
                                     ) {
-                                        let same_dir = extra_sessions
-                                            .iter()
-                                            .filter(|p| {
-                                                matches!(
-                                                    p.state,
-                                                    OrderLifecycleState::PositionOpenMakerExit {
-                                                        side: p_s,
-                                                        ..
-                                                    } if p_s == side
-                                                )
-                                            })
-                                            .count();
-                                        let opp_dir =
-                                            extra_sessions.len().saturating_sub(same_dir);
+                                        let mut same_w: usize = 0;
+                                        let mut opp_w: usize = 0;
+                                        for p in &extra_sessions {
+                                            if let OrderLifecycleState::PositionOpenMakerExit {
+                                                side: p_s,
+                                                ..
+                                            } = p.state
+                                            {
+                                                let w = if p.slot_idx == 0 {
+                                                    6
+                                                } else if p.slot_idx == 1 {
+                                                    2
+                                                } else {
+                                                    1
+                                                };
+                                                if p_s == side {
+                                                    same_w += w;
+                                                } else {
+                                                    opp_w += w;
+                                                }
+                                            }
+                                        }
                                         let raw_sc =
                                             OrthogonalFactorState::snr_composite_score(&snap).abs();
-                                        let sc = if opp_dir > same_dir {
-                                            raw_sc * 1.35
-                                        } else if same_dir >= 4 && opp_dir == 0 {
-                                            raw_sc * 0.85
+                                        let sc = if opp_w > same_w {
+                                            raw_sc * 1.45
+                                        } else if same_w >= 6 && opp_w == 0 {
+                                            raw_sc * 0.78
                                         } else {
                                             raw_sc
                                         };
@@ -3234,12 +3266,22 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         sinking_fund_scaled_bps =
                                             (sinking_fund_scaled_bps - used_s).max(0);
                                     }
+                                    let eff_close_px = if partial_harvest_done && real_g_bps < 520 {
+                                        let b_g = (520 + real_g_bps.max(340)) / 2;
+                                        ExecutionFsm::dynamic_maker_floor_price(
+                                            open_side,
+                                            open_entry_price,
+                                            ScaledBps(b_g),
+                                        )
+                                    } else {
+                                        std_px
+                                    };
                                     let px_g = match open_side {
                                         Side::Bid => {
-                                            PriceTicks(last_pegged_exit_price.0.max(std_px.0))
+                                            PriceTicks(last_pegged_exit_price.0.max(eff_close_px.0))
                                         }
                                         Side::Ask => PriceTicks(
-                                            last_pegged_exit_price.0.min(std_px.0).max(1),
+                                            last_pegged_exit_price.0.min(eff_close_px.0).max(1),
                                         ),
                                     };
                                     last_pegged_exit_price = px_g;
@@ -3267,7 +3309,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     let cur_l = sp_a.parse_lot_qty(&cur_sz_s).unwrap_or(LotQty(0)).0;
                                     let nom_l = sp_a.parse_lot_qty(full_q).unwrap_or(LotQty(0)).0;
                                     let el_now = snap.ts_local_ns.0.saturating_sub(open_since_ts.0);
-                                    if cur_l > 0 && cur_l <= (nom_l / 2).max(1) && el_now < 300_000_000_000 {
+                                    if cur_l > 0 && cur_l <= ((nom_l * 3) / 4).max(1) && el_now < 300_000_000_000 {
                                         partial_harvest_done = true;
                                         sinking_fund_scaled_bps = (sinking_fund_scaled_bps + 15).min(3_500);
                                         last_pegged_exit_price = PriceTicks(0);
@@ -3627,8 +3669,18 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             } else {
                                 500_i64
                             };
-                            let sub_bps = if hold_el >= 900_000_000_000 {
-                                sinking_fund_scaled_bps.clamp(0, 3_500)
+                            let live_diff = match open_side {
+                                Side::Bid => snap.bids[0].price.0 - open_entry_price.0,
+                                Side::Ask => open_entry_price.0 - snap.asks[0].price.0,
+                            };
+                            let live_g_bps = (live_diff.saturating_mul(1_000_000))
+                                / open_entry_price.0.max(1);
+                            let avail_sub = sinking_fund_scaled_bps.clamp(0, 3_500);
+                            let near_exit_ready = hold_el >= 360_000_000_000
+                                && avail_sub >= 150
+                                && live_g_bps >= (base_runner_bps - avail_sub - 60);
+                            let sub_bps = if hold_el >= 900_000_000_000 || near_exit_ready {
+                                avail_sub
                             } else {
                                 0_i64
                             };
