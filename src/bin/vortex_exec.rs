@@ -1528,8 +1528,8 @@ fn build_consolidated_executive_sections(
     let pct_65 = ((eq_usdt / goal_usdt) * 100.0).clamp(0.0, 100.0);
     let filled_65 = (((pct_65 * 20.0) / 100.0).round() as usize).min(20);
     let rem_usdt = (goal_usdt - eq_usdt).max(0.0);
-    let rem_200 = 200_u64.saturating_sub(total);
-    let pct_200 = (((total as f64) * 100.0) / 200.0).min(100.0);
+    let rem_200 = 1000_u64.saturating_sub(total);
+    let pct_200 = (((total as f64) * 100.0) / 1000.0).min(100.0);
     let mut bar_200 = String::with_capacity(60);
     let mut bar_65 = String::with_capacity(60);
     let mut b_i = 0_usize;
@@ -1618,11 +1618,11 @@ fn build_consolidated_executive_sections(
             ANSI_YELLOW, ANSI_RESET
         ),
         format!(
-            "  \u{2022} Meta 200 (Evol): [{}] {:>3}/200 ({:>5.1}%) \u{2502} Faltan: {:>3} tiros \u{2502} Salidas Maker: {:>5.1}%",
+            "  \u{2022} Meta 1000(Evol): [{}] {:>4}/1000 ({:>5.1}%) \u{2502} Faltan: {:>3} tiros \u{2502} Salidas Maker: {:>5.1}%",
             bar_200, total, pct_200, rem_200, mkr_pct
         ),
         format!(
-            "  \u{2022} Meta 65 USDT   : [{}] {:>7.4}/65.00 ({:>5.1}%) \u{2502} Faltan: {:>7.4} USDT",
+            "  \u{2022} Meta 95 USDT   : [{}] {:>7.4}/95.00 ({:>5.1}%) \u{2502} Faltan: {:>7.4} USDT",
             bar_65, eq_usdt, pct_65, rem_usdt
         ),
         format!(
