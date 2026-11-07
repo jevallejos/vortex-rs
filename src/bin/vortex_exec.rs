@@ -155,6 +155,7 @@ struct BybitV5LiveClient {
     api_key: String,
     api_secret: String,
     pool: std::sync::Arc<std::sync::Mutex<BybitConnPool>>,
+    ws_pos_state: std::sync::Arc<[core::sync::atomic::AtomicU8; 6]>,
 }
 
 impl BybitV5LiveClient {
@@ -166,7 +167,172 @@ impl BybitV5LiveClient {
                 rest_tls: None,
                 ws_trade: None,
             })),
+            ws_pos_state: std::sync::Arc::new([
+                core::sync::atomic::AtomicU8::new(0),
+                core::sync::atomic::AtomicU8::new(0),
+                core::sync::atomic::AtomicU8::new(0),
+                core::sync::atomic::AtomicU8::new(0),
+                core::sync::atomic::AtomicU8::new(0),
+                core::sync::atomic::AtomicU8::new(0),
+            ]),
         }
+    }
+
+    fn has_ws_instant_fill(&self, slot_idx: usize) -> bool {
+        if slot_idx < 6 && self.ws_pos_state[slot_idx].load(Ordering::Acquire) == 2 {
+            self.ws_pos_state[slot_idx].store(0, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    fn has_ws_instant_flat(&self, slot_idx: usize) -> bool {
+        if slot_idx < 6 && self.ws_pos_state[slot_idx].load(Ordering::Acquire) == 1 {
+            self.ws_pos_state[slot_idx].store(0, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    fn spawn_private_ws_stream(&self) {
+        let key = self.api_key.clone();
+        let secret = self.api_secret.clone();
+        let state_arr = std::sync::Arc::clone(&self.ws_pos_state);
+        let _ = thread::spawn(move || loop {
+            if let Ok((mut ws, _)) = tungstenite::connect("wss://stream.bybit.com/v5/private") {
+                match ws.get_ref() {
+                    tungstenite::stream::MaybeTlsStream::Plain(s) => {
+                        let _ = s.set_nodelay(true);
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(25)));
+                    }
+                    tungstenite::stream::MaybeTlsStream::NativeTls(tls) => {
+                        let s = tls.get_ref();
+                        let _ = s.set_nodelay(true);
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(25)));
+                    }
+                    _ => {}
+                }
+                let exp_ms = (now_epoch_ns() / 1_000_000) + 10_000;
+                let exp_str = exp_ms.to_string();
+                let sig_b = sign_bybit_v5_hmac_sha256(
+                    "GET/realtime",
+                    "",
+                    "",
+                    &exp_str,
+                    &secret,
+                );
+                let sig_s = core::str::from_utf8(&sig_b).unwrap_or("");
+                let auth_cmd = format!(
+                    "{{\"op\":\"auth\",\"args\":[\"{}\",{},\"{}\"]}}",
+                    key, exp_ms, sig_s
+                );
+                if ws.send(tungstenite::Message::Text(auth_cmd)).is_ok() {
+                    let sub_cmd = String::from(
+                        "{{\"op\":\"subscribe\",\"args\":[\"position.linear\",\"execution.linear\"]}}"
+                    );
+                    let _ = ws.send(tungstenite::Message::Text(sub_cmd));
+                    println!(
+                        "{}\u{1f7e2} [BYBIT V5 PRIVATE WS] Real-time execution.linear + position.linear push active (0ms TP)!{}",
+                        ANSI_GREEN, ANSI_RESET
+                    );
+                    let mut last_ping = std::time::Instant::now();
+                    loop {
+                        if last_ping.elapsed() >= Duration::from_secs(18) {
+                            if ws
+                                .send(tungstenite::Message::Text(String::from(
+                                    "{\"op\":\"ping\"}",
+                                )))
+                                .is_err()
+                            {
+                                break;
+                            }
+                            last_ping = std::time::Instant::now();
+                        }
+                        match ws.read() {
+                            Ok(tungstenite::Message::Text(txt)) => {
+                                if let Ok(v) =
+                                    serde_json::from_str::<serde_json::Value>(&txt)
+                                {
+                                    let topic = v
+                                        .get("topic")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("");
+                                    if topic.starts_with("position") {
+                                        if let Some(arr) =
+                                            v.get("data").and_then(|d| d.as_array())
+                                        {
+                                            for item in arr {
+                                                let sym = item
+                                                    .get("symbol")
+                                                    .and_then(|x| x.as_str())
+                                                    .unwrap_or("");
+                                                let sz = item
+                                                    .get("size")
+                                                    .and_then(|x| x.as_str())
+                                                    .and_then(|s| s.parse::<f64>().ok())
+                                                    .unwrap_or(-1.0);
+                                                if let Some(sl_i) =
+                                                    slot_from_symbol_name(sym)
+                                                {
+                                                    if sl_i < 6 && sz >= 0.0 {
+                                                        let code = if sz > 0.0 {
+                                                            2
+                                                        } else {
+                                                            1
+                                                        };
+                                                        state_arr[sl_i].store(
+                                                            code,
+                                                            Ordering::Release,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if topic.starts_with("execution") {
+                                        if let Some(arr) =
+                                            v.get("data").and_then(|d| d.as_array())
+                                        {
+                                            for item in arr {
+                                                let sym = item
+                                                    .get("symbol")
+                                                    .and_then(|x| x.as_str())
+                                                    .unwrap_or("");
+                                                let c_sz = item
+                                                    .get("closedSize")
+                                                    .and_then(|x| x.as_str())
+                                                    .and_then(|s| s.parse::<f64>().ok())
+                                                    .unwrap_or(0.0);
+                                                if let Some(sl_i) =
+                                                    slot_from_symbol_name(sym)
+                                                {
+                                                    if sl_i < 6 {
+                                                        let code = if c_sz > 0.0 {
+                                                            1
+                                                        } else {
+                                                            2
+                                                        };
+                                                        state_arr[sl_i].store(
+                                                            code,
+                                                            Ordering::Release,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(tungstenite::Message::Ping(p)) => {
+                                let _ = ws.send(tungstenite::Message::Pong(p));
+                            }
+                            Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(1_500));
+        });
     }
 
     fn from_env_readonly() -> Option<Self> {
@@ -490,6 +656,7 @@ impl BybitV5LiveClient {
             g.rest_tls = Self::open_keepalive_tls();
             g.ws_trade = client.open_authenticated_ws_trade();
         }
+        client.spawn_private_ws_stream();
         for spec in APPROVED_SPECS {
             let sym = spec.symbol_id.name();
             let lev_body = format!(
@@ -867,6 +1034,62 @@ impl BybitV5LiveClient {
                 println!(
                     "{}\u{1f7e2} [6-SESSION PARTIAL HARVEST 50%] {} {} qty={} @ {}.{:04}{}",
                     ANSI_GREEN, sym, cl_s, hq, hw, hf, ANSI_RESET
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    fn try_arm_lot_shaving_25pct(
+        &self,
+        spec: &PairSpec,
+        open_side: Side,
+        shave_px: PriceTicks,
+    ) -> bool {
+        let sym = spec.symbol_id.name();
+        let (is_op, p_qty) = self.get_open_position_size(sym);
+        if !is_op {
+            return false;
+        }
+        let q_opt = match (spec.symbol_id.0, p_qty.as_str()) {
+            (2, "0.02") => Some("0.01"),
+            (3, "0.2") => Some("0.1"),
+            (4, "2.6" | "2.0" | "2") => Some("0.6"),
+            (4, "1.4" | "1.3") => Some("0.4"),
+            (5, "0.1") => Some("0.03"),
+            (5, "0.07" | "0.05") => Some("0.02"),
+            (6, "25" | "19" | "13") => Some("6"),
+            (6, "14" | "12") => Some("4"),
+            _ => None,
+        };
+        let Some(sq) = q_opt else {
+            return false;
+        };
+        let cl_s = match open_side {
+            Side::Bid => "Sell",
+            Side::Ask => "Buy",
+        };
+        self.cancel_all_symbol_orders(sym);
+        let (sw, sf) = spec.format_price_usdt_parts(shave_px);
+        let p1 = format!(
+            "{{\"category\":\"linear\",\"symbol\":\"{}\",\"side\":\"{}\",",
+            sym, cl_s
+        );
+        let p2 = format!(
+            "\"orderType\":\"Limit\",\"timeInForce\":\"PostOnly\",\"qty\":\"{}\",",
+            sq
+        );
+        let p3 = format!(
+            "\"price\":\"{}.{:04}\",\"reduceOnly\":true,\"positionIdx\":0}}",
+            sw, sf
+        );
+        let body = format!("{}{}{}", p1, p2, p3);
+        if let Some(resp) = self.post_v5("/v5/order/create", &body) {
+            if resp.get("retCode").and_then(|v| v.as_i64()) == Some(0) {
+                println!(
+                    "{}\u{1f7e2} [SINKING FUND 25% LOT SHAVE] {} {} qty={} @ {}.{:04}{}",
+                    ANSI_GREEN, sym, cl_s, sq, sw, sf, ANSI_RESET
                 );
                 return true;
             }
@@ -2872,7 +3095,11 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 Side::Bid => snap.factor_ofi.get() <= -0.10,
                                 Side::Ask => snap.factor_ofi.get() >= 0.10,
                             };
-                        let periodic_poll = live_client.is_some() && (snap.sequence_id & 31) == 0;
+                        let ws_instant_fill = live_client
+                            .as_ref()
+                            .is_some_and(|c| c.has_ws_instant_fill(active_slot));
+                        let periodic_poll = live_client.is_some()
+                            && (ws_instant_fill || (snap.sequence_id & 7) == 0);
                         let clean_sweep_fill = level_swept && !toxic_sweep;
                         let paper_queue_filled = live_client.is_none()
                             && (resting_queue_ahead.0 == 0 || clean_sweep_fill);
@@ -3017,6 +3244,28 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             arena.exec_fill_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(3, Ordering::Release);
                             arena.exec_queue_ahead_lots.store(0, Ordering::Release);
+                            if let Some(ref client) = live_client {
+                                let g_init = ExecutionFsm::dynamic_maker_floor_price(
+                                    side,
+                                    entry_price,
+                                    ScaledBps(500),
+                                );
+                                let safe_i = match side {
+                                    Side::Bid => {
+                                        snap.bids[0].price.0 > 0
+                                            && snap.bids[0].price.0 < g_init.0
+                                    }
+                                    Side::Ask => snap.asks[0].price.0 > g_init.0,
+                                };
+                                if safe_i {
+                                    client.arm_patient_green_exit(
+                                        &spec,
+                                        side,
+                                        g_init,
+                                        &mut last_pegged_exit_price,
+                                    );
+                                }
+                            }
 
                             let (e_w, e_f) = spec.format_price_usdt_parts(entry_price);
                             let (tp_w, tp_f) = spec.format_price_usdt_parts(PriceTicks(tp_t));
@@ -3074,7 +3323,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             continue;
                         }
                         last_seen_seq[active_slot] = snap.sequence_id;
-                        if last_pegged_exit_price.0 > 0 && (snap.sequence_id & 63) == 0 {
+                        let ws_instant_flat = live_client
+                            .as_ref()
+                            .is_some_and(|c| c.has_ws_instant_flat(active_slot));
+                        if last_pegged_exit_price.0 > 0
+                            && (ws_instant_flat || (snap.sequence_id & 15) == 0)
+                        {
                             if let Some(ref client) = live_client {
                                 let sym_n = APPROVED_SPECS[active_slot].symbol_id.name();
                                 let (still_open, _) = client.get_open_position_size(sym_n);
@@ -3425,6 +3679,36 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                             partial_harvest_done = true;
                                         }
                                     }
+                                } else if hold_el >= 300_000_000_000
+                                    && sinking_fund_scaled_bps >= 300
+                                {
+                                    let shave_sub =
+                                        sinking_fund_scaled_bps.clamp(0, 1_500) * 4;
+                                    let shave_floor = 500_i64 - shave_sub;
+                                    if cur_g_bps >= shave_floor {
+                                        if let Some(ref client) = live_client {
+                                            let spec = APPROVED_SPECS[active_slot];
+                                            let sh_px = match open_side {
+                                                Side::Bid => PriceTicks(
+                                                    snap.asks[0].price.0.max(1),
+                                                ),
+                                                Side::Ask => PriceTicks(
+                                                    snap.bids[0].price.0.max(1),
+                                                ),
+                                            };
+                                            if client.try_arm_lot_shaving_25pct(
+                                                &spec,
+                                                open_side,
+                                                sh_px,
+                                            ) {
+                                                let used_q =
+                                                    ((500 - cur_g_bps).max(0) + 3) / 4;
+                                                sinking_fund_scaled_bps =
+                                                    (sinking_fund_scaled_bps - used_q).max(0);
+                                                partial_harvest_done = true;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             let base_runner_bps = if partial_harvest_done {
@@ -3463,7 +3747,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 }
                                 Side::Ask => snap.asks[0].price.0 > target_exit_px.0,
                             };
-                            if hold_el >= 60_000_000_000 && safe_passive {
+                            if safe_passive {
                                 if let Some(ref client) = live_client {
                                     let spec = APPROVED_SPECS[active_slot];
                                     client.arm_patient_green_exit(
