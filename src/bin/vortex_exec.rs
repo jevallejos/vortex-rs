@@ -970,16 +970,22 @@ impl BybitV5LiveClient {
         if !is_op {
             return false;
         }
-        let half_opt = match (spec.symbol_id.0, p_qty.as_str()) {
-            (2, "0.02") => Some("0.01"),
-            (3, "0.2") => Some("0.1"),
-            (4, "2.6") => Some("1.3"),
-            (5, "0.1") => Some("0.05"),
-            (6, "25") => Some("12"),
-            (7, "3.6") => Some("1.8"),
-            (8, "6") => Some("3"),
-            (9, "60") => Some("30"),
-            _ => None,
+        let half_opt = {
+            let open_lots = spec.parse_lot_qty(&p_qty).unwrap_or(LotQty(0)).0;
+            if spec.symbol_id.0 >= 2 && open_lots >= 2 {
+                let l_qty = open_lots / 2;
+                let sc = l_qty.saturating_mul(spec.lot_step_1e8);
+                let wh = sc / 100_000_000;
+                let fr = sc - (wh * 100_000_000);
+                if fr == 0 {
+                    Some(format!("{}", wh))
+                } else {
+                    let s_f = format!("{:08}", fr);
+                    Some(format!("{}.{}", wh, s_f.trim_end_matches('0')))
+                }
+            } else {
+                None
+            }
         };
         let Some(hq) = half_opt else {
             return false;
@@ -1025,22 +1031,25 @@ impl BybitV5LiveClient {
         if !is_op {
             return false;
         }
-        let q_opt = match (spec.symbol_id.0, p_qty.as_str()) {
-            (2, "0.02") => Some("0.01"),
-            (3, "0.2") => Some("0.1"),
-            (4, "2.6" | "2.0" | "2") => Some("0.6"),
-            (4, "1.4" | "1.3") => Some("0.4"),
-            (5, "0.1") => Some("0.03"),
-            (5, "0.07" | "0.05") => Some("0.02"),
-            (6, "25" | "19" | "13") => Some("6"),
-            (6, "14" | "12") => Some("4"),
-            (7, "3.6" | "2.7") => Some("0.9"),
-            (7, "1.8") => Some("0.5"),
-            (8, "6" | "4") => Some("2"),
-            (8, "3") => Some("1"),
-            (9, "60" | "45") => Some("15"),
-            (9, "30") => Some("10"),
-            _ => None,
+        let q_opt = {
+            let open_lots = spec.parse_lot_qty(&p_qty).unwrap_or(LotQty(0)).0;
+            let debt_q = compute_optimal_50usdt_wallet_qty_str(spec.symbol_id, true);
+            let debt_l = spec.parse_lot_qty(debt_q).unwrap_or(LotQty(0)).0;
+            let min_rem = (debt_l / 2).max(1);
+            if spec.symbol_id.0 >= 2 && open_lots >= 2 && open_lots > min_rem {
+                let l_qty = (open_lots / 4).max(1);
+                let sc = l_qty.saturating_mul(spec.lot_step_1e8);
+                let wh = sc / 100_000_000;
+                let fr = sc - (wh * 100_000_000);
+                if fr == 0 {
+                    Some(format!("{}", wh))
+                } else {
+                    let s_f = format!("{:08}", fr);
+                    Some(format!("{}.{}", wh, s_f.trim_end_matches('0')))
+                }
+            } else {
+                None
+            }
         };
         let Some(sq) = q_opt else {
             return false;
@@ -3254,7 +3263,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         APPROVED_SPECS[active_slot].symbol_id,
                                         in_d,
                                     );
-                                    if cur_sz_s != full_q {
+                                    let sp_a = APPROVED_SPECS[active_slot];
+                                    let cur_l = sp_a.parse_lot_qty(&cur_sz_s).unwrap_or(LotQty(0)).0;
+                                    let nom_l = sp_a.parse_lot_qty(full_q).unwrap_or(LotQty(0)).0;
+                                    if cur_l > 0 && cur_l <= (nom_l / 2).max(1) {
                                         partial_harvest_done = true;
                                         last_pegged_exit_price = PriceTicks(0);
                                         println!(
