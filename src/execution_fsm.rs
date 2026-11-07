@@ -1128,21 +1128,22 @@ impl ExecutionFsm {
             let adverse_pressure = (-flow_conviction).max(0.0);
             let feeshare_anchor =
                 zero_loss_scratch_floor.max(fee_barrier_bps + (mfe_excess * 22) / 100);
+            let max_act_w = (fee_barrier_bps + 280).max(structural_win_floor);
             let active_win_floor = (feeshare_anchor
                 + ((adaptive_base_target - feeshare_anchor).max(0) * 55) / 100)
-                .clamp(structural_win_floor, fee_barrier_bps + 280);
+                .clamp(structural_win_floor, max_act_w);
             let floor_span = (active_win_floor - allowed_base_floor).max(0);
             let time_bleed = (elapsed_secs * floor_span) / elastic_win_horizon_secs.max(1);
             let adv_bleed =
                 (adverse_pressure * adverse_pressure * (floor_span as f64) * 3.0) as i64;
             let min_dynamic_floor = (active_win_floor - time_bleed - adv_bleed)
-                .clamp(allowed_base_floor, active_win_floor);
+                .clamp(allowed_base_floor, active_win_floor.max(allowed_base_floor));
             let base_eps = (adaptive_base_target - allowed_base_floor).max(0) as f64;
             let tau = (elapsed_secs as f64) / (elastic_win_horizon_secs.max(1) as f64);
             let denom = 1.0 + tau * tau + 2.5 * adverse_pressure * adverse_pressure * tau;
             let epsilon_elastico = (base_eps / denom) as i64;
             let elastic_harvest_floor = (allowed_base_floor + epsilon_elastico)
-                .clamp(min_dynamic_floor, 780);
+                .clamp(min_dynamic_floor, 780_i64.max(min_dynamic_floor));
 
             let impulse_immunity_ns =
                 (learned_mfe.clamp(560, 1_200) * 35_000_000).clamp(20_000_000_000, 42_000_000_000);
@@ -1375,7 +1376,14 @@ impl ExecutionFsm {
         let fee_rt_bps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
         let fee_ticks = (entry_price.0.saturating_mul(fee_rt_bps) + 999_999) / 1_000_000;
         let quantum_ticks = fee_ticks + 1;
-        let min_profit_delta_ticks = if quantum_ticks > 2 { quantum_ticks } else { 2 };
+        let min_profit_delta_ticks = if entry_price.0 > 0 && entry_price.0 < 5_000 {
+            let t440 = (entry_price.0.saturating_mul(440) + 999_999) / 1_000_000;
+            if t440 > 1 { t440 } else { 1 }
+        } else if quantum_ticks > 2 {
+            quantum_ticks
+        } else {
+            2
+        };
         match side {
             Side::Bid => PriceTicks(entry_price.0 + min_profit_delta_ticks),
             Side::Ask => {
@@ -1429,7 +1437,13 @@ impl ExecutionFsm {
             return quantum_floor;
         }
         let target_ticks = (entry_price.0.saturating_mul(g) + 999_999) / 1_000_000;
-        let min_delta_ticks = if target_ticks > 2 { target_ticks } else { 2 };
+        let min_delta_ticks = if entry_price.0 > 0 && entry_price.0 < 5_000 {
+            if target_ticks > 1 { target_ticks } else { 1 }
+        } else if target_ticks > 2 {
+            target_ticks
+        } else {
+            2
+        };
         match side {
             Side::Bid => {
                 let cand = entry_price.0 + min_delta_ticks;

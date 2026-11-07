@@ -1283,7 +1283,7 @@ fn spawn_async_telegram_notifier(live_capital_enabled: bool) -> Option<SyncSende
     } else {
         "🟢 [VORTEX-L2 VORAGINE V0.3.2 — PAPER-TRUE LAB MODE]\nSHM v9 (200.0 Hz) active in sniper-singapur."
     };
-    let _ = tx.try_send(mode_banner.to_owned());
+    let _ = mode_banner;
     thread::spawn(move || {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
         while let Ok(msg) = rx.recv() {
@@ -3618,8 +3618,11 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 0_i64
                             };
                             let eff_floor_bps = base_runner_bps - sub_bps;
-                            let eff_delta_t =
-                                (open_entry_price.0 * eff_floor_bps) / 1_000_000;
+                            let eff_delta_t = if eff_floor_bps >= 0 {
+                                ((open_entry_price.0 * eff_floor_bps) + 999_999) / 1_000_000
+                            } else {
+                                (open_entry_price.0 * eff_floor_bps) / 1_000_000
+                            };
                             let raw_t_px = match open_side {
                                 Side::Bid => {
                                     PriceTicks((open_entry_price.0 + eff_delta_t).max(1))
