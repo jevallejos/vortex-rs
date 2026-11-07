@@ -25,7 +25,7 @@ struct CandidateContract {
     realized_vol_5m: ScaledBps,
 }
 
-const CANDIDATE_UNIVERSE: [CandidateContract; 12] = [
+const CANDIDATE_UNIVERSE: [CandidateContract; 15] = [
     CandidateContract {
         name: "BTCUSDT",
         spec: PairSpec {
@@ -126,9 +126,42 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 12] = [
         realized_vol_5m: ScaledBps::from_whole_bps(92),
     },
     CandidateContract {
-        name: "XRPUSDT",
+        name: "LINKUSDT",
         spec: PairSpec {
             symbol_id: SymbolId(10),
+            tick_size_1e8: 100_000,
+            lot_step_1e8: 10_000_000,
+            empirical_taker_exit_prob_pct: 20,
+        },
+        reference_mid_ticks: PriceTicks(8_982),
+        realized_vol_5m: ScaledBps::from_whole_bps(64),
+    },
+    CandidateContract {
+        name: "NEARUSDT",
+        spec: PairSpec {
+            symbol_id: SymbolId(11),
+            tick_size_1e8: 100_000,
+            lot_step_1e8: 10_000_000,
+            empirical_taker_exit_prob_pct: 20,
+        },
+        reference_mid_ticks: PriceTicks(8_982),
+        realized_vol_5m: ScaledBps::from_whole_bps(64),
+    },
+    CandidateContract {
+        name: "LTCUSDT",
+        spec: PairSpec {
+            symbol_id: SymbolId(12),
+            tick_size_1e8: 1_000_000,
+            lot_step_1e8: 10_000_000,
+            empirical_taker_exit_prob_pct: 20,
+        },
+        reference_mid_ticks: PriceTicks(8_982),
+        realized_vol_5m: ScaledBps::from_whole_bps(64),
+    },
+    CandidateContract {
+        name: "XRPUSDT",
+        spec: PairSpec {
+            symbol_id: SymbolId(13),
             tick_size_1e8: 10_000,
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
@@ -139,7 +172,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 12] = [
     CandidateContract {
         name: "ZEREBROUSDT",
         spec: PairSpec {
-            symbol_id: SymbolId(11),
+            symbol_id: SymbolId(14),
             tick_size_1e8: 1_000,
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
@@ -150,7 +183,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 12] = [
     CandidateContract {
         name: "WALUSDT",
         spec: PairSpec {
-            symbol_id: SymbolId(12),
+            symbol_id: SymbolId(15),
             tick_size_1e8: 1_000,
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
@@ -661,7 +694,7 @@ mod tests {
                 vetoed += 1;
             }
         }
-        assert_eq!(approved, 9);
+        assert_eq!(approved, 12);
         assert_eq!(vetoed, 3);
 
         let mut batch = ColumnarParquetBatch::new();

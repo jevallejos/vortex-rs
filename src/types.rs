@@ -111,9 +111,12 @@ impl SymbolId {
             7 => "ORDIUSDT",
             8 => "PENDLEUSDT",
             9 => "WIFUSDT",
-            10 => "XRPUSDT",
-            11 => "ZEREBROUSDT",
-            12 => "WALUSDT",
+            10 => "LINKUSDT",
+            11 => "NEARUSDT",
+            12 => "LTCUSDT",
+            13 => "XRPUSDT",
+            14 => "ZEREBROUSDT",
+            15 => "WALUSDT",
             _ => "UNKNOWN",
         }
     }
@@ -315,7 +318,7 @@ impl PairSpec {
             Ok(v) => v,
             Err(e) => return Err(e),
         };
-        let max_t = if self.symbol_id.0 >= 7 && self.symbol_id.0 <= 9 {
+        let max_t = if self.symbol_id.0 >= 7 && self.symbol_id.0 <= 12 {
             800
         } else {
             ScaledBps::MAX_ALLOWED_TICK_BPS.0
@@ -357,7 +360,7 @@ impl PairSpec {
         let exit_fee_expected = (p_taker * ScaledBps::BYBIT_VIP0_TAKER_FEE_BPS.0
             + (100 - p_taker) * ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.0)
             / 100;
-        let eff_t = if self.symbol_id.0 >= 7 && self.symbol_id.0 <= 9 && tick_bps.0 > 150 {
+        let eff_t = if self.symbol_id.0 >= 7 && self.symbol_id.0 <= 12 && tick_bps.0 > 150 {
             150
         } else {
             tick_bps.0
@@ -575,7 +578,7 @@ pub fn classify_pnl_badge(net_bps: f64) -> (&'static str, &'static str, &'static
 }
 
 /// Canonical 6 approved institutional perpetual contracts (`Tick_bps <= 1.50 bps`).
-pub const APPROVED_SPECS: [PairSpec; 9] = [
+pub const APPROVED_SPECS: [PairSpec; 12] = [
     PairSpec {
         symbol_id: SymbolId(1),
         tick_size_1e8: 10_000_000,
@@ -630,6 +633,24 @@ pub const APPROVED_SPECS: [PairSpec; 9] = [
         lot_step_1e8: 100_000_000,
         empirical_taker_exit_prob_pct: 20,
     },
+    PairSpec {
+        symbol_id: SymbolId(10),
+        tick_size_1e8: 100_000,
+        lot_step_1e8: 10_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(11),
+        tick_size_1e8: 100_000,
+        lot_step_1e8: 10_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
+    PairSpec {
+        symbol_id: SymbolId(12),
+        tick_size_1e8: 1_000_000,
+        lot_step_1e8: 10_000_000,
+        empirical_taker_exit_prob_pct: 20,
+    },
 ];
 
 /// Looks up `(slot_idx, PairSpec)` for an approved `SymbolId`.
@@ -660,6 +681,9 @@ pub fn slot_from_symbol_name(sym: &str) -> Option<usize> {
         "ORDIUSDT" => Some(6),
         "PENDLEUSDT" => Some(7),
         "WIFUSDT" => Some(8),
+        "LINKUSDT" => Some(9),
+        "NEARUSDT" => Some(10),
+        "LTCUSDT" => Some(11),
         _ => None,
     }
 }

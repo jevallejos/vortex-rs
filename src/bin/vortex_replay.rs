@@ -366,10 +366,10 @@ fn replay_captured_live_parquet_segments() {
     let mut fifo_sim = FifoQueueSimulator::new();
     let mut exit_fifo_sim = ExitFifoQueueSimulator::new();
     let mut btc_leader_snap = SymbolLobSnapshot::default();
-    let mut latest_snaps = [SymbolLobSnapshot::default(); 9];
-    let mut slot_cooldown_until_ns = [0_i64; 9];
-    let mut learned_vol_5m_bps = [6_000_i64; 9];
-    let mut prev_mid_ticks = [0_i64; 9];
+    let mut latest_snaps = [SymbolLobSnapshot::default(); 12];
+    let mut slot_cooldown_until_ns = [0_i64; 12];
+    let mut learned_vol_5m_bps = [6_000_i64; 12];
+    let mut prev_mid_ticks = [0_i64; 12];
     let mut resting_init_queue_ahead = LotQty(0);
     let mut active_sym = SymbolId(0);
     let mut active_slot: usize = 0;
@@ -1280,10 +1280,10 @@ pub fn run_microstructure_trend_and_markout_stats() {
     );
     println!("----------------------------------------------------------------------------------------------------------");
     let mut fsm_prof = ExecutionFsm::new(1_250_000_000, 1_250_000_000);
-    let mut slot_trades = [0_u64; 9];
-    let mut slot_wins = [0_u64; 9];
-    let mut slot_win_bps = [0.0_f64; 9];
-    let mut slot_clean_bps = [0.0_f64; 9];
+    let mut slot_trades = [0_u64; 12];
+    let mut slot_wins = [0_u64; 12];
+    let mut slot_win_bps = [0.0_f64; 12];
+    let mut slot_clean_bps = [0.0_f64; 12];
     if let Ok(sf) = File::open("deploy/forensic_vault_171.seed") {
         for line in BufReader::new(sf).lines().map_while(Result::ok) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -1311,10 +1311,10 @@ pub fn run_microstructure_trend_and_markout_stats() {
     }
     let sym_names = [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT", "TAOUSDT",
-        "SUIUSDT", "ORDIUSDT", "PENDLEUSDT", "WIFUSDT",
+        "SUIUSDT", "ORDIUSDT", "PENDLEUSDT", "WIFUSDT", "LINKUSDT", "NEARUSDT", "LTCUSDT",
     ];
     let mut s = 0_usize;
-    while s < 9 {
+    while s < 12 {
         let m_win = if slot_wins[s] > 0 {
             slot_win_bps[s] / (slot_wins[s] as f64)
         } else {

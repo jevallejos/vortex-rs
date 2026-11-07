@@ -62,6 +62,9 @@ struct ForensicEntrySnapshot {
 ) -> &'static str {
     match symbol_id.0 {
         1 => "0.001",
+        10 => if in_scar_debt { "0.9" } else { "1.8" },
+        11 => if in_scar_debt { "2.6" } else { "5.0" },
+        12 => if in_scar_debt { "0.2" } else { "0.3" },
         2 => {
             if in_scar_debt {
                 "0.01"
@@ -99,23 +102,23 @@ struct ForensicEntrySnapshot {
         }
         7 => {
             if in_scar_debt {
-                "1.8"
+                "3.2"
             } else {
-                "3.6"
+                "6.4"
             }
         }
         8 => {
             if in_scar_debt {
-                "4"
-            } else {
                 "6"
+            } else {
+                "12"
             }
         }
         9 => {
             if in_scar_debt {
-                "30"
-            } else {
                 "60"
+            } else {
+                "125"
             }
         }
         _ => "1",
@@ -176,7 +179,7 @@ struct BybitV5LiveClient {
     api_key: String,
     api_secret: String,
     pool: std::sync::Arc<std::sync::Mutex<BybitConnPool>>,
-    ws_pos_state: std::sync::Arc<[core::sync::atomic::AtomicU8; 9]>,
+    ws_pos_state: std::sync::Arc<[core::sync::atomic::AtomicU8; 12]>,
 }
 
 impl BybitV5LiveClient {
@@ -189,6 +192,9 @@ impl BybitV5LiveClient {
                 ws_trade: None,
             })),
             ws_pos_state: std::sync::Arc::new([
+                  core::sync::atomic::AtomicU8::new(0),
+                  core::sync::atomic::AtomicU8::new(0),
+                  core::sync::atomic::AtomicU8::new(0),
                 core::sync::atomic::AtomicU8::new(0),
                 core::sync::atomic::AtomicU8::new(0),
                 core::sync::atomic::AtomicU8::new(0),
@@ -2466,12 +2472,12 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut resting_queue_ahead: LotQty = LotQty(0);
     let mut prev_l1_qty: LotQty = LotQty(0);
     let mut prev_cum_trade_lots: LotQty = LotQty(0);
-    let mut last_seen_seq = [0_u64; 9];
+    let mut last_seen_seq = [0_u64; 12];
     let mut last_pegged_exit_price = PriceTicks(0);
     let mut exit_peg_attempts: u32 = 0;
     let mut entry_forensic = ForensicEntrySnapshot::default();
-    let mut slot_cooldown_until_ns = [0_i64; 9];
-    let mut extra_sessions: Vec<ParallelOpenSession> = Vec::with_capacity(8);
+    let mut slot_cooldown_until_ns = [0_i64; 12];
+    let mut extra_sessions: Vec<ParallelOpenSession> = Vec::with_capacity(11);
     let mut partial_harvest_done = false;
     let mut mux_tick: u64 = 0;
     rehydrate_shadow_ledger(&mut ledger, &mut fsm, &mut adaptive_gov, arena);
@@ -2575,7 +2581,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         );
         if matches!(fsm.state, OrderLifecycleState::PositionOpenMakerExit { .. }) {
             for (s_i, sp_spec) in APPROVED_SPECS.iter().enumerate() {
-                if s_i == active_slot || extra_sessions.len() >= 8 {
+                if s_i == active_slot || extra_sessions.len() >= 11 {
                     continue;
                 }
                 let s_name = sp_spec.symbol_id.name();
@@ -2648,8 +2654,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         ANSI_RESET
     );
 
-    let mut last_price_seq = [0_u64; 9];
-    let mut cached_snaps = [SymbolLobSnapshot::default(); 9];
+    let mut last_price_seq = [0_u64; 12];
+    let mut cached_snaps = [SymbolLobSnapshot::default(); 12];
     loop {
         thread::sleep(Duration::from_millis(5));
         let mut p_slot = 0;
@@ -2698,7 +2704,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                 last_opened_ts: fsm.last_opened_ts,
                 last_armed_ts: fsm.last_armed_ts,
             };
-            if !drain_active && extra_sessions.len() < 8 && (mux_tick & 3) == 0 {
+            if !drain_active && extra_sessions.len() < 11 && (mux_tick & 3) == 0 {
                 extra_sessions.push(cur_s);
                 fsm.state = OrderLifecycleState::Idle;
                 last_pegged_exit_price = PriceTicks(0);
@@ -3433,8 +3439,9 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             );
 
                             if summary.net_scaled_bps.raw() > 0 {
+                                let sf_rate = if extra_sessions.len() >= 4 { 50 } else { 30 };
                                 sinking_fund_scaled_bps = sinking_fund_scaled_bps
-                                    .saturating_add((summary.net_scaled_bps.raw() * 30) / 100)
+                                    .saturating_add((summary.net_scaled_bps.raw() * sf_rate) / 100)
                                     .min(3_500);
                             }
                             slot_cooldown_until_ns[active_slot] =
@@ -3592,10 +3599,17 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             arena.exec_tp_ticks.store(open_tp_price.0 as u64, Ordering::Release);
                             arena.exec_state_code.store(3, Ordering::Release);
                             let hold_el = snap.ts_local_ns.0.saturating_sub(open_since_ts.0);
+                            let deep_p1_bps = if snap.factor_tfi.get().abs() > 0.85
+                                && snap.factor_ofi.get().abs() > 0.60
+                            {
+                                620_i64
+                            } else {
+                                500_i64
+                            };
                             let g_px = ExecutionFsm::dynamic_maker_floor_price(
                                 open_side,
                                 open_entry_price,
-                                ScaledBps(500),
+                                ScaledBps(deep_p1_bps),
                             );
                             let mut shave_active_now = false;
                             if active_slot >= 1 && !partial_harvest_done {

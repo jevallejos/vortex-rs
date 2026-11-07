@@ -427,7 +427,7 @@ pub struct ExecutionFsm {
     /// Field learned_mfe_ewma_bps.
     pub learned_mfe_ewma_bps: i64,
     /// Field learned_mfe_by_slot.
-    pub learned_mfe_by_slot: [i64; 9],
+    pub learned_mfe_by_slot: [i64; 12],
     /// Field active_slot_idx.
     pub active_slot_idx: usize,
     /// Field last_peak_gross_bps.
@@ -480,7 +480,7 @@ impl ExecutionFsm {
             gross_profit_accum_1e8: 0,
             gross_loss_accum_1e8: 0,
             learned_mfe_ewma_bps: 720,
-            learned_mfe_by_slot: [720; 9],
+            learned_mfe_by_slot: [720; 12],
             active_slot_idx: 0,
             last_peak_gross_bps: 0,
             max_wald_contraction_pct: 0,
@@ -502,7 +502,7 @@ impl ExecutionFsm {
     #[inline]
     #[must_use]
     pub const fn slot_index_for_symbol(sym: SymbolId) -> usize {
-        if sym.0 >= 1 && sym.0 <= 9 {
+        if sym.0 >= 1 && sym.0 <= 12 {
             (sym.0 - 1) as usize
         } else {
             0
@@ -514,7 +514,7 @@ impl ExecutionFsm {
     #[must_use]
     #[allow(clippy::manual_clamp)]
     pub const fn slot_learned_mfe_bps(&self, sym: SymbolId) -> i64 {
-        let raw = if sym.0 >= 1 && sym.0 <= 9 {
+        let raw = if sym.0 >= 1 && sym.0 <= 12 {
             self.learned_mfe_by_slot[(sym.0 - 1) as usize]
         } else {
             self.learned_mfe_ewma_bps
@@ -1565,7 +1565,7 @@ impl ExecutionFsm {
         raw_observed_gross_bps: i64,
         is_maker_exit: bool,
     ) {
-        let s = slot_idx.min(8);
+        let s = slot_idx.min(11);
         let fee_rt_bps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
         let structural_win_threshold = fee_rt_bps + (fee_rt_bps / 4);
         if is_maker_exit {
@@ -1733,31 +1733,31 @@ impl ExecutionFsm {
 /// coupled with Cross-Slot Global Directional Regime Memory and Dual-Horizon Price Drift EWMA.
 #[derive(Copy, Clone, Debug)]
 pub struct OnlineAdaptiveGovernor {
-    ewma_net_bps_x100: [[i64; 2]; 9],
-    cum_net_bps_x100: [[i64; 2]; 9],
-    sl_streak: [[u32; 2]; 9],
-    win_streak: [[u32; 2]; 9],
-    directional_cooldown_until_ns: [[i64; 2]; 9],
+    ewma_net_bps_x100: [[i64; 2]; 12],
+    cum_net_bps_x100: [[i64; 2]; 12],
+    sl_streak: [[u32; 2]; 12],
+    win_streak: [[u32; 2]; 12],
+    directional_cooldown_until_ns: [[i64; 2]; 12],
     global_dir_debt_bps_x100: [i64; 2],
     global_dir_sl_streak: [u32; 2],
     global_dir_win_streak: [u32; 2],
     global_dir_cooldown_until_ns: [i64; 2],
     last_global_win_dir: u8,
     last_global_win_ts_ns: i64,
-    ewma_fast_px_1e4: [i64; 9],
-    ewma_slow_px_1e4: [i64; 9],
-    last_price_sample_ts_ns: [i64; 9],
-    wave_anchor_px_1e4: [[i64; 2]; 9],
-    last_exit_px_1e4: [[i64; 2]; 9],
-    wave_step_count: [[u32; 2]; 9],
-    abort_streak: [[u32; 2]; 9],
-    abort_anchor_px_1e4: [[i64; 2]; 9],
-    abort_last_ts_ns: [[i64; 2]; 9],
+    ewma_fast_px_1e4: [i64; 12],
+    ewma_slow_px_1e4: [i64; 12],
+    last_price_sample_ts_ns: [i64; 12],
+    wave_anchor_px_1e4: [[i64; 2]; 12],
+    last_exit_px_1e4: [[i64; 2]; 12],
+    wave_step_count: [[u32; 2]; 12],
+    abort_streak: [[u32; 2]; 12],
+    abort_anchor_px_1e4: [[i64; 2]; 12],
+    abort_last_ts_ns: [[i64; 2]; 12],
     global_dir_abort_streak: [u32; 2],
     global_abort_last_ts_ns: [i64; 2],
     last_sl_ts_ns: i64,
-    price_sample_count: [u32; 9],
-    last_seen_px_1e4: [i64; 9],
+    price_sample_count: [u32; 12],
+    last_seen_px_1e4: [i64; 12],
 }
 
 impl Default for OnlineAdaptiveGovernor {
@@ -1773,31 +1773,31 @@ impl OnlineAdaptiveGovernor {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            ewma_net_bps_x100: [[200; 2]; 9],
-            cum_net_bps_x100: [[0; 2]; 9],
-            sl_streak: [[0; 2]; 9],
-            win_streak: [[0; 2]; 9],
-            directional_cooldown_until_ns: [[0; 2]; 9],
+            ewma_net_bps_x100: [[200; 2]; 12],
+            cum_net_bps_x100: [[0; 2]; 12],
+            sl_streak: [[0; 2]; 12],
+            win_streak: [[0; 2]; 12],
+            directional_cooldown_until_ns: [[0; 2]; 12],
             global_dir_debt_bps_x100: [0; 2],
             global_dir_sl_streak: [0; 2],
             global_dir_win_streak: [0; 2],
             global_dir_cooldown_until_ns: [0; 2],
             last_global_win_dir: 255,
             last_global_win_ts_ns: 0,
-            ewma_fast_px_1e4: [0; 9],
-            ewma_slow_px_1e4: [0; 9],
-            last_price_sample_ts_ns: [0; 9],
-            wave_anchor_px_1e4: [[0; 2]; 9],
-            last_exit_px_1e4: [[0; 2]; 9],
-            wave_step_count: [[0; 2]; 9],
-            abort_streak: [[0; 2]; 9],
-            abort_anchor_px_1e4: [[0; 2]; 9],
-            abort_last_ts_ns: [[0; 2]; 9],
+            ewma_fast_px_1e4: [0; 12],
+            ewma_slow_px_1e4: [0; 12],
+            last_price_sample_ts_ns: [0; 12],
+            wave_anchor_px_1e4: [[0; 2]; 12],
+            last_exit_px_1e4: [[0; 2]; 12],
+            wave_step_count: [[0; 2]; 12],
+            abort_streak: [[0; 2]; 12],
+            abort_anchor_px_1e4: [[0; 2]; 12],
+            abort_last_ts_ns: [[0; 2]; 12],
             global_dir_abort_streak: [0; 2],
             global_abort_last_ts_ns: [0; 2],
             last_sl_ts_ns: 0,
-            price_sample_count: [0; 9],
-            last_seen_px_1e4: [0; 9],
+            price_sample_count: [0; 12],
+            last_seen_px_1e4: [0; 12],
         }
     }
 
