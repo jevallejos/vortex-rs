@@ -318,7 +318,6 @@ fn replay_captured_live_parquet_segments() {
     let mut shadow_history: Vec<(i64, usize, Side, i64, i64, i64, bool)> = Vec::new();
     let mut shadow_cursor: usize = 0;
     for hist_path in [
-        "data/vault/vortex_governor_scar_memory.disabled",
         "data/vault/vortex_shadow_trades.jsonl",
     ] {
         if let Ok(sf) = std::fs::File::open(hist_path) {
@@ -335,17 +334,8 @@ fn replay_captured_live_parquet_segments() {
                     let side_s = val.get("side").and_then(|v| v.as_str()).unwrap_or("Bid");
                     let en_t = val.get("entry_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
                     let ex_t = val.get("exit_ticks").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let slot_opt = match sym_s {
-                        "BTCUSDT" => Some(0),
-                        "ETHUSDT" => Some(1),
-                        "SOLUSDT" => Some(2),
-                        "AVAXUSDT" => Some(3),
-                        "TAOUSDT" => Some(4),
-                        "SUIUSDT" => Some(5),
-                        _ => None,
-                    };
-                    if let Some(s_i) = slot_opt {
-                        let s_side = if side_s == "Ask" { Side::Ask } else { Side::Bid };
+                    if let Some(s_i) = slot_from_symbol_name(sym_s) {
+                        let s_side = side_from_str(side_s);
                         let net_sc = (net_bps * 100.0).round() as i64;
                         shadow_history.push((ts_s, s_i, s_side, en_t, ex_t, net_sc, is_mkr));
                     }
@@ -366,16 +356,7 @@ fn replay_captured_live_parquet_segments() {
                 }
                 let net_s = (net_bps * 100.0).round() as i64;
                 let sym_str = val.get("symbol").and_then(serde_json::Value::as_str).unwrap_or("");
-                let s_opt = match sym_str {
-                    "BTCUSDT" => Some(0),
-                    "ETHUSDT" => Some(1),
-                    "SOLUSDT" => Some(2),
-                    "AVAXUSDT" => Some(3),
-                    "TAOUSDT" => Some(4),
-                    "SUIUSDT" => Some(5),
-                    _ => None,
-                };
-                if let Some(si) = s_opt {
+                if let Some(si) = slot_from_symbol_name(sym_str) {
                     fsm.observe_mfe_sample_for_slot(si, net_s + 400, true);
                 }
             }
@@ -385,10 +366,10 @@ fn replay_captured_live_parquet_segments() {
     let mut fifo_sim = FifoQueueSimulator::new();
     let mut exit_fifo_sim = ExitFifoQueueSimulator::new();
     let mut btc_leader_snap = SymbolLobSnapshot::default();
-    let mut latest_snaps = [SymbolLobSnapshot::default(); 6];
-    let mut slot_cooldown_until_ns = [0_i64; 6];
-    let mut learned_vol_5m_bps = [6_000_i64; 6];
-    let mut prev_mid_ticks = [0_i64; 6];
+    let mut latest_snaps = [SymbolLobSnapshot::default(); 9];
+    let mut slot_cooldown_until_ns = [0_i64; 9];
+    let mut learned_vol_5m_bps = [6_000_i64; 9];
+    let mut prev_mid_ticks = [0_i64; 9];
     let mut resting_init_queue_ahead = LotQty(0);
     let mut active_sym = SymbolId(0);
     let mut active_slot: usize = 0;
@@ -1299,10 +1280,10 @@ pub fn run_microstructure_trend_and_markout_stats() {
     );
     println!("----------------------------------------------------------------------------------------------------------");
     let mut fsm_prof = ExecutionFsm::new(1_250_000_000, 1_250_000_000);
-    let mut slot_trades = [0_u64; 6];
-    let mut slot_wins = [0_u64; 6];
-    let mut slot_win_bps = [0.0_f64; 6];
-    let mut slot_clean_bps = [0.0_f64; 6];
+    let mut slot_trades = [0_u64; 9];
+    let mut slot_wins = [0_u64; 9];
+    let mut slot_win_bps = [0.0_f64; 9];
+    let mut slot_clean_bps = [0.0_f64; 9];
     if let Ok(sf) = File::open("deploy/forensic_vault_171.seed") {
         for line in BufReader::new(sf).lines().map_while(Result::ok) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -1334,9 +1315,12 @@ pub fn run_microstructure_trend_and_markout_stats() {
             }
         }
     }
-    let sym_names = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT", "TAOUSDT", "SUIUSDT"];
+    let sym_names = [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT", "TAOUSDT",
+        "SUIUSDT", "ORDIUSDT", "PENDLEUSDT", "WIFUSDT",
+    ];
     let mut s = 0_usize;
-    while s < 6 {
+    while s < 9 {
         let m_win = if slot_wins[s] > 0 {
             slot_win_bps[s] / (slot_wins[s] as f64)
         } else {

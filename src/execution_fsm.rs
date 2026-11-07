@@ -427,7 +427,7 @@ pub struct ExecutionFsm {
     /// Field learned_mfe_ewma_bps.
     pub learned_mfe_ewma_bps: i64,
     /// Field learned_mfe_by_slot.
-    pub learned_mfe_by_slot: [i64; 6],
+    pub learned_mfe_by_slot: [i64; 9],
     /// Field active_slot_idx.
     pub active_slot_idx: usize,
     /// Field last_peak_gross_bps.
@@ -480,7 +480,7 @@ impl ExecutionFsm {
             gross_profit_accum_1e8: 0,
             gross_loss_accum_1e8: 0,
             learned_mfe_ewma_bps: 720,
-            learned_mfe_by_slot: [720; 6],
+            learned_mfe_by_slot: [720; 9],
             active_slot_idx: 0,
             last_peak_gross_bps: 0,
             max_wald_contraction_pct: 0,
@@ -502,7 +502,7 @@ impl ExecutionFsm {
     #[inline]
     #[must_use]
     pub const fn slot_index_for_symbol(sym: SymbolId) -> usize {
-        if sym.0 >= 1 && sym.0 <= 6 {
+        if sym.0 >= 1 && sym.0 <= 9 {
             (sym.0 - 1) as usize
         } else {
             0
@@ -514,7 +514,7 @@ impl ExecutionFsm {
     #[must_use]
     #[allow(clippy::manual_clamp)]
     pub const fn slot_learned_mfe_bps(&self, sym: SymbolId) -> i64 {
-        let raw = if sym.0 >= 1 && sym.0 <= 6 {
+        let raw = if sym.0 >= 1 && sym.0 <= 9 {
             self.learned_mfe_by_slot[(sym.0 - 1) as usize]
         } else {
             self.learned_mfe_ewma_bps
@@ -1551,7 +1551,7 @@ impl ExecutionFsm {
         raw_observed_gross_bps: i64,
         is_maker_exit: bool,
     ) {
-        let s = slot_idx.min(5);
+        let s = slot_idx.min(8);
         let fee_rt_bps = ScaledBps::BYBIT_VIP0_MAKER_FEE_BPS.raw() * 2;
         let structural_win_threshold = fee_rt_bps + (fee_rt_bps / 4);
         if is_maker_exit {
@@ -1719,31 +1719,31 @@ impl ExecutionFsm {
 /// coupled with Cross-Slot Global Directional Regime Memory and Dual-Horizon Price Drift EWMA.
 #[derive(Copy, Clone, Debug)]
 pub struct OnlineAdaptiveGovernor {
-    ewma_net_bps_x100: [[i64; 2]; 6],
-    cum_net_bps_x100: [[i64; 2]; 6],
-    sl_streak: [[u32; 2]; 6],
-    win_streak: [[u32; 2]; 6],
-    directional_cooldown_until_ns: [[i64; 2]; 6],
+    ewma_net_bps_x100: [[i64; 2]; 9],
+    cum_net_bps_x100: [[i64; 2]; 9],
+    sl_streak: [[u32; 2]; 9],
+    win_streak: [[u32; 2]; 9],
+    directional_cooldown_until_ns: [[i64; 2]; 9],
     global_dir_debt_bps_x100: [i64; 2],
     global_dir_sl_streak: [u32; 2],
     global_dir_win_streak: [u32; 2],
     global_dir_cooldown_until_ns: [i64; 2],
     last_global_win_dir: u8,
     last_global_win_ts_ns: i64,
-    ewma_fast_px_1e4: [i64; 6],
-    ewma_slow_px_1e4: [i64; 6],
-    last_price_sample_ts_ns: [i64; 6],
-    wave_anchor_px_1e4: [[i64; 2]; 6],
-    last_exit_px_1e4: [[i64; 2]; 6],
-    wave_step_count: [[u32; 2]; 6],
-    abort_streak: [[u32; 2]; 6],
-    abort_anchor_px_1e4: [[i64; 2]; 6],
-    abort_last_ts_ns: [[i64; 2]; 6],
+    ewma_fast_px_1e4: [i64; 9],
+    ewma_slow_px_1e4: [i64; 9],
+    last_price_sample_ts_ns: [i64; 9],
+    wave_anchor_px_1e4: [[i64; 2]; 9],
+    last_exit_px_1e4: [[i64; 2]; 9],
+    wave_step_count: [[u32; 2]; 9],
+    abort_streak: [[u32; 2]; 9],
+    abort_anchor_px_1e4: [[i64; 2]; 9],
+    abort_last_ts_ns: [[i64; 2]; 9],
     global_dir_abort_streak: [u32; 2],
     global_abort_last_ts_ns: [i64; 2],
     last_sl_ts_ns: i64,
-    price_sample_count: [u32; 6],
-    last_seen_px_1e4: [i64; 6],
+    price_sample_count: [u32; 9],
+    last_seen_px_1e4: [i64; 9],
 }
 
 impl Default for OnlineAdaptiveGovernor {
@@ -1759,31 +1759,31 @@ impl OnlineAdaptiveGovernor {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            ewma_net_bps_x100: [[200; 2]; 6],
-            cum_net_bps_x100: [[0; 2]; 6],
-            sl_streak: [[0; 2]; 6],
-            win_streak: [[0; 2]; 6],
-            directional_cooldown_until_ns: [[0; 2]; 6],
+            ewma_net_bps_x100: [[200; 2]; 9],
+            cum_net_bps_x100: [[0; 2]; 9],
+            sl_streak: [[0; 2]; 9],
+            win_streak: [[0; 2]; 9],
+            directional_cooldown_until_ns: [[0; 2]; 9],
             global_dir_debt_bps_x100: [0; 2],
             global_dir_sl_streak: [0; 2],
             global_dir_win_streak: [0; 2],
             global_dir_cooldown_until_ns: [0; 2],
             last_global_win_dir: 255,
             last_global_win_ts_ns: 0,
-            ewma_fast_px_1e4: [0; 6],
-            ewma_slow_px_1e4: [0; 6],
-            last_price_sample_ts_ns: [0; 6],
-            wave_anchor_px_1e4: [[0; 2]; 6],
-            last_exit_px_1e4: [[0; 2]; 6],
-            wave_step_count: [[0; 2]; 6],
-            abort_streak: [[0; 2]; 6],
-            abort_anchor_px_1e4: [[0; 2]; 6],
-            abort_last_ts_ns: [[0; 2]; 6],
+            ewma_fast_px_1e4: [0; 9],
+            ewma_slow_px_1e4: [0; 9],
+            last_price_sample_ts_ns: [0; 9],
+            wave_anchor_px_1e4: [[0; 2]; 9],
+            last_exit_px_1e4: [[0; 2]; 9],
+            wave_step_count: [[0; 2]; 9],
+            abort_streak: [[0; 2]; 9],
+            abort_anchor_px_1e4: [[0; 2]; 9],
+            abort_last_ts_ns: [[0; 2]; 9],
             global_dir_abort_streak: [0; 2],
             global_abort_last_ts_ns: [0; 2],
             last_sl_ts_ns: 0,
-            price_sample_count: [0; 6],
-            last_seen_px_1e4: [0; 6],
+            price_sample_count: [0; 9],
+            last_seen_px_1e4: [0; 9],
         }
     }
 
@@ -1804,7 +1804,7 @@ impl OnlineAdaptiveGovernor {
         entry_ticks: i64,
         exit_ticks: i64,
     ) {
-        if slot_idx >= 6 || entry_ticks <= 0 || exit_ticks <= 0 {
+        if slot_idx >= 9 || entry_ticks <= 0 || exit_ticks <= 0 {
             return;
         }
         let d = Self::dir_idx(side);
@@ -1831,7 +1831,7 @@ impl OnlineAdaptiveGovernor {
         entry_ticks: i64,
         ts_ns: TimestampNs,
     ) {
-        if slot_idx >= 6 || entry_ticks <= 0 {
+        if slot_idx >= 9 || entry_ticks <= 0 {
             return;
         }
         let d = Self::dir_idx(side);
@@ -1887,7 +1887,7 @@ impl OnlineAdaptiveGovernor {
     /// Updates 1Hz physical-clock fast (`20s`) and slow macro (`300s`) price EWMAs in `1e4` fixed-point scale.
     #[inline]
     pub fn observe_market_price(&mut self, slot_idx: usize, snap: &SymbolLobSnapshot) {
-        if slot_idx >= 6 {
+        if slot_idx >= 9 {
             return;
         }
         let mid_ticks = if snap.bids[0].price.0 > 0 && snap.asks[0].price.0 > 0 {
@@ -1995,7 +1995,7 @@ impl OnlineAdaptiveGovernor {
         slot_idx: usize,
         snap: &SymbolLobSnapshot,
     ) -> (i64, i64) {
-        if slot_idx >= 6 {
+        if slot_idx >= 9 {
             return (0, 0);
         }
         let fast = self.ewma_fast_px_1e4[slot_idx];
@@ -2028,7 +2028,7 @@ impl OnlineAdaptiveGovernor {
         snap: &SymbolLobSnapshot,
         entry_ticks: i64,
     ) -> (i64, u32, u32, u32, i64, i64, i64, i64) {
-        if slot_idx >= 6 {
+        if slot_idx >= 9 {
             return (0, 0, 0, 0, 0, 0, 0, 0);
         }
         let d = Self::dir_idx(side);
@@ -2059,7 +2059,7 @@ impl OnlineAdaptiveGovernor {
     #[inline]
     #[must_use]
     pub const fn slot_direction_diagnostics(&self, slot_idx: usize, side: Side) -> (i64, u32, u32) {
-        if slot_idx >= 6 {
+        if slot_idx >= 9 {
             return (0, 0, 0);
         }
         let d = Self::dir_idx(side);
@@ -2074,7 +2074,7 @@ impl OnlineAdaptiveGovernor {
     #[inline]
     #[must_use]
     pub const fn is_in_scar_debt(&self, slot_idx: usize, side: Side) -> bool {
-        if slot_idx >= 6 {
+        if slot_idx >= 9 {
             return false;
         }
         let d = Self::dir_idx(side);
@@ -2095,7 +2095,7 @@ impl OnlineAdaptiveGovernor {
         entry_ticks: i64,
         check_ts_ns: i64,
     ) -> Option<&'static str> {
-        if slot_idx >= 6 {
+        if slot_idx >= 9 {
             return Some("VETO_INVALID_SLOT");
         }
         let d = Self::dir_idx(side);
@@ -2337,7 +2337,7 @@ impl OnlineAdaptiveGovernor {
         is_maker_exit: bool,
         ts_ns: TimestampNs,
     ) {
-        if slot_idx >= 6 {
+        if slot_idx >= 9 {
             return;
         }
         let d = Self::dir_idx(side);

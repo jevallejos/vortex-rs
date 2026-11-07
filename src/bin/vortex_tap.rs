@@ -25,7 +25,7 @@ struct CandidateContract {
     realized_vol_5m: ScaledBps,
 }
 
-const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
+const CANDIDATE_UNIVERSE: [CandidateContract; 12] = [
     CandidateContract {
         name: "BTCUSDT",
         spec: PairSpec {
@@ -93,9 +93,42 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
         realized_vol_5m: ScaledBps::from_whole_bps(64),
     },
     CandidateContract {
-        name: "XRPUSDT",
+        name: "ORDIUSDT",
         spec: PairSpec {
             symbol_id: SymbolId(7),
+            tick_size_1e8: 100_000,
+            lot_step_1e8: 10_000_000,
+            empirical_taker_exit_prob_pct: 20,
+        },
+        reference_mid_ticks: PriceTicks(3_452),
+        realized_vol_5m: ScaledBps::from_whole_bps(82),
+    },
+    CandidateContract {
+        name: "PENDLEUSDT",
+        spec: PairSpec {
+            symbol_id: SymbolId(8),
+            tick_size_1e8: 10_000,
+            lot_step_1e8: 100_000_000,
+            empirical_taker_exit_prob_pct: 20,
+        },
+        reference_mid_ticks: PriceTicks(16_739),
+        realized_vol_5m: ScaledBps::from_whole_bps(78),
+    },
+    CandidateContract {
+        name: "WIFUSDT",
+        spec: PairSpec {
+            symbol_id: SymbolId(9),
+            tick_size_1e8: 10_000,
+            lot_step_1e8: 100_000_000,
+            empirical_taker_exit_prob_pct: 20,
+        },
+        reference_mid_ticks: PriceTicks(1_604),
+        realized_vol_5m: ScaledBps::from_whole_bps(92),
+    },
+    CandidateContract {
+        name: "XRPUSDT",
+        spec: PairSpec {
+            symbol_id: SymbolId(10),
             tick_size_1e8: 10_000,
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
@@ -106,7 +139,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
     CandidateContract {
         name: "ZEREBROUSDT",
         spec: PairSpec {
-            symbol_id: SymbolId(8),
+            symbol_id: SymbolId(11),
             tick_size_1e8: 1_000,
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
@@ -117,7 +150,7 @@ const CANDIDATE_UNIVERSE: [CandidateContract; 9] = [
     CandidateContract {
         name: "WALUSDT",
         spec: PairSpec {
-            symbol_id: SymbolId(9),
+            symbol_id: SymbolId(12),
             tick_size_1e8: 1_000,
             lot_step_1e8: 100_000_000,
             empirical_taker_exit_prob_pct: 20,
@@ -415,7 +448,7 @@ fn run_live_bybit_ws_loop(
         s += 1;
     }
 
-    let subscribe_payload = r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","publicTrade.BTCUSDT","orderbook.50.ETHUSDT","publicTrade.ETHUSDT","orderbook.50.SOLUSDT","publicTrade.SOLUSDT","orderbook.50.AVAXUSDT","publicTrade.AVAXUSDT","orderbook.50.TAOUSDT","publicTrade.TAOUSDT","orderbook.50.SUIUSDT","publicTrade.SUIUSDT"]}"#;
+    let subscribe_payload = r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","publicTrade.BTCUSDT","orderbook.50.ETHUSDT","publicTrade.ETHUSDT","orderbook.50.SOLUSDT","publicTrade.SOLUSDT","orderbook.50.AVAXUSDT","publicTrade.AVAXUSDT","orderbook.50.TAOUSDT","publicTrade.TAOUSDT","orderbook.50.SUIUSDT","publicTrade.SUIUSDT","orderbook.50.ORDIUSDT","publicTrade.ORDIUSDT","orderbook.50.PENDLEUSDT","publicTrade.PENDLEUSDT","orderbook.50.WIFUSDT","publicTrade.WIFUSDT"]}"#;
     let _ = std::fs::create_dir_all("data/lakehouse_par1");
     let mut parquet_seq: u64 = discover_max_parquet_seq();
     println!(
@@ -628,7 +661,7 @@ mod tests {
                 vetoed += 1;
             }
         }
-        assert_eq!(approved, 6);
+        assert_eq!(approved, 9);
         assert_eq!(vetoed, 3);
 
         let mut batch = ColumnarParquetBatch::new();

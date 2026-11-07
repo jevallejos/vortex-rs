@@ -10,11 +10,11 @@ use crate::types::{BoundedScore, LotQty, PriceTicks, ScaledBps, Side, SymbolId, 
 /// Canonical depth of Bybit `orderbook.50` stream.
 pub const LOB_DEPTH: usize = 50;
 /// Maximum number of active institutional pairs in the shared memory segment.
-pub const MAX_ACTIVE_PAIRS: usize = 8;
+pub const MAX_ACTIVE_PAIRS: usize = 9;
 /// Magic header identifying a valid VORTEXL2 shared memory region ("VORTEXL2" in ASCII).
 pub const VORTEX_SHM_MAGIC: u64 = 0x564F_5254_4558_4C32;
 /// Schema version of the shared memory layout (v9 ABI locked: MFE peak tracking + trade-tape drain).
-pub const VORTEX_SHM_VERSION: u32 = 9;
+pub const VORTEX_SHM_VERSION: u32 = 10;
 /// Canonical POSIX shared-memory path on Ubuntu Linux production nodes.
 pub const DEFAULT_LINUX_SHM_PATH: &str = "/dev/shm/vortex_lob.mmap";
 
@@ -334,6 +334,7 @@ impl VortexShmArena {
             exec_fill_count: AtomicU64::new(0),
             exec_closed_count: AtomicU64::new(0),
             slots: [
+                SeqlockSymbolSlot::new(),
                 SeqlockSymbolSlot::new(),
                 SeqlockSymbolSlot::new(),
                 SeqlockSymbolSlot::new(),
