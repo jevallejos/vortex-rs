@@ -203,12 +203,12 @@ impl BybitV5LiveClient {
                 match ws.get_ref() {
                     tungstenite::stream::MaybeTlsStream::Plain(s) => {
                         let _ = s.set_nodelay(true);
-                        let _ = s.set_read_timeout(Some(Duration::from_secs(25)));
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
                     }
                     tungstenite::stream::MaybeTlsStream::NativeTls(tls) => {
                         let s = tls.get_ref();
                         let _ = s.set_nodelay(true);
-                        let _ = s.set_read_timeout(Some(Duration::from_secs(25)));
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
                     }
                     _ => {}
                 }
@@ -325,6 +325,9 @@ impl BybitV5LiveClient {
                             Ok(tungstenite::Message::Ping(p)) => {
                                 let _ = ws.send(tungstenite::Message::Pong(p));
                             }
+                            Err(tungstenite::Error::Io(ref e))
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind() == std::io::ErrorKind::TimedOut => {}
                             Ok(tungstenite::Message::Close(_)) | Err(_) => break,
                             _ => {}
                         }
@@ -3244,26 +3247,29 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             arena.exec_fill_count.fetch_add(1, Ordering::Release);
                             arena.exec_state_code.store(3, Ordering::Release);
                             arena.exec_queue_ahead_lots.store(0, Ordering::Release);
-                            if let Some(ref client) = live_client {
-                                let g_init = ExecutionFsm::dynamic_maker_floor_price(
-                                    side,
-                                    entry_price,
-                                    ScaledBps(500),
-                                );
-                                let safe_i = match side {
-                                    Side::Bid => {
-                                        snap.bids[0].price.0 > 0
-                                            && snap.bids[0].price.0 < g_init.0
-                                    }
-                                    Side::Ask => snap.asks[0].price.0 > g_init.0,
-                                };
-                                if safe_i {
-                                    client.arm_patient_green_exit(
-                                        &spec,
+                            if active_slot >= 1 {
+                                if let Some(ref client) = live_client {
+                                    let g_init = ExecutionFsm::dynamic_maker_floor_price(
                                         side,
-                                        g_init,
-                                        &mut last_pegged_exit_price,
+                                        entry_price,
+                                        ScaledBps(500),
                                     );
+                                    let safe_i = match side {
+                                        Side::Bid => {
+                                            snap.bids[0].price.0 > 0
+                                                && snap.bids[0].price.0 < g_init.0
+                                        }
+                                        Side::Ask => snap.asks[0].price.0 > g_init.0,
+                                    };
+                                    if safe_i
+                                        && client.try_arm_partial_harvest_50pct(
+                                            &spec,
+                                            side,
+                                            g_init,
+                                        )
+                                    {
+                                        last_pegged_exit_price = PriceTicks(-g_init.0);
+                                    }
                                 }
                             }
 
@@ -3326,13 +3332,17 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                         let ws_instant_flat = live_client
                             .as_ref()
                             .is_some_and(|c| c.has_ws_instant_flat(active_slot));
-                        if last_pegged_exit_price.0 > 0
+                        if last_pegged_exit_price.0 != 0
                             && (ws_instant_flat || (snap.sequence_id & 15) == 0)
                         {
                             if let Some(ref client) = live_client {
                                 let sym_n = APPROVED_SPECS[active_slot].symbol_id.name();
-                                let (still_open, _) = client.get_open_position_size(sym_n);
+                                let (still_open, cur_sz_s) =
+                                    client.get_open_position_size(sym_n);
                                 if !still_open {
+                                    let pegged_abs =
+                                        PriceTicks(last_pegged_exit_price.0.abs());
+                                    last_pegged_exit_price = pegged_abs;
                                     let std_px = ExecutionFsm::dynamic_maker_floor_price(
                                         open_side,
                                         open_entry_price,
@@ -3340,10 +3350,10 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     );
                                     let raw_d = match open_side {
                                         Side::Bid => {
-                                            last_pegged_exit_price.0 - open_entry_price.0
+                                            pegged_abs.0 - open_entry_price.0
                                         }
                                         Side::Ask => {
-                                            open_entry_price.0 - last_pegged_exit_price.0
+                                            open_entry_price.0 - pegged_abs.0
                                         }
                                     };
                                     let real_g_bps = (raw_d.saturating_mul(1_000_000))
@@ -3374,6 +3384,21 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                                 PriceTicks((px_g.0 - 1).max(1));
                                             snap.asks[0].price = px_g;
                                         }
+                                    }
+                                } else if last_pegged_exit_price.0 < 0 {
+                                    let in_d =
+                                        adaptive_gov.is_in_scar_debt(active_slot, open_side);
+                                    let full_q = compute_optimal_50usdt_wallet_qty_str(
+                                        APPROVED_SPECS[active_slot].symbol_id,
+                                        in_d,
+                                    );
+                                    if cur_sz_s != full_q {
+                                        partial_harvest_done = true;
+                                        last_pegged_exit_price = PriceTicks(0);
+                                        println!(
+                                            "{}\u{1f7e2} [PARTIAL LEG FILLED] {} remaining qty={} (2nd half uncapped for Free-Ride & +3.40 bps floor!){}",
+                                            ANSI_GREEN, sym_n, cur_sz_s, ANSI_RESET
+                                        );
                                     }
                                 }
                             }
@@ -3653,30 +3678,34 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 open_entry_price,
                                 ScaledBps(500),
                             );
-                            if is_third_partial && !partial_harvest_done {
+                            let mut shave_active_now = false;
+                            if (is_third_partial || active_slot >= 1) && !partial_harvest_done {
                                 let cur_diff = match open_side {
                                     Side::Bid => snap.bids[0].price.0 - open_entry_price.0,
                                     Side::Ask => open_entry_price.0 - snap.asks[0].price.0,
                                 };
                                 let cur_g_bps = (cur_diff.saturating_mul(1_000_000))
                                     / open_entry_price.0.max(1);
-                                if cur_g_bps >= 520 {
-                                    if let Some(ref client) = live_client {
-                                        let spec = APPROVED_SPECS[active_slot];
-                                        let fav_px = match open_side {
-                                            Side::Bid => {
-                                                PriceTicks(snap.asks[0].price.0.max(g_px.0))
+                                if hold_el < 90_000_000_000 {
+                                    if last_pegged_exit_price.0 == 0 {
+                                        if let Some(ref client) = live_client {
+                                            let spec = APPROVED_SPECS[active_slot];
+                                            let fav_px = match open_side {
+                                                Side::Bid => PriceTicks(
+                                                    snap.asks[0].price.0.max(g_px.0),
+                                                ),
+                                                Side::Ask => PriceTicks(
+                                                    snap.bids[0].price.0.min(g_px.0).max(1),
+                                                ),
+                                            };
+                                            if client.try_arm_partial_harvest_50pct(
+                                                &spec,
+                                                open_side,
+                                                fav_px,
+                                            ) {
+                                                last_pegged_exit_price =
+                                                    PriceTicks(-fav_px.0);
                                             }
-                                            Side::Ask => PriceTicks(
-                                                snap.bids[0].price.0.min(g_px.0).max(1),
-                                            ),
-                                        };
-                                        if client.try_arm_partial_harvest_50pct(
-                                            &spec,
-                                            open_side,
-                                            fav_px,
-                                        ) {
-                                            partial_harvest_done = true;
                                         }
                                     }
                                 } else if hold_el >= 300_000_000_000
@@ -3686,26 +3715,31 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                         sinking_fund_scaled_bps.clamp(0, 1_500) * 4;
                                     let shave_floor = 500_i64 - shave_sub;
                                     if cur_g_bps >= shave_floor {
-                                        if let Some(ref client) = live_client {
-                                            let spec = APPROVED_SPECS[active_slot];
-                                            let sh_px = match open_side {
-                                                Side::Bid => PriceTicks(
-                                                    snap.asks[0].price.0.max(1),
-                                                ),
-                                                Side::Ask => PriceTicks(
-                                                    snap.bids[0].price.0.max(1),
-                                                ),
-                                            };
-                                            if client.try_arm_lot_shaving_25pct(
-                                                &spec,
-                                                open_side,
-                                                sh_px,
-                                            ) {
-                                                let used_q =
-                                                    ((500 - cur_g_bps).max(0) + 3) / 4;
-                                                sinking_fund_scaled_bps =
-                                                    (sinking_fund_scaled_bps - used_q).max(0);
-                                                partial_harvest_done = true;
+                                        shave_active_now = true;
+                                        if last_pegged_exit_price.0 >= 0 {
+                                            if let Some(ref client) = live_client {
+                                                let spec = APPROVED_SPECS[active_slot];
+                                                let sh_px = match open_side {
+                                                    Side::Bid => PriceTicks(
+                                                        snap.asks[0].price.0.max(1),
+                                                    ),
+                                                    Side::Ask => PriceTicks(
+                                                        snap.bids[0].price.0.max(1),
+                                                    ),
+                                                };
+                                                if client.try_arm_lot_shaving_25pct(
+                                                    &spec,
+                                                    open_side,
+                                                    sh_px,
+                                                ) {
+                                                    let used_q =
+                                                        ((500 - cur_g_bps).max(0) + 3) / 4;
+                                                    sinking_fund_scaled_bps =
+                                                        (sinking_fund_scaled_bps - used_q)
+                                                            .max(0);
+                                                    last_pegged_exit_price =
+                                                        PriceTicks(-sh_px.0);
+                                                }
                                             }
                                         }
                                     }
@@ -3747,7 +3781,17 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 }
                                 Side::Ask => snap.asks[0].price.0 > target_exit_px.0,
                             };
-                            if safe_passive {
+                            let req_hold_ns = if active_slot == 0 {
+                                45_000_000_000_i64
+                            } else if last_pegged_exit_price.0 < 0 {
+                                90_000_000_000_i64
+                            } else {
+                                60_000_000_000_i64
+                            };
+                            if !shave_active_now
+                                && hold_el >= req_hold_ns
+                                && safe_passive
+                            {
                                 if let Some(ref client) = live_client {
                                     let spec = APPROVED_SPECS[active_slot];
                                     client.arm_patient_green_exit(
