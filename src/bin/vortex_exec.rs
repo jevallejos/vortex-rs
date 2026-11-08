@@ -1534,7 +1534,7 @@ fn build_consolidated_executive_sections(
         }
     };
     let total = wins + scratches + losses;
-    let filled_200 = ((total.min(200) * 20) / 200) as usize;
+    let filled_200 = ((total.min(1000) * 20) / 1000) as usize;
     let goal_usdt = 95.0_f64;
     let pct_65 = ((eq_usdt / goal_usdt) * 100.0).clamp(0.0, 100.0);
     let filled_65 = (((pct_65 * 20.0) / 100.0).round() as usize).min(20);
@@ -2335,8 +2335,19 @@ fn print_live_shm_hud() -> ExitCode {
                 ));
             }
         }
-        slot_idx += 1;
-    }
+        let raw_mask = arena.exec_active_slot.load(Ordering::Acquire) >> 16;
+        if (raw_mask & (1_u64 << slot_idx)) != 0 {
+            if let Some(last_r) = sec_rows.last_mut() {
+                let sym_s = spec.symbol_id.name();
+                if let Some(pos) = last_r.find(sym_s) {
+                    let end_p = pos + sym_s.len();
+                    let pfx = &last_r[..end_p];
+                    let sfx = &last_r[end_p..];
+                    *last_r = format!("{}{}{}{}", ANSI_YELLOW, pfx, ANSI_RESET, sfx);
+                }
+            }
+        }
+        slot_idx += 1;    }
     let state_code = arena.exec_state_code.load(Ordering::Acquire);
     let active_sym = SymbolId(arena.exec_active_symbol.load(Ordering::Acquire) as u16);
     let side_code = arena.exec_side.load(Ordering::Acquire);
@@ -2448,7 +2459,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
     let mut tracked_sym_on_startup: Option<&'static str> = None;
 
     if (saved_state_code == 2 && live_client.is_some()) || saved_state_code == 3 {
-        let slot_saved = (arena.exec_active_slot.load(Ordering::Acquire) as usize).min(APPROVED_SPECS.len() - 1);
+        let slot_saved = ((arena.exec_active_slot.load(Ordering::Acquire) & 0xFFFF) as usize).min(APPROVED_SPECS.len() - 1);
         let sym_name = APPROVED_SPECS[slot_saved].symbol_id.name();
         let mut valid_to_restore = true;
 
@@ -2633,6 +2644,19 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
         }
 
         mux_tick = mux_tick.wrapping_add(1);
+        let mut open_slots_mask: u64 = 0;
+        if matches!(fsm.state, OrderLifecycleState::PositionOpenMakerExit { .. }) {
+            open_slots_mask |= 1_u64 << active_slot;
+        }
+        for sp_item in &extra_sessions {
+            if matches!(sp_item.state, OrderLifecycleState::PositionOpenMakerExit { .. }) {
+                open_slots_mask |= 1_u64 << sp_item.slot_idx;
+            }
+        }
+        arena.exec_active_slot.store(
+            (active_slot as u64) | (open_slots_mask << 16),
+            Ordering::Release,
+        );
         let drain_active = Path::new("data/vault/DRAIN_MODE.lock").exists()
             || ledger.closed_trades_count >= 200;
         if drain_active
@@ -3573,7 +3597,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                     Ordering::Release,
                                 );
                             }
-                            arena.exec_active_slot.store(active_slot as u64, Ordering::Release);
+                            arena.exec_active_slot.store((active_slot as u64) | (open_slots_mask << 16), Ordering::Release);
                             arena.exec_active_symbol.store(
                                 u64::from(APPROVED_SPECS[active_slot].symbol_id.0),
                                 Ordering::Release,
@@ -3685,7 +3709,8 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             } else {
                                 0_i64
                             };
-                            let eff_floor_bps = (base_runner_bps - sub_bps).max(440);
+                            let min_siphon_bps = if sinking_fund_scaled_bps >= 440 { 40_i64 } else { 440_i64 };
+                            let eff_floor_bps = (base_runner_bps - sub_bps).max(min_siphon_bps);
                             let eff_delta_t = if eff_floor_bps >= 0 {
                                 ((open_entry_price.0 * eff_floor_bps) + 999_999) / 1_000_000
                             } else {
