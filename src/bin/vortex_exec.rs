@@ -990,7 +990,7 @@ impl BybitV5LiveClient {
         if let Some(resp) = self.post_v5("/v5/order/create", &body) {
             if resp.get("retCode").and_then(|v| v.as_i64()) == Some(0) {
                 println!(
-                    "{}\u{1f7e2} [6-SESSION PARTIAL HARVEST 50%] {} {} qty={} @ {}.{:04}{}",
+                    "{}\u{1f535} [PARTIAL HARVEST 50% ARMED] {} {} qty={} @ {}.{:04}{}",
                     ANSI_GREEN, sym, cl_s, hq, hw, hf, ANSI_RESET
                 );
                 return true;
@@ -3595,7 +3595,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 };
                                 let cur_g_bps = (cur_diff.saturating_mul(1_000_000))
                                     / open_entry_price.0.max(1);
-                                if hold_el < 90_000_000_000 {
+                                if hold_el < 300_000_000_000 {
                                     if last_pegged_exit_price.0 == 0 {
                                         if let Some(ref client) = live_client {
                                             let spec = APPROVED_SPECS[active_slot];
@@ -3706,7 +3706,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let req_hold_ns = if active_slot == 0 {
                                 45_000_000_000_i64
                             } else if last_pegged_exit_price.0 < 0 {
-                                90_000_000_000_i64
+                                300_000_000_000_i64
                             } else {
                                 60_000_000_000_i64
                             };
