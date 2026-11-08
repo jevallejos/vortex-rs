@@ -3622,7 +3622,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 {
                                     let shave_sub =
                                         sinking_fund_scaled_bps.clamp(0, 1_500) * 4;
-                                    let shave_floor = 500_i64 - shave_sub;
+                                    let shave_floor = (500_i64 - shave_sub).max(440);
                                     if cur_g_bps >= shave_floor {
                                         shave_active_now = true;
                                         if last_pegged_exit_price.0 >= 0 {
@@ -3674,7 +3674,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             } else {
                                 0_i64
                             };
-                            let eff_floor_bps = base_runner_bps - sub_bps;
+                            let eff_floor_bps = (base_runner_bps - sub_bps).max(440);
                             let eff_delta_t = if eff_floor_bps >= 0 {
                                 ((open_entry_price.0 * eff_floor_bps) + 999_999) / 1_000_000
                             } else {
