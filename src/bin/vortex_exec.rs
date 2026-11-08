@@ -3595,7 +3595,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                 };
                                 let cur_g_bps = (cur_diff.saturating_mul(1_000_000))
                                     / open_entry_price.0.max(1);
-                                if hold_el < 300_000_000_000 {
+                                if hold_el < 600_000_000_000 {
                                     if last_pegged_exit_price.0 == 0 {
                                         if let Some(ref client) = live_client {
                                             let spec = APPROVED_SPECS[active_slot];
@@ -3617,7 +3617,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                                             }
                                         }
                                     }
-                                } else if hold_el >= 300_000_000_000
+                                } else if hold_el >= 600_000_000_000
                                     && sinking_fund_scaled_bps >= 300
                                 {
                                     let shave_sub =
@@ -3706,7 +3706,7 @@ fn run_shadow_execution_daemon(live_capital_enabled: bool) -> ExitCode {
                             let req_hold_ns = if active_slot == 0 {
                                 45_000_000_000_i64
                             } else if last_pegged_exit_price.0 < 0 {
-                                300_000_000_000_i64
+                                600_000_000_000_i64
                             } else {
                                 60_000_000_000_i64
                             };
