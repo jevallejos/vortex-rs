@@ -2343,7 +2343,7 @@ fn print_live_shm_hud() -> ExitCode {
                     let end_p = pos + sym_s.len();
                     let pfx = &last_r[..end_p];
                     let sfx = &last_r[end_p..];
-                    *last_r = format!("{}{}{}{}", ANSI_YELLOW, pfx, ANSI_RESET, sfx);
+                    *last_r = format!("{}\u{1f7e1}{}{} {}", ANSI_YELLOW, &pfx[..pfx.len().saturating_sub(2)], ANSI_RESET, sfx);
                 }
             }
         }
