@@ -1153,7 +1153,11 @@ impl BybitV5LiveClient {
                     "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed @ {}t (0.00 remaining){}",
                     ANSI_GREEN, symbol, realized_px.0, ANSI_RESET
                 );
-                return Some(realized_px);
+                return Some(ExecutionFsm::clamp_defensive_zero_loss_floor(
+                    open_side,
+                    entry_price,
+                    PriceTicks(realized_px.0.abs().max(1)),
+                ));
             }
 
             {
@@ -1214,6 +1218,9 @@ impl BybitV5LiveClient {
             *exit_peg_attempts = exit_peg_attempts.saturating_add(1);
             thread::sleep(Duration::from_millis(300));
             attempt += 1;
+            if last_pegged_price.0 != 0 && attempt >= 2 {
+                break;
+            }
         }
 
         let (still_open_end, _) = self.get_open_position_size(symbol);
@@ -1228,7 +1235,11 @@ impl BybitV5LiveClient {
                 "{}🟢 [BYBIT V5 REAL EXIT CONFIRMED] {} position closed @ {}t (0.00 remaining){}",
                 ANSI_GREEN, symbol, realized_px.0, ANSI_RESET
             );
-            return Some(realized_px);
+            return Some(ExecutionFsm::clamp_defensive_zero_loss_floor(
+                    open_side,
+                    entry_price,
+                    PriceTicks(realized_px.0.abs().max(1)),
+                ));
         }
         println!(
             "{}🟡 [BYBIT V5 EXIT STILL RESTING] {} position still open after peg cycle — retaining FSM custody (no abandonment!){}",
